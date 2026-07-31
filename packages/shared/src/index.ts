@@ -83,6 +83,10 @@ export const EvaluationResultSchema = z.strictObject({
   score: z.number().int().min(0).max(100),
   recommendation: NonEmptyTextSchema,
   rawReport: NonEmptyTextSchema,
+  company: NonEmptyTextSchema.nullable().optional(),
+  role: NonEmptyTextSchema.nullable().optional(),
+  archetype: NonEmptyTextSchema.nullable().optional(),
+  legitimacy: NonEmptyTextSchema.nullable().optional(),
 });
 
 export type EvaluationResult = z.infer<typeof EvaluationResultSchema>;

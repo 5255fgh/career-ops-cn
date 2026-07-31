@@ -76,7 +76,14 @@ importers:
 
   packages/boss-adapter: {}
 
-  packages/career-ops-adapter: {}
+  packages/career-ops-adapter:
+    dependencies:
+      '@career-ops-cn/shared':
+        specifier: workspace:*
+        version: link:../shared
+      zod:
+        specifier: ^4.1.5
+        version: 4.4.3
 
   packages/screening: {}
 

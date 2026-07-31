@@ -1,0 +1,1 @@
+AuthenticationError: 401 Incorrect API key provided: sk-fixture-secret-value

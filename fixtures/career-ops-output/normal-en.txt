@@ -1,0 +1,13 @@
+# Role Evaluation
+
+The role is a solid match for the candidate's product engineering background.
+
+---SCORE_SUMMARY---
+COMPANY: Northstar Labs
+ROLE: Product Engineer
+SCORE: 3.6
+ARCHETYPE: Operator
+LEGITIMACY: medium
+---END_SUMMARY---
+
+Review the equity and on-call expectations before applying.
