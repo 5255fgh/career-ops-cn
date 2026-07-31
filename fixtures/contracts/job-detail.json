@@ -1,0 +1,11 @@
+{
+  "jobId": "123456789",
+  "title": "前端开发工程师",
+  "companyName": "示例科技",
+  "salaryText": "20-30K·14薪",
+  "location": "上海·浦东新区",
+  "experienceText": "3-5年",
+  "educationText": "本科",
+  "detailUrl": "https://www.zhipin.com/job_detail/123456789.html",
+  "description": "负责招聘产品的前端功能开发与维护，要求熟悉 TypeScript 和 React。"
+}
