@@ -1,1 +1,30 @@
-export {};
+export {
+  detectBossPage,
+  detectBossPageBlock,
+  parseBossDetail,
+  parseVisibleBossCards,
+  scanSelectedBossDetails,
+  verifyDetailIdentity,
+  waitForBossDetail,
+} from "./adapter.js";
+export { bossSelectors } from "./selectors.js";
+export type {
+  BossDetailPredicate,
+  BossDetailPredicateContext,
+  BossDetailScanEntry,
+  BossDetailScanResult,
+  BossDetailSelection,
+  BossIdentitySignal,
+  BossIdentitySignals,
+  BossIdentityVerification,
+  BossJobCard,
+  BossJobDetail,
+  BossJobIdentity,
+  BossPageBlock,
+  BossPageBlockReason,
+  BossPageType,
+  ScanSelectedBossDetailsOptions,
+  VerifyDetailIdentityInput,
+  WaitForBossDetailOptions,
+  WaitForBossDetailResult,
+} from "./types.js";
