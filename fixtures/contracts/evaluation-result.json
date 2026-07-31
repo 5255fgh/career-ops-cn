@@ -1,11 +1,5 @@
 {
-  "jobId": "123456789",
   "score": 86,
-  "summary": "岗位技术方向与求职偏好较匹配。",
-  "strengths": [
-    "技术栈包含 TypeScript 和 React"
-  ],
-  "risks": [
-    "职位描述未说明团队规模"
-  ]
+  "recommendation": "建议申请",
+  "rawReport": "岗位技术方向与求职偏好较匹配；技术栈包含 TypeScript 和 React。职位描述未说明团队规模，建议面试时进一步确认。"
 }

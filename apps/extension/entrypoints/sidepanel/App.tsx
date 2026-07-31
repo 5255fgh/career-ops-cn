@@ -1,76 +1,199 @@
-import { PageContextRequestSchema, PageContextResponseSchema } from '@career-ops-cn/shared';
-import { useEffect, useState } from 'react';
+import {
+  BridgeSettingsSchema,
+  MockJobDetailRequestSchema,
+  MockJobDetailResponseSchema,
+  type EvaluationResult,
+  type JobDetail,
+} from '@career-ops-cn/shared';
+import { type FormEvent, useEffect, useState } from 'react';
 import { browser } from 'wxt/browser';
 
-import { isZhipinUrl } from '../../lib/is-zhipin-host';
+import { BridgeClientError, createBridgeClient } from '../../lib/bridge-client';
 
-type PageStatus = 'checking' | 'zhipin' | 'other';
+const BRIDGE_TOKEN_STORAGE_KEY = 'bridgeToken';
 
-async function readActivePageStatus(): Promise<PageStatus> {
+interface FlowResult {
+  job: JobDetail;
+  evaluation: EvaluationResult;
+}
+
+async function requestMockJobDetail(): Promise<JobDetail> {
   const [activeTab] = await browser.tabs.query({ active: true, currentWindow: true });
 
   if (activeTab?.id === undefined) {
-    return 'other';
+    throw new Error('找不到当前浏览器标签页。');
   }
 
-  if (activeTab.url !== undefined) {
-    return isZhipinUrl(activeTab.url) ? 'zhipin' : 'other';
-  }
+  const request = MockJobDetailRequestSchema.parse({ type: 'mock-job-detail/request' });
 
+  let response: unknown;
   try {
-    const request = PageContextRequestSchema.parse({ type: 'page-context/request' });
-    const response: unknown = await browser.tabs.sendMessage(activeTab.id, request);
-    const parsedResponse = PageContextResponseSchema.safeParse(response);
-
-    return parsedResponse.success && parsedResponse.data.isZhipin ? 'zhipin' : 'other';
-  } catch {
-    return 'other';
+    response = await browser.tabs.sendMessage(activeTab.id, request);
+  } catch (error) {
+    throw new Error('无法读取 Mock JobDetail。请打开 zhipin.com 页面并刷新后再试。', {
+      cause: error,
+    });
   }
+
+  const parsed = MockJobDetailResponseSchema.safeParse(response);
+  if (!parsed.success) {
+    throw new Error('Content Script 返回的 Mock JobDetail 不符合 shared 契约。', {
+      cause: parsed.error,
+    });
+  }
+
+  return parsed.data.job;
+}
+
+function describeError(error: unknown): string {
+  if (error instanceof BridgeClientError || error instanceof Error) {
+    return error.message;
+  }
+
+  return '测试链路失败，请检查当前页面与 Bridge 状态。';
 }
 
 export function App() {
-  const [pageStatus, setPageStatus] = useState<PageStatus>('checking');
+  const [token, setToken] = useState('');
+  const [settingsMessage, setSettingsMessage] = useState('');
+  const [isRunning, setIsRunning] = useState(false);
+  const [flowError, setFlowError] = useState('');
+  const [result, setResult] = useState<FlowResult | null>(null);
 
   useEffect(() => {
     let disposed = false;
-    let refreshSequence = 0;
 
-    const refresh = () => {
-      const sequence = ++refreshSequence;
+    void browser.storage.local
+      .get(BRIDGE_TOKEN_STORAGE_KEY)
+      .then((storedValue) => {
+        const parsed = BridgeSettingsSchema.safeParse(storedValue);
 
-      void readActivePageStatus().then((nextStatus) => {
-        if (!disposed && sequence === refreshSequence) {
-          setPageStatus(nextStatus);
+        if (!disposed && parsed.success) {
+          setToken(parsed.data.bridgeToken);
+        }
+      })
+      .catch(() => {
+        if (!disposed) {
+          setSettingsMessage('无法读取已保存的 Bridge token。');
         }
       });
-    };
-
-    refresh();
-    browser.tabs.onActivated.addListener(refresh);
-    browser.tabs.onUpdated.addListener(refresh);
 
     return () => {
       disposed = true;
-      browser.tabs.onActivated.removeListener(refresh);
-      browser.tabs.onUpdated.removeListener(refresh);
     };
   }, []);
 
-  const pageDescription =
-    pageStatus === 'checking'
-      ? '正在识别当前页面…'
-      : pageStatus === 'zhipin'
-        ? '当前页面是 zhipin.com'
-        : '当前页面不是 zhipin.com';
+  const saveToken = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    const parsed = BridgeSettingsSchema.safeParse({ bridgeToken: token });
+
+    if (!parsed.success) {
+      setSettingsMessage('请输入 Bridge token。');
+      return;
+    }
+
+    try {
+      await browser.storage.local.set(parsed.data);
+      setToken(parsed.data.bridgeToken);
+      setSettingsMessage('Bridge token 已保存到本机扩展存储。');
+    } catch {
+      setSettingsMessage('Bridge token 保存失败。');
+    }
+  };
+
+  const runTestFlow = async () => {
+    const settings = BridgeSettingsSchema.safeParse({ bridgeToken: token });
+
+    if (!settings.success) {
+      setFlowError('请先输入并保存 Bridge token。');
+      return;
+    }
+
+    setIsRunning(true);
+    setFlowError('');
+    setResult(null);
+
+    try {
+      const job = await requestMockJobDetail();
+      const bridge = createBridgeClient({ token: settings.data.bridgeToken });
+      const savedJob = await bridge.saveJob(job);
+      const evaluation = await bridge.evaluateJob(savedJob.id);
+      setResult({ job, evaluation });
+    } catch (error) {
+      setFlowError(describeError(error));
+    } finally {
+      setIsRunning(false);
+    }
+  };
 
   return (
     <main className="panel">
       <p className="eyebrow">Career Ops CN</p>
-      <h1>基础环境可用</h1>
-      <p className={`page-status page-status--${pageStatus}`} role="status" aria-live="polite">
-        <span className="status-dot" aria-hidden="true" />
-        {pageDescription}
-      </p>
+      <h1>Mock 端到端链路</h1>
+
+      <form className="token-form" onSubmit={(event) => void saveToken(event)}>
+        <label htmlFor="bridge-token">Bridge token</label>
+        <div className="token-row">
+          <input
+            id="bridge-token"
+            type="password"
+            value={token}
+            autoComplete="off"
+            placeholder="输入本机 Bridge token"
+            onChange={(event) => {
+              setToken(event.target.value);
+              setSettingsMessage('');
+            }}
+          />
+          <button className="secondary-button" type="submit">
+            保存
+          </button>
+        </div>
+        {settingsMessage === '' ? null : (
+          <p className="form-message" role="status">
+            {settingsMessage}
+          </p>
+        )}
+      </form>
+
+      <button
+        className="primary-button"
+        type="button"
+        disabled={isRunning}
+        onClick={() => void runTestFlow()}
+      >
+        {isRunning ? '测试中…' : '测试链路'}
+      </button>
+
+      {flowError === '' ? null : (
+        <p className="error-message" role="alert">
+          {flowError}
+        </p>
+      )}
+
+      {result === null ? null : (
+        <section className="result-card" aria-label="评估结果">
+          <p className="result-label">Job</p>
+          <h2>{result.job.title}</h2>
+          <p className="company">{result.job.companyName}</p>
+
+          <dl className="evaluation-summary">
+            <div>
+              <dt>Score</dt>
+              <dd>{result.evaluation.score}</dd>
+            </div>
+            <div>
+              <dt>Recommendation</dt>
+              <dd>{result.evaluation.recommendation}</dd>
+            </div>
+          </dl>
+
+          <div className="raw-report">
+            <h3>Raw report</h3>
+            <p>{result.evaluation.rawReport}</p>
+          </div>
+        </section>
+      )}
     </main>
   );
 }

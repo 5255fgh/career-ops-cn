@@ -5,6 +5,7 @@
     "lib": ["ES2024", "DOM", "DOM.Iterable"],
     "module": "ESNext",
     "moduleResolution": "Bundler",
+    "resolveJsonModule": true,
     "noEmit": true
   },
   "include": ["entrypoints/**/*.ts", "entrypoints/**/*.tsx", "lib/**/*.ts", "wxt.config.ts"]

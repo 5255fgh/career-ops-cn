@@ -4,12 +4,19 @@ import { describe, expect, it } from "vitest";
 import type { ZodType } from "zod";
 
 import {
+  BridgeErrorResponseSchema,
+  BridgeSettingsSchema,
+  CreateJobRequestSchema,
   EvaluationResultSchema,
   HealthBadRequestResponseSchema,
   HealthRequestSchema,
   HealthResponseSchema,
   JobCardSchema,
   JobDetailSchema,
+  JobIdParamsSchema,
+  JobResponseSchema,
+  MockJobDetailRequestSchema,
+  MockJobDetailResponseSchema,
   PageContextRequestSchema,
   PageContextResponseSchema,
   PreferencesSchema,
@@ -89,6 +96,63 @@ const otherStrictContracts: Array<{
     schema: PageContextResponseSchema,
     value: { type: "page-context/response", isZhipin: true },
   },
+  {
+    name: "BridgeSettings",
+    schema: BridgeSettingsSchema,
+    value: { bridgeToken: "test-token" },
+  },
+  {
+    name: "BridgeErrorResponse",
+    schema: BridgeErrorResponseSchema,
+    value: { error: "not_found" },
+  },
+  {
+    name: "MockJobDetailRequest",
+    schema: MockJobDetailRequestSchema,
+    value: { type: "mock-job-detail/request" },
+  },
+  {
+    name: "MockJobDetailResponse",
+    schema: MockJobDetailResponseSchema,
+    value: {
+      type: "mock-job-detail/response",
+      job: readFixture("job-detail.json"),
+    },
+  },
+  {
+    name: "CreateJobRequest",
+    schema: CreateJobRequestSchema,
+    value: {
+      source: "boss",
+      sourceJobId: "123456789",
+      title: "前端开发工程师",
+      company: "示例科技",
+      salary: "20-30K·14薪",
+      location: "上海·浦东新区",
+      description: "负责招聘产品的前端功能开发与维护。",
+      url: "https://www.zhipin.com/job_detail/123456789.html",
+    },
+  },
+  {
+    name: "JobResponse",
+    schema: JobResponseSchema,
+    value: {
+      id: "1",
+      source: "boss",
+      sourceJobId: "123456789",
+      title: "前端开发工程师",
+      company: "示例科技",
+      salary: "20-30K·14薪",
+      location: "上海·浦东新区",
+      description: "负责招聘产品的前端功能开发与维护。",
+      url: "https://www.zhipin.com/job_detail/123456789.html",
+    },
+  },
+  {
+    name: "JobIdParams",
+    schema: JobIdParamsSchema,
+    value: { id: "1" },
+  },
 ];
 
 describe("其余边界对象", () => {
@@ -105,6 +169,17 @@ describe("其余边界对象", () => {
       JobCardSchema.parse({
         ...fixture,
         detailUrl: "https://example.com/job/123456789",
+      }),
+    ).toThrow();
+  });
+
+  it("CreateJobRequest 拒绝非 zhipin.com URL", () => {
+    expect(() =>
+      CreateJobRequestSchema.parse({
+        source: "boss",
+        title: "前端开发工程师",
+        company: "示例科技",
+        url: "https://example.com/job/123456789",
       }),
     ).toThrow();
   });

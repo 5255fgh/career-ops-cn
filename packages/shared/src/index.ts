@@ -37,6 +37,31 @@ export const JobDetailSchema = JobCardSchema.extend({
 
 export type JobDetail = z.infer<typeof JobDetailSchema>;
 
+export const CreateJobRequestSchema = z.strictObject({
+  source: z.literal("boss"),
+  sourceJobId: NonEmptyTextSchema.optional(),
+  title: NonEmptyTextSchema,
+  company: NonEmptyTextSchema,
+  salary: NonEmptyTextSchema.optional(),
+  location: NonEmptyTextSchema.optional(),
+  description: NonEmptyTextSchema.optional(),
+  url: ZhipinUrlSchema.optional(),
+});
+
+export type CreateJobRequest = z.infer<typeof CreateJobRequestSchema>;
+
+export const JobResponseSchema = CreateJobRequestSchema.extend({
+  id: NonEmptyTextSchema,
+}).strict();
+
+export type JobResponse = z.infer<typeof JobResponseSchema>;
+
+export const JobIdParamsSchema = z.strictObject({
+  id: NonEmptyTextSchema,
+});
+
+export type JobIdParams = z.infer<typeof JobIdParamsSchema>;
+
 export const PreferencesSchema = z.strictObject({
   targetTitles: z.array(NonEmptyTextSchema),
   locations: z.array(NonEmptyTextSchema),
@@ -55,11 +80,9 @@ export const ScreeningResultSchema = z.strictObject({
 export type ScreeningResult = z.infer<typeof ScreeningResultSchema>;
 
 export const EvaluationResultSchema = z.strictObject({
-  jobId: NonEmptyTextSchema,
   score: z.number().int().min(0).max(100),
-  summary: NonEmptyTextSchema,
-  strengths: z.array(NonEmptyTextSchema),
-  risks: z.array(NonEmptyTextSchema),
+  recommendation: NonEmptyTextSchema,
+  rawReport: NonEmptyTextSchema,
 });
 
 export type EvaluationResult = z.infer<typeof EvaluationResultSchema>;
@@ -90,6 +113,18 @@ export type HealthBadRequestResponse = z.infer<
   typeof HealthBadRequestResponseSchema
 >;
 
+export const BridgeErrorResponseSchema = z.strictObject({
+  error: z.enum(["invalid_request", "unauthorized", "not_found"]),
+});
+
+export type BridgeErrorResponse = z.infer<typeof BridgeErrorResponseSchema>;
+
+export const BridgeSettingsSchema = z.strictObject({
+  bridgeToken: NonEmptyTextSchema,
+});
+
+export type BridgeSettings = z.infer<typeof BridgeSettingsSchema>;
+
 export const PageContextRequestSchema = z.strictObject({
   type: z.literal("page-context/request"),
 });
@@ -103,9 +138,24 @@ export const PageContextResponseSchema = z.strictObject({
 
 export type PageContextResponse = z.infer<typeof PageContextResponseSchema>;
 
+export const MockJobDetailRequestSchema = z.strictObject({
+  type: z.literal("mock-job-detail/request"),
+});
+
+export type MockJobDetailRequest = z.infer<typeof MockJobDetailRequestSchema>;
+
+export const MockJobDetailResponseSchema = z.strictObject({
+  type: z.literal("mock-job-detail/response"),
+  job: JobDetailSchema,
+});
+
+export type MockJobDetailResponse = z.infer<typeof MockJobDetailResponseSchema>;
+
 export const ExtensionMessageSchema = z.discriminatedUnion("type", [
   PageContextRequestSchema,
   PageContextResponseSchema,
+  MockJobDetailRequestSchema,
+  MockJobDetailResponseSchema,
 ]);
 
 export type ExtensionMessage = z.infer<typeof ExtensionMessageSchema>;
