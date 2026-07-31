@@ -7,6 +7,8 @@ import {
   BridgeErrorResponseSchema,
   BridgeSettingsSchema,
   CreateJobRequestSchema,
+  DecisionRequestSchema,
+  DecisionResponseSchema,
   EvaluationResultSchema,
   HealthBadRequestResponseSchema,
   HealthRequestSchema,
@@ -14,12 +16,16 @@ import {
   JobCardSchema,
   JobDetailSchema,
   JobIdParamsSchema,
+  JobListResponseSchema,
   JobResponseSchema,
   MockJobDetailRequestSchema,
   MockJobDetailResponseSchema,
   PageContextRequestSchema,
   PageContextResponseSchema,
   PreferencesSchema,
+  PossibleDuplicateSchema,
+  ScreenRequestSchema,
+  ScreenResponseSchema,
   ScreeningResultSchema,
   UserDecisionSchema,
 } from "../src/index.js";
@@ -64,10 +70,12 @@ const otherStrictContracts: Array<{
     name: "Preferences",
     schema: PreferencesSchema,
     value: {
-      targetTitles: ["前端开发工程师"],
-      locations: ["上海"],
-      requiredKeywords: ["TypeScript"],
-      excludedKeywords: ["外包"],
+      location: { allowed: ["上海"] },
+      salary: { minimum: 20_000, period: "month" },
+      company: { blocklist: ["风险公司"] },
+      keyword: { blocklist: ["外包"], warning: ["大小周"] },
+      skill: { requiredAny: ["TypeScript"] },
+      jd: { minimumLength: 20 },
     },
   },
   {
@@ -84,7 +92,7 @@ const otherStrictContracts: Array<{
   {
     name: "HealthBadRequestResponse",
     schema: HealthBadRequestResponseSchema,
-    value: { error: "invalid_request" },
+    value: { error: "INVALID_REQUEST" },
   },
   {
     name: "PageContextRequest",
@@ -104,7 +112,7 @@ const otherStrictContracts: Array<{
   {
     name: "BridgeErrorResponse",
     schema: BridgeErrorResponseSchema,
-    value: { error: "not_found" },
+    value: { error: "JOB_NOT_FOUND" },
   },
   {
     name: "MockJobDetailRequest",
@@ -146,6 +154,38 @@ const otherStrictContracts: Array<{
       location: "上海·浦东新区",
       description: "负责招聘产品的前端功能开发与维护。",
       url: "https://www.zhipin.com/job_detail/123456789.html",
+      identityVerified: true,
+    },
+  },
+  {
+    name: "PossibleDuplicate",
+    schema: PossibleDuplicateSchema,
+    value: { jobId: "2", reason: "same_company_and_title" },
+  },
+  {
+    name: "ScreenRequest",
+    schema: ScreenRequestSchema,
+    value: {
+      jobs: [readFixture("job-card.json")],
+      preferences: {
+        location: { allowed: ["上海"] },
+        keyword: { blocklist: ["外包"] },
+        skill: { requiredAny: ["TypeScript"] },
+      },
+    },
+  },
+  {
+    name: "DecisionRequest",
+    schema: DecisionRequestSchema,
+    value: { decision: "review", reason: "需要人工复核" },
+  },
+  {
+    name: "DecisionResponse",
+    schema: DecisionResponseSchema,
+    value: {
+      jobId: "1",
+      decision: "apply",
+      outcome: "已确认",
     },
   },
   {
@@ -162,6 +202,25 @@ describe("其余边界对象", () => {
       expect(() => schema.parse({ ...value, unexpected: true })).toThrow();
     });
   }
+
+  it("列表响应只接受对应契约数组", () => {
+    expect(() =>
+      ScreenResponseSchema.parse([readFixture("screening-result.json")]),
+    ).not.toThrow();
+    expect(() =>
+      JobListResponseSchema.parse([
+        {
+          id: "1",
+          source: "boss",
+          title: "前端开发工程师",
+          company: "示例科技",
+          identityVerified: false,
+        },
+      ]),
+    ).not.toThrow();
+    expect(() => ScreenResponseSchema.parse({})).toThrow();
+    expect(() => JobListResponseSchema.parse({})).toThrow();
+  });
 
   it("JobCard 拒绝非 zhipin.com URL", () => {
     const fixture = readFixture("job-card.json");

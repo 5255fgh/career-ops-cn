@@ -2,8 +2,11 @@ import { randomUUID } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
 
 import {
+  DecisionResponseSchema,
   JobResponseSchema,
   type CreateJobRequest,
+  type DecisionRequest,
+  type DecisionResponse,
   type EvaluationResult,
   type JobResponse,
 } from "@career-ops-cn/shared";
@@ -12,12 +15,56 @@ interface JobRow {
   id: string;
   source: string;
   source_job_id: string | null;
+  normalized_url: string | null;
   title: string;
   company: string;
   salary: string | null;
   location: string | null;
+  experience: string | null;
+  education: string | null;
   description: string | null;
   url: string | null;
+  identity_verified: number;
+}
+
+interface JobColumnRow {
+  name: string;
+}
+
+const JOB_COLUMNS: ReadonlyArray<readonly [string, string]> = [
+  ["normalized_url", "TEXT"],
+  ["experience", "TEXT"],
+  ["education", "TEXT"],
+  [
+    "identity_verified",
+    "INTEGER NOT NULL DEFAULT 0 CHECK (identity_verified IN (0, 1))",
+  ],
+];
+
+export interface JobUpsertResult {
+  job: JobResponse;
+  possibleDuplicateJobId?: string;
+}
+
+export function normalizeJobUrl(value: string | undefined): string | null {
+  if (value === undefined) {
+    return null;
+  }
+
+  const url = new URL(value);
+  url.hash = "";
+  url.search = "";
+  url.hostname = url.hostname.toLowerCase();
+
+  if (url.port === "443") {
+    url.port = "";
+  }
+
+  if (url.pathname.length > 1) {
+    url.pathname = url.pathname.replace(/\/+$/u, "");
+  }
+
+  return url.toString();
 }
 
 export function initializeDatabase(database: DatabaseSync): void {
@@ -28,12 +75,17 @@ export function initializeDatabase(database: DatabaseSync): void {
       id TEXT PRIMARY KEY NOT NULL,
       source TEXT NOT NULL,
       source_job_id TEXT,
+      normalized_url TEXT,
       title TEXT NOT NULL,
       company TEXT NOT NULL,
       salary TEXT,
       location TEXT,
+      experience TEXT,
+      education TEXT,
       description TEXT,
       url TEXT,
+      identity_verified INTEGER NOT NULL DEFAULT 0
+        CHECK (identity_verified IN (0, 1)),
       UNIQUE (source, source_job_id)
     ) STRICT;
 
@@ -44,7 +96,43 @@ export function initializeDatabase(database: DatabaseSync): void {
       recommendation TEXT NOT NULL,
       raw_report TEXT NOT NULL
     ) STRICT;
+
+    CREATE TABLE IF NOT EXISTS decisions (
+      job_id TEXT PRIMARY KEY NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+      decision TEXT NOT NULL CHECK (decision IN ('apply', 'review', 'skip')),
+      reason TEXT,
+      outcome TEXT
+    ) STRICT;
+
+    CREATE INDEX IF NOT EXISTS jobs_normalized_url_idx
+      ON jobs (source, normalized_url)
+      WHERE normalized_url IS NOT NULL;
   `);
+
+  const existingColumns = new Set(
+    (
+      database.prepare("PRAGMA table_info(jobs)").all() as unknown as
+        JobColumnRow[]
+    ).map(({ name }) => name),
+  );
+
+  for (const [name, definition] of JOB_COLUMNS) {
+    if (!existingColumns.has(name)) {
+      database.exec(`ALTER TABLE jobs ADD COLUMN ${name} ${definition}`);
+    }
+  }
+
+  const legacyRows = database
+    .prepare(
+      "SELECT id, url FROM jobs WHERE url IS NOT NULL AND normalized_url IS NULL",
+    )
+    .all() as Array<{ id: string; url: string }>;
+  const updateNormalizedUrl = database.prepare(
+    "UPDATE jobs SET normalized_url = ? WHERE id = ?",
+  );
+  for (const row of legacyRows) {
+    updateNormalizedUrl.run(normalizeJobUrl(row.url), row.id);
+  }
 }
 
 function rowToJob(row: JobRow): JobResponse {
@@ -58,59 +146,135 @@ function rowToJob(row: JobRow): JobResponse {
     company: row.company,
     ...(row.salary === null ? {} : { salary: row.salary }),
     ...(row.location === null ? {} : { location: row.location }),
+    ...(row.experience === null ? {} : { experience: row.experience }),
+    ...(row.education === null ? {} : { education: row.education }),
     ...(row.description === null
       ? {}
       : { description: row.description }),
     ...(row.url === null ? {} : { url: row.url }),
+    identityVerified: row.identity_verified === 1,
   });
+}
+
+function findJobRowForUpsert(
+  database: DatabaseSync,
+  input: CreateJobRequest,
+  normalizedUrl: string | null,
+): JobRow | undefined {
+  if (input.sourceJobId !== undefined) {
+    const sourceJobMatch = database
+      .prepare(
+        "SELECT * FROM jobs WHERE source = ? AND source_job_id = ?",
+      )
+      .get(input.source, input.sourceJobId) as JobRow | undefined;
+
+    if (sourceJobMatch !== undefined) {
+      return sourceJobMatch;
+    }
+  }
+
+  if (normalizedUrl === null) {
+    return undefined;
+  }
+
+  return database
+    .prepare(
+      "SELECT * FROM jobs WHERE source = ? AND normalized_url = ? ORDER BY rowid LIMIT 1",
+    )
+    .get(input.source, normalizedUrl) as JobRow | undefined;
+}
+
+function jobValues(
+  id: string,
+  sourceJobId: string | null,
+  normalizedUrl: string | null,
+  input: CreateJobRequest,
+): readonly (string | number | null)[] {
+  return [
+    id,
+    input.source,
+    sourceJobId,
+    normalizedUrl,
+    input.title,
+    input.company,
+    input.salary ?? null,
+    input.location ?? null,
+    input.experience ?? null,
+    input.education ?? null,
+    input.description ?? null,
+    input.url ?? null,
+    input.identityVerified ? 1 : 0,
+  ];
 }
 
 export function saveJob(
   database: DatabaseSync,
   input: CreateJobRequest,
-): JobResponse {
-  const values = [
-    randomUUID(),
-    input.source,
-    input.sourceJobId ?? null,
-    input.title,
-    input.company,
-    input.salary ?? null,
-    input.location ?? null,
-    input.description ?? null,
-    input.url ?? null,
-  ] as const;
+): JobUpsertResult {
+  const normalizedUrl = normalizeJobUrl(input.url);
+  database.exec("BEGIN IMMEDIATE");
 
-  const sql = input.sourceJobId
-    ? `
-        INSERT INTO jobs (
-          id, source, source_job_id, title, company,
-          salary, location, description, url
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT (source, source_job_id) DO UPDATE SET
-          title = excluded.title,
-          company = excluded.company,
-          salary = excluded.salary,
-          location = excluded.location,
-          description = excluded.description,
-          url = excluded.url
-        RETURNING *
-      `
-    : `
-        INSERT INTO jobs (
-          id, source, source_job_id, title, company,
-          salary, location, description, url
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        RETURNING *
-      `;
+  try {
+    const existing = findJobRowForUpsert(database, input, normalizedUrl);
+    const id = existing?.id ?? randomUUID();
+    const sourceJobId = input.sourceJobId ?? existing?.source_job_id ?? null;
+    const values = jobValues(id, sourceJobId, normalizedUrl, input);
 
-  const row = database.prepare(sql).get(...values) as JobRow | undefined;
+    const row = database
+      .prepare(
+        `
+          INSERT INTO jobs (
+            id, source, source_job_id, normalized_url, title, company,
+            salary, location, experience, education, description, url,
+            identity_verified
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          ON CONFLICT (id) DO UPDATE SET
+            source = excluded.source,
+            source_job_id = excluded.source_job_id,
+            normalized_url = excluded.normalized_url,
+            title = excluded.title,
+            company = excluded.company,
+            salary = excluded.salary,
+            location = excluded.location,
+            experience = excluded.experience,
+            education = excluded.education,
+            description = excluded.description,
+            url = excluded.url,
+            identity_verified = excluded.identity_verified
+          RETURNING *
+        `,
+      )
+      .get(...values) as JobRow | undefined;
 
-  if (row === undefined) {
-    throw new Error("保存职位后未能读取记录。");
+    if (row === undefined) {
+      throw new Error("保存职位后未能读取记录。");
+    }
+
+    const possibleDuplicate = database
+      .prepare(
+        `
+          SELECT id
+          FROM jobs
+          WHERE id <> ?
+            AND title = ? COLLATE NOCASE
+            AND company = ? COLLATE NOCASE
+          ORDER BY rowid
+          LIMIT 1
+        `,
+      )
+      .get(id, input.title, input.company) as { id: string } | undefined;
+
+    database.exec("COMMIT");
+    return {
+      job: rowToJob(row),
+      ...(possibleDuplicate === undefined
+        ? {}
+        : { possibleDuplicateJobId: possibleDuplicate.id }),
+    };
+  } catch (error) {
+    database.exec("ROLLBACK");
+    throw error;
   }
-
-  return rowToJob(row);
 }
 
 export function findJob(
@@ -122,6 +286,13 @@ export function findJob(
     | undefined;
 
   return row === undefined ? undefined : rowToJob(row);
+}
+
+export function listJobs(database: DatabaseSync): JobResponse[] {
+  return (
+    database.prepare("SELECT * FROM jobs ORDER BY rowid").all() as unknown as
+      JobRow[]
+  ).map(rowToJob);
 }
 
 export function saveEvaluation(
@@ -144,4 +315,47 @@ export function saveEvaluation(
       evaluation.recommendation,
       evaluation.rawReport,
     );
+}
+
+export function saveDecision(
+  database: DatabaseSync,
+  jobId: string,
+  decision: DecisionRequest,
+): DecisionResponse {
+  const row = database
+    .prepare(
+      `
+        INSERT INTO decisions (job_id, decision, reason, outcome)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT (job_id) DO UPDATE SET
+          decision = excluded.decision,
+          reason = excluded.reason,
+          outcome = excluded.outcome
+        RETURNING *
+      `,
+    )
+    .get(
+      jobId,
+      decision.decision,
+      decision.reason ?? null,
+      decision.outcome ?? null,
+    ) as
+    | {
+        job_id: string;
+        decision: string;
+        reason: string | null;
+        outcome: string | null;
+      }
+    | undefined;
+
+  if (row === undefined) {
+    throw new Error("保存决策后未能读取记录。");
+  }
+
+  return DecisionResponseSchema.parse({
+    jobId: row.job_id,
+    decision: row.decision,
+    ...(row.reason === null ? {} : { reason: row.reason }),
+    ...(row.outcome === null ? {} : { outcome: row.outcome }),
+  });
 }

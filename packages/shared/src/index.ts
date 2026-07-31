@@ -44,14 +44,25 @@ export const CreateJobRequestSchema = z.strictObject({
   company: NonEmptyTextSchema,
   salary: NonEmptyTextSchema.optional(),
   location: NonEmptyTextSchema.optional(),
+  experience: NonEmptyTextSchema.optional(),
+  education: NonEmptyTextSchema.optional(),
   description: NonEmptyTextSchema.optional(),
   url: ZhipinUrlSchema.optional(),
+  identityVerified: z.boolean().default(false),
 });
 
 export type CreateJobRequest = z.infer<typeof CreateJobRequestSchema>;
 
+export const PossibleDuplicateSchema = z.strictObject({
+  jobId: NonEmptyTextSchema,
+  reason: z.literal("same_company_and_title"),
+});
+
+export type PossibleDuplicate = z.infer<typeof PossibleDuplicateSchema>;
+
 export const JobResponseSchema = CreateJobRequestSchema.extend({
   id: NonEmptyTextSchema,
+  possibleDuplicate: PossibleDuplicateSchema.optional(),
 }).strict();
 
 export type JobResponse = z.infer<typeof JobResponseSchema>;
@@ -63,10 +74,38 @@ export const JobIdParamsSchema = z.strictObject({
 export type JobIdParams = z.infer<typeof JobIdParamsSchema>;
 
 export const PreferencesSchema = z.strictObject({
-  targetTitles: z.array(NonEmptyTextSchema),
-  locations: z.array(NonEmptyTextSchema),
-  requiredKeywords: z.array(NonEmptyTextSchema),
-  excludedKeywords: z.array(NonEmptyTextSchema),
+  location: z
+    .strictObject({
+      allowed: z.array(NonEmptyTextSchema).optional(),
+    })
+    .optional(),
+  salary: z
+    .strictObject({
+      minimum: z.number().nonnegative().optional(),
+      period: z.enum(["month", "day", "year"]).optional(),
+    })
+    .optional(),
+  company: z
+    .strictObject({
+      blocklist: z.array(NonEmptyTextSchema).optional(),
+    })
+    .optional(),
+  keyword: z
+    .strictObject({
+      blocklist: z.array(NonEmptyTextSchema).optional(),
+      warning: z.array(NonEmptyTextSchema).optional(),
+    })
+    .optional(),
+  skill: z
+    .strictObject({
+      requiredAny: z.array(NonEmptyTextSchema).optional(),
+    })
+    .optional(),
+  jd: z
+    .strictObject({
+      minimumLength: z.number().int().positive().optional(),
+    })
+    .optional(),
 });
 
 export type Preferences = z.infer<typeof PreferencesSchema>;
@@ -79,6 +118,17 @@ export const ScreeningResultSchema = z.strictObject({
 
 export type ScreeningResult = z.infer<typeof ScreeningResultSchema>;
 
+export const ScreenRequestSchema = z.strictObject({
+  jobs: z.array(JobCardSchema),
+  preferences: PreferencesSchema.optional(),
+});
+
+export type ScreenRequest = z.infer<typeof ScreenRequestSchema>;
+
+export const ScreenResponseSchema = z.array(ScreeningResultSchema);
+
+export type ScreenResponse = z.infer<typeof ScreenResponseSchema>;
+
 export const EvaluationResultSchema = z.strictObject({
   score: z.number().int().min(0).max(100),
   recommendation: NonEmptyTextSchema,
@@ -86,6 +136,24 @@ export const EvaluationResultSchema = z.strictObject({
 });
 
 export type EvaluationResult = z.infer<typeof EvaluationResultSchema>;
+
+export const JobListResponseSchema = z.array(JobResponseSchema);
+
+export type JobListResponse = z.infer<typeof JobListResponseSchema>;
+
+export const DecisionRequestSchema = z.strictObject({
+  decision: z.enum(["apply", "review", "skip"]),
+  reason: NonEmptyTextSchema.optional(),
+  outcome: NonEmptyTextSchema.optional(),
+});
+
+export type DecisionRequest = z.infer<typeof DecisionRequestSchema>;
+
+export const DecisionResponseSchema = DecisionRequestSchema.extend({
+  jobId: NonEmptyTextSchema,
+}).strict();
+
+export type DecisionResponse = z.infer<typeof DecisionResponseSchema>;
 
 export const UserDecisionSchema = z.strictObject({
   jobId: NonEmptyTextSchema,
@@ -106,7 +174,7 @@ export const HealthResponseSchema = z.strictObject({
 export type HealthResponse = z.infer<typeof HealthResponseSchema>;
 
 export const HealthBadRequestResponseSchema = z.strictObject({
-  error: z.literal("invalid_request"),
+  error: z.literal("INVALID_REQUEST"),
 });
 
 export type HealthBadRequestResponse = z.infer<
@@ -114,7 +182,18 @@ export type HealthBadRequestResponse = z.infer<
 >;
 
 export const BridgeErrorResponseSchema = z.strictObject({
-  error: z.enum(["invalid_request", "unauthorized", "not_found"]),
+  error: z.enum([
+    "UNAUTHORIZED",
+    "INVALID_REQUEST",
+    "JOB_NOT_FOUND",
+    "INVALID_JOB_DETAIL",
+    "DETAIL_IDENTITY_UNVERIFIED",
+    "EVALUATION_FAILED",
+    "EVALUATION_TIMEOUT",
+    "CANCELLED",
+    "CAREER_OPS_NOT_FOUND",
+    "DATABASE_ERROR",
+  ]),
 });
 
 export type BridgeErrorResponse = z.infer<typeof BridgeErrorResponseSchema>;
