@@ -239,6 +239,36 @@ describe("screen", () => {
       await bridge.close();
     }
   });
+
+  it("review 属于非 block，允许进入详情 Top N", async () => {
+    const { database } = await createTempDatabase();
+    const bridge = createBridge({
+      environment: TEST_ENVIRONMENT,
+      database,
+      screenJob: () => ({
+        decision: "review",
+        rules: [{ decision: "warning", reason: "需要人工复核" }],
+      }),
+    });
+
+    try {
+      const response = await bridge.inject({
+        method: "POST",
+        url: "/screen",
+        headers: AUTHORIZATION,
+        payload: { jobs: [JOB_CARD] },
+      });
+      expect(ScreenResponseSchema.parse(response.json())).toEqual([
+        {
+          jobId: JOB_CARD.jobId,
+          matched: true,
+          reasons: ["需要人工复核"],
+        },
+      ]);
+    } finally {
+      await bridge.close();
+    }
+  });
 });
 
 describe("职位 upsert 与读取", () => {
@@ -533,6 +563,62 @@ describe("evaluate", () => {
 });
 
 describe("decision 与持久化", () => {
+  it("GET /jobs 返回最近评估与用户判断", async () => {
+    const { database } = await createTempDatabase();
+    const evaluator = vi.fn<Evaluator>(async () => ({
+      score: 89,
+      recommendation: "apply",
+      rawReport: "完整评估报告",
+      company: "示例科技",
+      role: "前端开发工程师",
+      archetype: "Builder",
+      legitimacy: "high",
+    }));
+    const bridge = createBridge({
+      environment: TEST_ENVIRONMENT,
+      database,
+      evaluator,
+      screenJob: PASS_SCREEN_JOB,
+    });
+
+    try {
+      const job = await postJob(bridge);
+      const evaluation = await bridge.inject({
+        method: "POST",
+        url: `/jobs/${job.id}/evaluate`,
+        headers: AUTHORIZATION,
+      });
+      expect(evaluation.statusCode).toBe(200);
+      const decision = await bridge.inject({
+        method: "POST",
+        url: `/jobs/${job.id}/decision`,
+        headers: AUTHORIZATION,
+        payload: { decision: "apply" },
+      });
+      expect(decision.statusCode).toBe(200);
+
+      const response = await bridge.inject({
+        method: "GET",
+        url: "/jobs",
+        headers: AUTHORIZATION,
+      });
+      const [history] = JobListResponseSchema.parse(response.json());
+      expect(history).toMatchObject({
+        id: job.id,
+        latestEvaluation: {
+          score: 89,
+          recommendation: "apply",
+          archetype: "Builder",
+          legitimacy: "high",
+          rawReport: "完整评估报告",
+        },
+        decision: { jobId: job.id, decision: "apply" },
+      });
+    } finally {
+      await bridge.close();
+    }
+  });
+
   it("对同一 job 幂等更新 decision", async () => {
     const { database } = await createTempDatabase();
     const bridge = createBridge({ environment: TEST_ENVIRONMENT, database });

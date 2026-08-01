@@ -1,0 +1,15 @@
+{
+  "search-list.html": { "pageType": "search-list", "block": null },
+  "job-detail.html": { "pageType": "job-detail", "block": null },
+  "search-detail-panel.html": { "pageType": "search-detail-panel", "block": null },
+  "company-job-list.html": { "pageType": "company-job-list", "block": null },
+  "missing-fields.html": { "pageType": "job-detail", "block": null },
+  "login.html": { "pageType": "login", "block": "login_required" },
+  "challenge.html": { "pageType": "challenge", "block": "challenge" },
+  "account-risk.html": { "pageType": "unsupported", "block": "account_risk" },
+  "empty-page.html": { "pageType": "unsupported", "block": "empty_page" },
+  "unknown-layout.html": { "pageType": "unsupported", "block": "unsupported_layout" },
+  "stale-detail-b.html": { "pageType": "search-detail-panel", "block": null },
+  "detail-unchanged.html": { "pageType": "search-detail-panel", "block": null },
+  "no-source-id.html": { "pageType": "search-detail-panel", "block": null }
+}

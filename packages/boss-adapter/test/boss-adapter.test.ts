@@ -1,0 +1,368 @@
+import { readFileSync } from "node:fs";
+
+import { Window } from "happy-dom";
+import { afterEach, describe, expect, it, vi } from "vitest";
+
+import {
+  detectBossPage,
+  detectBossPageBlock,
+  parseBossDetail,
+  parseVisibleBossCards,
+  scanSelectedBossDetails,
+  verifyDetailIdentity,
+  waitForBossDetail,
+} from "../src/index.js";
+import type {
+  BossJobIdentity,
+  BossPageBlockReason,
+  BossPageType,
+} from "../src/index.js";
+
+const fixtureUrl = (filename: string): URL =>
+  new URL(`../../../fixtures/boss/${filename}`, import.meta.url);
+
+const readFixture = (filename: string): string =>
+  readFileSync(fixtureUrl(filename), "utf8");
+
+const createDocument = (
+  filename: string,
+  url: string,
+): { window: Window; document: Document } => {
+  const window = new Window({ url });
+  window.document.write(readFixture(filename));
+  window.document.close();
+  return { window, document: window.document as unknown as Document };
+};
+
+const fixtureUrls: Record<string, string> = {
+  "search-list.html": "https://www.zhipin.com/web/geek/job?query=typescript",
+  "job-detail.html": "https://www.zhipin.com/job_detail/boss-2001.html",
+  "search-detail-panel.html":
+    "https://www.zhipin.com/web/geek/job?query=frontend",
+  "company-job-list.html": "https://www.zhipin.com/gongsi/job/example.html",
+  "missing-fields.html": "https://www.zhipin.com/job_detail/boss-5001.html",
+  "login.html": "https://www.zhipin.com/web/user/?ka=header-login",
+  "challenge.html": "https://www.zhipin.com/web/common/challenge",
+  "account-risk.html": "https://www.zhipin.com/web/geek/job",
+  "empty-page.html": "https://www.zhipin.com/web/geek/job",
+  "unknown-layout.html": "https://www.zhipin.com/other",
+  "stale-detail-b.html": "https://www.zhipin.com/web/geek/job",
+  "detail-unchanged.html": "https://www.zhipin.com/web/geek/job",
+  "no-source-id.html": "https://www.zhipin.com/web/geek/job",
+};
+
+const expectations = JSON.parse(readFixture("expectations.json")) as Record<
+  string,
+  { pageType: BossPageType; block: BossPageBlockReason | null }
+>;
+
+afterEach(() => {
+  vi.useRealTimers();
+});
+
+describe("fixture 页面识别和阻断", () => {
+  for (const [filename, expected] of Object.entries(expectations)) {
+    it(`${filename} 符合页面与阻断预期`, () => {
+      const url = fixtureUrls[filename];
+      if (url === undefined) {
+        throw new Error(`fixture 缺少 URL: ${filename}`);
+      }
+      const { window, document } = createDocument(filename, url);
+
+      expect(detectBossPage(document, url)).toBe(expected.pageType);
+      expect(detectBossPageBlock(document, url)?.reason ?? null).toBe(
+        expected.block,
+      );
+      window.close();
+    });
+  }
+});
+
+describe("列表解析", () => {
+  it("提取可见搜索卡片并过滤隐藏卡片", () => {
+    const url = fixtureUrls["search-list.html"]!;
+    const { window, document } = createDocument("search-list.html", url);
+
+    expect(parseVisibleBossCards(document, url)).toEqual([
+      {
+        sourceJobId: "boss-1001",
+        url: "https://www.zhipin.com/job_detail/boss-1001.html",
+        title: "前端开发工程师",
+        company: "示例甲科技",
+        salaryRaw: "20-30K·14薪",
+        city: "上海·浦东新区",
+        experience: "3-5年",
+        education: "本科",
+        tags: ["TypeScript", "React"],
+      },
+      {
+        sourceJobId: "boss-1002",
+        url: "https://www.zhipin.com/job_detail/boss-1002.html",
+        title: "Node.js 开发工程师",
+        company: "示例乙网络",
+        salaryRaw: "18-28K",
+        city: "北京·海淀区",
+        experience: "1-3年",
+        education: "本科",
+        tags: ["Node.js"],
+      },
+    ]);
+    window.close();
+  });
+
+  it("解析公司职位列表", () => {
+    const url = fixtureUrls["company-job-list.html"]!;
+    const { window, document } = createDocument("company-job-list.html", url);
+
+    expect(parseVisibleBossCards(document, url)).toHaveLength(1);
+    expect(parseVisibleBossCards(document, url)[0]?.sourceJobId).toBe(
+      "boss-4001",
+    );
+    window.close();
+  });
+});
+
+describe("详情解析", () => {
+  it("提取独立详情字段、时间与空 warnings", () => {
+    const url = fixtureUrls["job-detail.html"]!;
+    const { window, document } = createDocument("job-detail.html", url);
+    const detail = parseBossDetail(document, url);
+
+    expect(detail).toMatchObject({
+      sourceJobId: "boss-2001",
+      url: "https://www.zhipin.com/job_detail/boss-2001.html",
+      title: "高级前端工程师",
+      company: "示例丙软件",
+      salaryRaw: "25-35K·15薪",
+      city: "深圳·南山区",
+      experience: "5-10年",
+      education: "本科",
+      tags: ["Vue", "TypeScript"],
+      description: "负责复杂业务前端架构与核心功能开发。",
+      warnings: [],
+    });
+    expect(Number.isNaN(Date.parse(detail?.capturedAt ?? ""))).toBe(false);
+    window.close();
+  });
+
+  it("提取搜索页详情面板", () => {
+    const url = fixtureUrls["search-detail-panel.html"]!;
+    const { window, document } = createDocument(
+      "search-detail-panel.html",
+      url,
+    );
+
+    expect(parseBossDetail(document, url)).toMatchObject({
+      sourceJobId: "boss-3001",
+      title: "Web 前端工程师",
+      description: "负责 Web 产品研发与维护。",
+    });
+    window.close();
+  });
+
+  it("字段缺失返回 null 和 warning，不抛无关异常", () => {
+    const url = fixtureUrls["missing-fields.html"]!;
+    const { window, document } = createDocument("missing-fields.html", url);
+    const detail = parseBossDetail(document, url);
+
+    expect(detail?.company).toBeNull();
+    expect(detail?.salaryRaw).toBeNull();
+    expect(detail?.warnings).toEqual(
+      expect.arrayContaining([
+        "missing_company",
+        "missing_salary",
+        "missing_city",
+        "missing_experience",
+        "missing_education",
+      ]),
+    );
+    window.close();
+  });
+});
+
+describe("详情身份校验", () => {
+  it("点击 A 但详情仍为 B 时失败", () => {
+    const url = fixtureUrls["stale-detail-b.html"]!;
+    const { window, document } = createDocument("stale-detail-b.html", url);
+    const detail = parseBossDetail(document, url)!;
+    const activeCard = parseVisibleBossCards(document, url)[0]!;
+
+    const result = verifyDetailIdentity({
+      expected: {
+        sourceJobId: "boss-a",
+        url: "https://www.zhipin.com/job_detail/boss-a.html",
+        title: "职位 A",
+      },
+      detail,
+      activeCard,
+      previousDetail: detail,
+    });
+
+    expect(result.verified).toBe(false);
+    expect(result.matchedSignals).toEqual(["active_card"]);
+    window.close();
+  });
+
+  it("无 sourceJobId 时可由标题和 active card 两个信号验证", () => {
+    const url = fixtureUrls["no-source-id.html"]!;
+    const { window, document } = createDocument("no-source-id.html", url);
+    const detail = parseBossDetail(document, url)!;
+    const activeCard = parseVisibleBossCards(document, url)[0]!;
+
+    const result = verifyDetailIdentity({
+      expected: { sourceJobId: null, url: null, title: "无编号前端职位" },
+      detail,
+      activeCard,
+    });
+
+    expect(detail.sourceJobId).toBeNull();
+    expect(result.verified).toBe(true);
+    expect(result.matchedSignals).toEqual(["title", "active_card"]);
+    window.close();
+  });
+});
+
+describe("等待与批量扫描", () => {
+  const expectedA: BossJobIdentity = {
+    sourceJobId: "boss-a",
+    url: "https://www.zhipin.com/job_detail/boss-a.html",
+    title: "职位 A",
+  };
+
+  it("详情内容未变化时等待到可预测 timeout", async () => {
+    vi.useFakeTimers();
+    const url = fixtureUrls["detail-unchanged.html"]!;
+    const { window, document } = createDocument("detail-unchanged.html", url);
+    const previousDetail = parseBossDetail(document, url)!;
+    let settled = false;
+    const pending = waitForBossDetail({
+      document,
+      url,
+      expected: expectedA,
+      previousDetail,
+      timeoutMs: 250,
+    }).then((result) => {
+      settled = true;
+      return result;
+    });
+
+    await vi.advanceTimersByTimeAsync(249);
+    expect(settled).toBe(false);
+    await vi.advanceTimersByTimeAsync(1);
+    await expect(pending).resolves.toMatchObject({ status: "timeout" });
+    window.close();
+  });
+
+  it("MutationObserver 在详情变化并满足 predicate 后返回 verified", async () => {
+    const url = fixtureUrls["detail-unchanged.html"]!;
+    const { window, document } = createDocument("detail-unchanged.html", url);
+    const previousDetail = parseBossDetail(document, url)!;
+    const pending = waitForBossDetail({
+      document,
+      url,
+      expected: expectedA,
+      previousDetail,
+      timeoutMs: 1_000,
+      predicate: ({ detail }) => detail.description === "已经更新的职位 A 详情。",
+    });
+
+    document.getElementById("unchanged-description")!.textContent =
+      "已经更新的职位 A 详情。";
+
+    await expect(pending).resolves.toMatchObject({
+      status: "verified",
+      detail: { description: "已经更新的职位 A 详情。" },
+    });
+    window.close();
+  });
+
+  it("AbortSignal 可以中断等待", async () => {
+    const url = fixtureUrls["detail-unchanged.html"]!;
+    const { window, document } = createDocument("detail-unchanged.html", url);
+    const controller = new AbortController();
+    const pending = waitForBossDetail({
+      document,
+      url,
+      expected: expectedA,
+      previousDetail: parseBossDetail(document, url),
+      timeoutMs: 10_000,
+      signal: controller.signal,
+    });
+
+    controller.abort();
+    await expect(pending).resolves.toEqual({ status: "aborted" });
+    window.close();
+  });
+
+  it.each([
+    ["challenge.html", "challenge"],
+    ["account-risk.html", "account_risk"],
+  ] as const)("%s 命中后立即返回阻断结果", async (filename, reason) => {
+    const url = fixtureUrls[filename]!;
+    const { window, document } = createDocument(filename, url);
+
+    await expect(
+      waitForBossDetail({
+        document,
+        url,
+        expected: expectedA,
+        timeoutMs: 10_000,
+      }),
+    ).resolves.toMatchObject({ status: "blocked", block: { reason } });
+    window.close();
+  });
+
+  it("空 selections 扫描也会返回挑战阻断", async () => {
+    const filename = "challenge.html";
+    const url = fixtureUrls[filename]!;
+    const { window, document } = createDocument(filename, url);
+
+    await expect(
+      scanSelectedBossDetails({ document, url, selections: [] }),
+    ).resolves.toMatchObject({
+      entries: [],
+      details: [],
+      block: { reason: "challenge" },
+    });
+    window.close();
+  });
+
+  it("扫描选中卡片时只收集完成身份校验的详情", async () => {
+    const url = fixtureUrls["search-detail-panel.html"]!;
+    const { window, document } = createDocument(
+      "search-detail-panel.html",
+      url,
+    );
+    const cardB = document.getElementById("panel-card-b")!;
+    cardB.addEventListener("click", () => {
+      document
+        .getElementById("panel-detail")!
+        .setAttribute("data-jobid", "boss-3002");
+      document
+        .getElementById("panel-detail-link")!
+        .setAttribute("href", "/job_detail/boss-3002.html");
+      document.getElementById("panel-detail-title")!.textContent = "全栈工程师";
+      document.getElementById("panel-detail-company")!.textContent =
+        "示例戊科技";
+      document.getElementById("panel-description")!.textContent =
+        "负责全栈产品研发。";
+    });
+
+    const result = await scanSelectedBossDetails({
+      document,
+      url,
+      selections: [{ element: cardB }],
+      timeoutMs: 1_000,
+    });
+
+    expect(result.block).toBeNull();
+    expect(result.entries[0]?.result.status).toBe("verified");
+    expect(result.details).toHaveLength(1);
+    expect(result.details[0]).toMatchObject({
+      sourceJobId: "boss-3002",
+      title: "全栈工程师",
+      description: "负责全栈产品研发。",
+    });
+    window.close();
+  });
+});

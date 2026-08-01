@@ -1,0 +1,387 @@
+import {
+  ScanConfigSchema,
+  type BossPageBlockReason,
+  type DecisionResponse,
+  type EvaluationResult,
+  type JobDetail,
+  type JobResponse,
+  type ScanConfig,
+  type ScreeningResult,
+  type VisibleJobCard,
+} from '@career-ops-cn/shared';
+
+import { isAbortError, type BridgeClient } from './bridge-client';
+import type { ContentClient } from './content-client';
+
+export const DEFAULT_SCAN_CONFIG: ScanConfig = Object.freeze({
+  maxListJobs: 30,
+  maxDetailJobs: 8,
+  maxAiJobs: 5,
+  detailTimeoutMs: 8_000,
+  detailCooldownMs: 1_500,
+});
+
+export type ScanStatus =
+  | 'idle'
+  | 'reading-list'
+  | 'screening'
+  | 'reading-details'
+  | 'evaluating'
+  | 'completed'
+  | 'cancelled'
+  | 'failed';
+
+export type ScanStopReason =
+  | Exclude<BossPageBlockReason, 'empty_page'>
+  | 'detail_timeout_limit'
+  | 'identity_failure_limit';
+
+export interface ScanProgress {
+  listJobs: number;
+  screenedJobs: number;
+  detailCompleted: number;
+  detailTarget: number;
+  aiCompleted: number;
+  aiTarget: number;
+}
+
+export interface ScannedJob {
+  card: VisibleJobCard;
+  screening?: ScreeningResult;
+  detail?: JobDetail;
+  savedJob?: JobResponse;
+  evaluation?: EvaluationResult;
+  decision?: DecisionResponse;
+  detailError?: string;
+  evaluationError?: string;
+}
+
+export interface ScanState {
+  status: ScanStatus;
+  progress: ScanProgress;
+  results: ScannedJob[];
+  stopReason: ScanStopReason | null;
+  error: string | null;
+}
+
+export interface ScanControllerOptions {
+  content: ContentClient;
+  bridge: BridgeClient;
+  config?: Partial<ScanConfig>;
+  delay?: (milliseconds: number, signal: AbortSignal) => Promise<void>;
+}
+
+export type ScanStateListener = (state: ScanState) => void;
+
+const ACTIVE_STATUSES = new Set<ScanStatus>([
+  'reading-list',
+  'screening',
+  'reading-details',
+  'evaluating',
+]);
+
+const FATAL_PAGE_BLOCKS = new Set<BossPageBlockReason>([
+  'login_required',
+  'challenge',
+  'account_risk',
+  'unsupported_layout',
+]);
+
+function emptyProgress(): ScanProgress {
+  return {
+    listJobs: 0,
+    screenedJobs: 0,
+    detailCompleted: 0,
+    detailTarget: 0,
+    aiCompleted: 0,
+    aiTarget: 0,
+  };
+}
+
+function abortError(): DOMException {
+  return new DOMException('扫描已取消。', 'AbortError');
+}
+
+async function defaultDelay(milliseconds: number, signal: AbortSignal): Promise<void> {
+  if (milliseconds === 0) {
+    return;
+  }
+  if (signal.aborted) {
+    throw abortError();
+  }
+
+  await new Promise<void>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      signal.removeEventListener('abort', onAbort);
+      resolve();
+    }, milliseconds);
+    const onAbort = (): void => {
+      clearTimeout(timer);
+      reject(abortError());
+    };
+    signal.addEventListener('abort', onAbort, { once: true });
+  });
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : '扫描流程发生未知错误。';
+}
+
+export class ScanController {
+  readonly config: ScanConfig;
+  private readonly content: ContentClient;
+  private readonly bridge: BridgeClient;
+  private readonly delay: (milliseconds: number, signal: AbortSignal) => Promise<void>;
+  private readonly listeners = new Set<ScanStateListener>();
+  private abortController: AbortController | null = null;
+  private currentState: ScanState = {
+    status: 'idle',
+    progress: emptyProgress(),
+    results: [],
+    stopReason: null,
+    error: null,
+  };
+
+  constructor(options: ScanControllerOptions) {
+    this.content = options.content;
+    this.bridge = options.bridge;
+    this.config = ScanConfigSchema.parse({
+      ...DEFAULT_SCAN_CONFIG,
+      ...options.config,
+    });
+    this.delay = options.delay ?? defaultDelay;
+  }
+
+  get state(): ScanState {
+    return this.currentState;
+  }
+
+  subscribe(listener: ScanStateListener): () => void {
+    this.listeners.add(listener);
+    listener(this.currentState);
+    return () => {
+      this.listeners.delete(listener);
+    };
+  }
+
+  private update(patch: Partial<ScanState>): void {
+    this.currentState = { ...this.currentState, ...patch };
+    for (const listener of this.listeners) {
+      listener(this.currentState);
+    }
+  }
+
+  private updateProgress(patch: Partial<ScanProgress>): void {
+    this.update({
+      progress: { ...this.currentState.progress, ...patch },
+    });
+  }
+
+  private updateResult(jobId: string, patch: Partial<ScannedJob>): void {
+    this.update({
+      results: this.currentState.results.map((result) =>
+        result.card.job.jobId === jobId ? { ...result, ...patch } : result,
+      ),
+    });
+  }
+
+  private stop(reason: ScanStopReason, message: string): void {
+    this.update({ status: 'failed', stopReason: reason, error: message });
+  }
+
+  async run(): Promise<ScanState> {
+    if (ACTIVE_STATUSES.has(this.currentState.status)) {
+      throw new Error('扫描已在进行中。');
+    }
+
+    const controller = new AbortController();
+    this.abortController = controller;
+    this.update({
+      status: 'reading-list',
+      progress: emptyProgress(),
+      results: [],
+      stopReason: null,
+      error: null,
+    });
+
+    try {
+      const page = await this.content.detectPage();
+      if (page.block !== null && FATAL_PAGE_BLOCKS.has(page.block.reason)) {
+        this.stop(page.block.reason as ScanStopReason, `页面已停止扫描：${page.block.reason}`);
+        return this.currentState;
+      }
+
+      const visible = await this.content.extractVisibleCards();
+      const cards = visible.cards.slice(0, this.config.maxListJobs);
+      this.updateProgress({ listJobs: visible.totalVisible });
+      if (cards.length === 0) {
+        this.update({
+          status: 'failed',
+          error:
+            visible.invalidCount > 0
+              ? '当前可见职位均缺少必要字段。'
+              : '当前页面没有可扫描的可见职位。',
+        });
+        return this.currentState;
+      }
+
+      this.update({ status: 'screening' });
+      const screenings = await this.bridge.screenJobs(
+        cards.map(({ job }) => job),
+        undefined,
+        controller.signal,
+      );
+      const screeningById = new Map(screenings.map((result) => [result.jobId, result]));
+      this.update({
+        results: cards.map((card) => {
+          const screening = screeningById.get(card.job.jobId);
+          return {
+            card,
+            ...(screening === undefined ? {} : { screening }),
+          };
+        }),
+      });
+      this.updateProgress({ screenedJobs: screenings.length });
+
+      const detailTargets = cards
+        .filter((card) => screeningById.get(card.job.jobId)?.matched === true)
+        .slice(0, this.config.maxDetailJobs);
+      this.update({ status: 'reading-details' });
+      this.updateProgress({ detailTarget: detailTargets.length });
+
+      let consecutiveTimeouts = 0;
+      let consecutiveIdentityFailures = 0;
+
+      for (const [index, card] of detailTargets.entries()) {
+        const detailResult = await this.content.startDetailScan(
+          card,
+          this.config.detailTimeoutMs,
+          controller.signal,
+        );
+        this.updateProgress({
+          detailCompleted: this.currentState.progress.detailCompleted + 1,
+        });
+
+        if (detailResult.outcome === 'cancelled') {
+          throw abortError();
+        }
+
+        if (detailResult.outcome === 'blocked') {
+          if (FATAL_PAGE_BLOCKS.has(detailResult.reason)) {
+            this.stop(
+              detailResult.reason as ScanStopReason,
+              `页面已停止扫描：${detailResult.reason}`,
+            );
+            return this.currentState;
+          }
+          consecutiveTimeouts = 0;
+          consecutiveIdentityFailures = 0;
+          this.updateResult(card.job.jobId, {
+            detailError: `页面阻断：${detailResult.reason}`,
+          });
+        } else if (detailResult.outcome === 'timeout') {
+          consecutiveTimeouts += 1;
+          consecutiveIdentityFailures = 0;
+          this.updateResult(card.job.jobId, { detailError: '职位详情读取超时。' });
+          if (consecutiveTimeouts >= 3) {
+            this.stop('detail_timeout_limit', '连续 3 个职位详情读取超时。');
+            return this.currentState;
+          }
+        } else if (detailResult.outcome === 'identity_failure') {
+          consecutiveIdentityFailures += 1;
+          consecutiveTimeouts = 0;
+          this.updateResult(card.job.jobId, { detailError: '职位详情身份校验失败。' });
+          if (consecutiveIdentityFailures >= 3) {
+            this.stop('identity_failure_limit', '连续 3 个职位详情身份校验失败。');
+            return this.currentState;
+          }
+        } else if (detailResult.outcome === 'failed') {
+          consecutiveTimeouts = 0;
+          consecutiveIdentityFailures = 0;
+          this.updateResult(card.job.jobId, { detailError: detailResult.message });
+        } else {
+          consecutiveTimeouts = 0;
+          consecutiveIdentityFailures = 0;
+          this.updateResult(card.job.jobId, { detail: detailResult.job });
+          try {
+            const savedJob = await this.bridge.saveJob(detailResult.job, controller.signal);
+            this.updateResult(card.job.jobId, { savedJob });
+          } catch (error) {
+            if (controller.signal.aborted || isAbortError(error)) {
+              throw error;
+            }
+            this.updateResult(card.job.jobId, {
+              detailError: `保存职位失败：${errorMessage(error)}`,
+            });
+          }
+        }
+
+        if (index < detailTargets.length - 1) {
+          await this.delay(this.config.detailCooldownMs, controller.signal);
+        }
+      }
+
+      const evaluationTargets = this.currentState.results
+        .filter((result): result is ScannedJob & { savedJob: JobResponse } =>
+          result.savedJob !== undefined,
+        )
+        .slice(0, this.config.maxAiJobs);
+      this.update({ status: 'evaluating' });
+      this.updateProgress({ aiTarget: evaluationTargets.length });
+
+      for (const result of evaluationTargets) {
+        try {
+          const evaluation = await this.bridge.evaluateJob(
+            result.savedJob.id,
+            controller.signal,
+          );
+          this.updateResult(result.card.job.jobId, { evaluation });
+        } catch (error) {
+          if (controller.signal.aborted || isAbortError(error)) {
+            throw error;
+          }
+          this.updateResult(result.card.job.jobId, {
+            evaluationError: errorMessage(error),
+          });
+        }
+        this.updateProgress({
+          aiCompleted: this.currentState.progress.aiCompleted + 1,
+        });
+      }
+
+      this.update({ status: 'completed' });
+      return this.currentState;
+    } catch (error) {
+      if (controller.signal.aborted || isAbortError(error)) {
+        if (this.currentState.status !== 'cancelled') {
+          this.update({ status: 'cancelled', error: null, stopReason: null });
+        }
+      } else {
+        this.update({ status: 'failed', error: errorMessage(error) });
+      }
+      return this.currentState;
+    } finally {
+      if (this.abortController === controller) {
+        this.abortController = null;
+      }
+    }
+  }
+
+  async cancel(): Promise<void> {
+    if (!ACTIVE_STATUSES.has(this.currentState.status)) {
+      return;
+    }
+    this.abortController?.abort();
+    this.update({ status: 'cancelled', error: null, stopReason: null });
+    await this.content.cancelDetailScan().catch(() => undefined);
+  }
+
+  recordDecision(decision: DecisionResponse): void {
+    const result = this.currentState.results.find(
+      (candidate) => candidate.savedJob?.id === decision.jobId,
+    );
+    if (result !== undefined) {
+      this.updateResult(result.card.job.jobId, { decision });
+    }
+  }
+}

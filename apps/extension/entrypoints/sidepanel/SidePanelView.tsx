@@ -1,0 +1,402 @@
+import type {
+  BossPageBlock,
+  BossPageType,
+  DecisionRequest,
+  JobHistoryEntry,
+} from '@career-ops-cn/shared';
+import type { FormEventHandler } from 'react';
+
+import type { ScanState, ScannedJob } from '../../lib/scan-controller';
+
+export interface PageSnapshot {
+  pageType: BossPageType;
+  block: BossPageBlock | null;
+  jobCount: number;
+  invalidCount: number;
+}
+
+export type ConnectionState = 'unknown' | 'checking' | 'online' | 'offline';
+export type HistoryFilter = 'all' | DecisionRequest['decision'];
+
+export interface SidePanelViewProps {
+  tokenDraft: string;
+  connectionState: ConnectionState;
+  connectionMessage: string;
+  pageSnapshot: PageSnapshot | null;
+  pageError: string;
+  scanState: ScanState;
+  selectedJobId: string | null;
+  history: JobHistoryEntry[];
+  historyFilter: HistoryFilter;
+  historyError: string;
+  decisionMessage: string;
+  onTokenChange(value: string): void;
+  onSaveConnection: FormEventHandler<HTMLFormElement>;
+  onRefreshPage(): void;
+  onStartScan(): void;
+  onCancelScan(): void;
+  onSelectJob(jobId: string): void;
+  onHistoryFilterChange(filter: HistoryFilter): void;
+  onRefreshHistory(): void;
+  onDecision(decision: DecisionRequest['decision']): void;
+}
+
+const ACTIVE_SCAN_STATUSES = new Set<ScanState['status']>([
+  'reading-list',
+  'screening',
+  'reading-details',
+  'evaluating',
+]);
+
+const STATUS_LABELS: Record<ScanState['status'], string> = {
+  idle: '待命',
+  'reading-list': '读取列表',
+  screening: '硬规则筛选',
+  'reading-details': '读取详情',
+  evaluating: 'AI 评估',
+  completed: '已完成',
+  cancelled: '已取消',
+  failed: '已停止',
+};
+
+function recommendationLabel(value: string | undefined): string {
+  switch (value?.toLowerCase()) {
+    case 'apply':
+      return 'Apply';
+    case 'review':
+      return 'Review';
+    case 'skip':
+      return 'Skip';
+    default:
+      return value ?? '待评估';
+  }
+}
+
+function connectionLabel(state: ConnectionState): string {
+  switch (state) {
+    case 'online':
+      return 'Bridge 在线';
+    case 'offline':
+      return 'Bridge 离线';
+    case 'checking':
+      return '正在检查';
+    default:
+      return '尚未连接';
+  }
+}
+
+function resultError(result: ScannedJob): string | null {
+  return result.detailError ?? result.evaluationError ?? null;
+}
+
+export function SidePanelView(props: SidePanelViewProps) {
+  const isScanning = ACTIVE_SCAN_STATUSES.has(props.scanState.status);
+  const selectedResult = props.scanState.results.find(
+    (result) => result.card.job.jobId === props.selectedJobId,
+  );
+  const visibleHistory = props.history.filter(
+    (job) =>
+      props.historyFilter === 'all' ||
+      job.decision?.decision === props.historyFilter,
+  );
+
+  return (
+    <main className="panel-shell">
+      <header className="panel-header">
+        <p className="eyebrow">Career Ops CN</p>
+        <h1>BOSS 只读职位扫描</h1>
+        <p>仅分析当前可见职位，不翻页、不投递、不联系招聘方。</p>
+      </header>
+
+      <section className="panel-section" aria-labelledby="connection-heading">
+        <div className="section-heading">
+          <div>
+            <span className="section-index">01</span>
+            <h2 id="connection-heading">连接设置</h2>
+          </div>
+          <span className={`status-dot status-${props.connectionState}`}>
+            {connectionLabel(props.connectionState)}
+          </span>
+        </div>
+        <form className="token-form" onSubmit={props.onSaveConnection}>
+          <label htmlFor="bridge-token">Bridge token</label>
+          <div className="input-row">
+            <input
+              id="bridge-token"
+              type="password"
+              value={props.tokenDraft}
+              autoComplete="off"
+              placeholder="输入本机 Bridge token"
+              onChange={(event) => props.onTokenChange(event.target.value)}
+            />
+            <button className="button button-secondary" type="submit">
+              保存并检查
+            </button>
+          </div>
+        </form>
+        {props.connectionMessage === '' ? null : (
+          <p className="inline-message" role="status">
+            {props.connectionMessage}
+          </p>
+        )}
+      </section>
+
+      <section className="panel-section" aria-labelledby="page-heading">
+        <div className="section-heading">
+          <div>
+            <span className="section-index">02</span>
+            <h2 id="page-heading">当前页面状态</h2>
+          </div>
+          <button className="text-button" type="button" onClick={props.onRefreshPage}>
+            刷新
+          </button>
+        </div>
+        {props.pageSnapshot === null ? (
+          <p className="empty-copy">尚未读取当前页面。</p>
+        ) : (
+          <dl className="metric-grid compact-grid">
+            <div>
+              <dt>页面类型</dt>
+              <dd>{props.pageSnapshot.pageType}</dd>
+            </div>
+            <div>
+              <dt>当前页职位数</dt>
+              <dd>{props.pageSnapshot.jobCount}</dd>
+            </div>
+            <div>
+              <dt>字段不完整</dt>
+              <dd>{props.pageSnapshot.invalidCount}</dd>
+            </div>
+            <div>
+              <dt>阻断</dt>
+              <dd>{props.pageSnapshot.block?.reason ?? '无'}</dd>
+            </div>
+          </dl>
+        )}
+        {props.pageError === '' ? null : (
+          <p className="error-message" role="alert">{props.pageError}</p>
+        )}
+      </section>
+
+      <section className="panel-section" aria-labelledby="control-heading">
+        <div className="section-heading">
+          <div>
+            <span className="section-index">03</span>
+            <h2 id="control-heading">扫描控制</h2>
+          </div>
+          <span className="scan-status">{STATUS_LABELS[props.scanState.status]}</span>
+        </div>
+        <div className="control-row">
+          <button
+            className="button button-primary"
+            type="button"
+            disabled={isScanning || props.connectionState !== 'online'}
+            onClick={props.onStartScan}
+          >
+            开始扫描
+          </button>
+          <button
+            className="button button-danger"
+            type="button"
+            disabled={!isScanning}
+            onClick={props.onCancelScan}
+          >
+            取消
+          </button>
+        </div>
+        {props.scanState.error === null ? null : (
+          <p className="error-message" role="alert">{props.scanState.error}</p>
+        )}
+        {props.scanState.stopReason === null ? null : (
+          <p className="stop-reason">停止原因：{props.scanState.stopReason}</p>
+        )}
+      </section>
+
+      <section className="panel-section" aria-labelledby="progress-heading">
+        <div className="section-heading">
+          <div>
+            <span className="section-index">04</span>
+            <h2 id="progress-heading">进度</h2>
+          </div>
+        </div>
+        <dl className="metric-grid progress-grid">
+          <div>
+            <dt>当前页职位数</dt>
+            <dd>{props.scanState.progress.listJobs}</dd>
+          </div>
+          <div>
+            <dt>已筛选数量</dt>
+            <dd>{props.scanState.progress.screenedJobs}</dd>
+          </div>
+          <div>
+            <dt>详情进度</dt>
+            <dd>{props.scanState.progress.detailCompleted}/{props.scanState.progress.detailTarget}</dd>
+          </div>
+          <div>
+            <dt>AI 进度</dt>
+            <dd>{props.scanState.progress.aiCompleted}/{props.scanState.progress.aiTarget}</dd>
+          </div>
+        </dl>
+      </section>
+
+      <section className="panel-section" aria-labelledby="results-heading">
+        <div className="section-heading">
+          <div>
+            <span className="section-index">05</span>
+            <h2 id="results-heading">结果列表</h2>
+          </div>
+          <span className="count-pill">{props.scanState.results.length}</span>
+        </div>
+        {props.scanState.results.length === 0 ? (
+          <p className="empty-copy">扫描结果会在这里逐条出现。</p>
+        ) : (
+          <ul className="result-list">
+            {props.scanState.results.map((result) => {
+              const error = resultError(result);
+              return (
+                <li key={result.card.job.jobId}>
+                  <button
+                    type="button"
+                    className={
+                      result.card.job.jobId === props.selectedJobId
+                        ? 'result-row result-row-selected'
+                        : 'result-row'
+                    }
+                    onClick={() => props.onSelectJob(result.card.job.jobId)}
+                  >
+                    <span className="result-main">
+                      <strong>{result.card.job.title}</strong>
+                      <span>{result.card.job.companyName}</span>
+                    </span>
+                    <span className="result-side">
+                      <span className={`recommendation recommendation-${result.evaluation?.recommendation?.toLowerCase() ?? 'pending'}`}>
+                        {recommendationLabel(result.evaluation?.recommendation)}
+                      </span>
+                      {result.evaluation === undefined ? null : (
+                        <span>{result.evaluation.score} 分</span>
+                      )}
+                    </span>
+                  </button>
+                  {result.screening === undefined ? null : (
+                    <p className="rule-copy">
+                      硬规则原因：{result.screening.reasons.join('；')}
+                    </p>
+                  )}
+                  {error === null ? null : <p className="row-error">{error}</p>}
+                </li>
+              );
+            })}
+          </ul>
+        )}
+      </section>
+
+      <section className="panel-section" aria-labelledby="detail-heading">
+        <div className="section-heading">
+          <div>
+            <span className="section-index">06</span>
+            <h2 id="detail-heading">单个职位详情</h2>
+          </div>
+        </div>
+        {selectedResult === undefined ? (
+          <p className="empty-copy">从结果列表选择一个职位。</p>
+        ) : (
+          <article className="job-detail">
+            <h3>{selectedResult.card.job.title}</h3>
+            <p className="job-company">{selectedResult.card.job.companyName}</p>
+            <dl className="detail-grid">
+              <div><dt>薪资</dt><dd>{selectedResult.card.job.salaryText}</dd></div>
+              <div><dt>地点</dt><dd>{selectedResult.card.job.location}</dd></div>
+              <div><dt>career-ops score</dt><dd>{selectedResult.evaluation?.score ?? '—'}</dd></div>
+              <div><dt>archetype</dt><dd>{selectedResult.evaluation?.archetype ?? '—'}</dd></div>
+              <div><dt>legitimacy</dt><dd>{selectedResult.evaluation?.legitimacy ?? '—'}</dd></div>
+              <div><dt>用户 decision</dt><dd>{selectedResult.decision?.decision ?? '未判断'}</dd></div>
+            </dl>
+            <div className="detail-copy">
+              <h4>职位描述</h4>
+              <p>{selectedResult.detail?.description ?? '详情尚未读取成功。'}</p>
+            </div>
+            <div className="detail-copy">
+              <h4>rawReport</h4>
+              <pre>{selectedResult.evaluation?.rawReport ?? '尚无 AI 评估。'}</pre>
+            </div>
+          </article>
+        )}
+      </section>
+
+      <section className="panel-section" aria-labelledby="history-heading">
+        <div className="section-heading">
+          <div>
+            <span className="section-index">07</span>
+            <h2 id="history-heading">历史职位</h2>
+          </div>
+          <button className="text-button" type="button" onClick={props.onRefreshHistory}>
+            刷新
+          </button>
+        </div>
+        <label className="filter-label" htmlFor="history-filter">用户判断筛选</label>
+        <select
+          id="history-filter"
+          value={props.historyFilter}
+          onChange={(event) => props.onHistoryFilterChange(event.target.value as HistoryFilter)}
+        >
+          <option value="all">全部</option>
+          <option value="apply">Apply</option>
+          <option value="review">Review</option>
+          <option value="skip">Skip</option>
+        </select>
+        {props.historyError === '' ? null : (
+          <p className="error-message" role="alert">{props.historyError}</p>
+        )}
+        {visibleHistory.length === 0 ? (
+          <p className="empty-copy">没有符合筛选条件的历史职位。</p>
+        ) : (
+          <ul className="history-list">
+            {visibleHistory.map((job) => (
+              <li key={job.id}>
+                <div>
+                  <strong>{job.title}</strong>
+                  <span>{job.company}</span>
+                </div>
+                <div className="history-meta">
+                  <span>{recommendationLabel(job.latestEvaluation?.recommendation)}</span>
+                  <span>{job.latestEvaluation?.score ?? '—'} 分</span>
+                  <span>{job.decision?.decision ?? '未判断'}</span>
+                </div>
+              </li>
+            ))}
+          </ul>
+        )}
+      </section>
+
+      <section className="panel-section" aria-labelledby="decision-heading">
+        <div className="section-heading">
+          <div>
+            <span className="section-index">08</span>
+            <h2 id="decision-heading">用户判断</h2>
+          </div>
+        </div>
+        <p className="decision-context">
+          {selectedResult?.savedJob === undefined
+            ? '选择一个已保存的职位后记录判断。'
+            : `${selectedResult.savedJob.title} · ${selectedResult.savedJob.company}`}
+        </p>
+        <div className="decision-row">
+          {(['apply', 'review', 'skip'] as const).map((decision) => (
+            <button
+              key={decision}
+              className={`decision-button decision-${decision}`}
+              type="button"
+              disabled={selectedResult?.savedJob === undefined}
+              onClick={() => props.onDecision(decision)}
+            >
+              {recommendationLabel(decision)}
+            </button>
+          ))}
+        </div>
+        {props.decisionMessage === '' ? null : (
+          <p className="inline-message" role="status">{props.decisionMessage}</p>
+        )}
+      </section>
+    </main>
+  );
+}

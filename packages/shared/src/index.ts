@@ -134,13 +134,13 @@ export const EvaluationResultSchema = z.strictObject({
   score: z.number().int().min(0).max(100),
   recommendation: NonEmptyTextSchema,
   rawReport: NonEmptyTextSchema,
+  company: NonEmptyTextSchema.nullable().optional(),
+  role: NonEmptyTextSchema.nullable().optional(),
+  archetype: NonEmptyTextSchema.nullable().optional(),
+  legitimacy: NonEmptyTextSchema.nullable().optional(),
 });
 
 export type EvaluationResult = z.infer<typeof EvaluationResultSchema>;
-
-export const JobListResponseSchema = z.array(JobResponseSchema);
-
-export type JobListResponse = z.infer<typeof JobListResponseSchema>;
 
 export const DecisionRequestSchema = z.strictObject({
   decision: z.enum(["apply", "review", "skip"]),
@@ -155,6 +155,17 @@ export const DecisionResponseSchema = DecisionRequestSchema.extend({
 }).strict();
 
 export type DecisionResponse = z.infer<typeof DecisionResponseSchema>;
+
+export const JobHistoryEntrySchema = JobResponseSchema.extend({
+  latestEvaluation: EvaluationResultSchema.optional(),
+  decision: DecisionResponseSchema.optional(),
+}).strict();
+
+export type JobHistoryEntry = z.infer<typeof JobHistoryEntrySchema>;
+
+export const JobListResponseSchema = z.array(JobHistoryEntrySchema);
+
+export type JobListResponse = z.infer<typeof JobListResponseSchema>;
 
 export const UserDecisionSchema = z.strictObject({
   jobId: NonEmptyTextSchema,
@@ -205,6 +216,139 @@ export const BridgeSettingsSchema = z.strictObject({
 
 export type BridgeSettings = z.infer<typeof BridgeSettingsSchema>;
 
+export const ScanConfigSchema = z.strictObject({
+  maxListJobs: z.number().int().positive(),
+  maxDetailJobs: z.number().int().positive(),
+  maxAiJobs: z.number().int().positive(),
+  detailTimeoutMs: z.number().int().positive(),
+  detailCooldownMs: z.number().int().nonnegative(),
+});
+
+export type ScanConfig = z.infer<typeof ScanConfigSchema>;
+
+export const BossPageTypeSchema = z.enum([
+  "search-list",
+  "search-detail-panel",
+  "job-detail",
+  "company-job-list",
+  "login",
+  "challenge",
+  "unsupported",
+]);
+
+export type BossPageType = z.infer<typeof BossPageTypeSchema>;
+
+export const BossPageBlockReasonSchema = z.enum([
+  "login_required",
+  "challenge",
+  "account_risk",
+  "unsupported_layout",
+  "empty_page",
+]);
+
+export type BossPageBlockReason = z.infer<
+  typeof BossPageBlockReasonSchema
+>;
+
+export const BossPageBlockSchema = z.strictObject({
+  reason: BossPageBlockReasonSchema,
+  pageType: BossPageTypeSchema,
+});
+
+export type BossPageBlock = z.infer<typeof BossPageBlockSchema>;
+
+export const VisibleJobCardSchema = z.strictObject({
+  index: z.number().int().nonnegative(),
+  job: JobCardSchema,
+});
+
+export type VisibleJobCard = z.infer<typeof VisibleJobCardSchema>;
+
+export const DetectPageRequestSchema = z.strictObject({
+  type: z.literal("boss/detect-page/request"),
+});
+
+export const DetectPageResponseSchema = z.strictObject({
+  type: z.literal("boss/detect-page/response"),
+  pageType: BossPageTypeSchema,
+  block: BossPageBlockSchema.nullable(),
+});
+
+export type DetectPageResponse = z.infer<typeof DetectPageResponseSchema>;
+
+export const ExtractCurrentDetailRequestSchema = z.strictObject({
+  type: z.literal("boss/extract-current-detail/request"),
+});
+
+export const ExtractCurrentDetailResponseSchema = z.strictObject({
+  type: z.literal("boss/extract-current-detail/response"),
+  job: JobDetailSchema.nullable(),
+});
+
+export const ExtractVisibleCardsRequestSchema = z.strictObject({
+  type: z.literal("boss/extract-visible-cards/request"),
+});
+
+export const ExtractVisibleCardsResponseSchema = z.strictObject({
+  type: z.literal("boss/extract-visible-cards/response"),
+  cards: z.array(VisibleJobCardSchema),
+  totalVisible: z.number().int().nonnegative(),
+  invalidCount: z.number().int().nonnegative(),
+});
+
+export type ExtractVisibleCardsResponse = z.infer<
+  typeof ExtractVisibleCardsResponseSchema
+>;
+
+export const StartDetailScanRequestSchema = z.strictObject({
+  type: z.literal("boss/start-detail-scan/request"),
+  card: VisibleJobCardSchema,
+  timeoutMs: z.number().int().positive(),
+});
+
+export const StartDetailScanResponseSchema = z.discriminatedUnion("outcome", [
+  z.strictObject({
+    type: z.literal("boss/start-detail-scan/response"),
+    outcome: z.literal("success"),
+    job: JobDetailSchema,
+  }),
+  z.strictObject({
+    type: z.literal("boss/start-detail-scan/response"),
+    outcome: z.literal("timeout"),
+  }),
+  z.strictObject({
+    type: z.literal("boss/start-detail-scan/response"),
+    outcome: z.literal("identity_failure"),
+  }),
+  z.strictObject({
+    type: z.literal("boss/start-detail-scan/response"),
+    outcome: z.literal("blocked"),
+    reason: BossPageBlockReasonSchema,
+  }),
+  z.strictObject({
+    type: z.literal("boss/start-detail-scan/response"),
+    outcome: z.literal("cancelled"),
+  }),
+  z.strictObject({
+    type: z.literal("boss/start-detail-scan/response"),
+    outcome: z.literal("failed"),
+    message: NonEmptyTextSchema,
+  }),
+]);
+
+export type StartDetailScanResponse = z.infer<
+  typeof StartDetailScanResponseSchema
+>;
+
+export const CancelDetailScanRequestSchema = z.strictObject({
+  type: z.literal("boss/cancel-detail-scan/request"),
+});
+
+export const CancelDetailScanResponseSchema = z.strictObject({
+  type: z.literal("boss/cancel-detail-scan/response"),
+  cancelled: z.boolean(),
+});
+
 export const PageContextRequestSchema = z.strictObject({
   type: z.literal("page-context/request"),
 });
@@ -231,11 +375,21 @@ export const MockJobDetailResponseSchema = z.strictObject({
 
 export type MockJobDetailResponse = z.infer<typeof MockJobDetailResponseSchema>;
 
-export const ExtensionMessageSchema = z.discriminatedUnion("type", [
+export const ExtensionMessageSchema = z.union([
   PageContextRequestSchema,
   PageContextResponseSchema,
   MockJobDetailRequestSchema,
   MockJobDetailResponseSchema,
+  DetectPageRequestSchema,
+  DetectPageResponseSchema,
+  ExtractCurrentDetailRequestSchema,
+  ExtractCurrentDetailResponseSchema,
+  ExtractVisibleCardsRequestSchema,
+  ExtractVisibleCardsResponseSchema,
+  StartDetailScanRequestSchema,
+  StartDetailScanResponseSchema,
+  CancelDetailScanRequestSchema,
+  CancelDetailScanResponseSchema,
 ]);
 
 export type ExtensionMessage = z.infer<typeof ExtensionMessageSchema>;

@@ -1,0 +1,13 @@
+# 岗位评估
+
+这个岗位与候选人的 TypeScript 和 React 经验高度匹配。
+
+---SCORE_SUMMARY---
+COMPANY: 星河科技
+ROLE: 高级前端工程师
+SCORE: 4.2
+ARCHETYPE: Builder
+LEGITIMACY: high
+---END_SUMMARY---
+
+建议进一步确认团队规模与值班安排。
