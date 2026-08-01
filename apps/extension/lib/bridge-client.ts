@@ -46,8 +46,11 @@ export function toCreateJobRequest(job: JobDetail): CreateJobRequest {
     company: job.companyName,
     salary: job.salaryText,
     location: job.location,
+    experience: job.experienceText,
+    education: job.educationText,
     description: job.description,
     url: job.detailUrl,
+    identityVerified: job.identityVerified,
   });
 }
 

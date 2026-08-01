@@ -33,6 +33,7 @@ export type JobCard = z.infer<typeof JobCardSchema>;
 
 export const JobDetailSchema = JobCardSchema.extend({
   description: NonEmptyTextSchema,
+  identityVerified: z.boolean(),
 }).strict();
 
 export type JobDetail = z.infer<typeof JobDetailSchema>;

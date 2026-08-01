@@ -117,7 +117,7 @@ try {
     education: jobDetail.educationText,
     description: jobDetail.description,
     url: jobDetail.detailUrl,
-    identityVerified: true,
+    identityVerified: jobDetail.identityVerified,
   });
   const authorization = { Authorization: "Bearer smoke-token" };
 

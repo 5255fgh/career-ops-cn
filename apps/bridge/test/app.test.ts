@@ -363,6 +363,7 @@ describe("evaluate", () => {
       expect(detail).toMatchObject({
         jobId: JOB.sourceJobId,
         description: JOB.description,
+        identityVerified: true,
       });
       expect(options).toMatchObject({
         careerOpsRoot: TEST_ENVIRONMENT.CAREER_OPS_CN_CAREER_OPS_ROOT,

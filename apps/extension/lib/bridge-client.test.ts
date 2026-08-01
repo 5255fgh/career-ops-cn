@@ -19,6 +19,7 @@ const fixtureJob = JobDetailSchema.parse({
   educationText: '本科',
   detailUrl: 'https://www.zhipin.com/job_detail/123456789.html',
   description: '负责招聘产品的前端功能开发与维护，要求熟悉 TypeScript 和 React。',
+  identityVerified: true,
 });
 
 const savedJob = {
@@ -29,8 +30,11 @@ const savedJob = {
   company: fixtureJob.companyName,
   salary: fixtureJob.salaryText,
   location: fixtureJob.location,
+  experience: fixtureJob.experienceText,
+  education: fixtureJob.educationText,
   description: fixtureJob.description,
   url: fixtureJob.detailUrl,
+  identityVerified: fixtureJob.identityVerified,
 };
 
 const evaluation = {
@@ -55,9 +59,21 @@ describe('Bridge client', () => {
       company: '示例科技',
       salary: '20-30K·14薪',
       location: '上海·浦东新区',
+      experience: '3-5年',
+      education: '本科',
       description: '负责招聘产品的前端功能开发与维护，要求熟悉 TypeScript 和 React。',
       url: 'https://www.zhipin.com/job_detail/123456789.html',
+      identityVerified: true,
     });
+  });
+
+  it('保留未经身份验证的 JobDetail 状态', () => {
+    const unverifiedJob = JobDetailSchema.parse({
+      ...fixtureJob,
+      identityVerified: false,
+    });
+
+    expect(toCreateJobRequest(unverifiedJob).identityVerified).toBe(false);
   });
 
   it('携带 token 顺序调用保存和评估接口，并校验响应', async () => {

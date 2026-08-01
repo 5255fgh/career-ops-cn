@@ -167,6 +167,7 @@ function buildJobDetail(job: ReturnType<typeof findJob>) {
     educationText: job.education,
     detailUrl: job.url,
     description: job.description,
+    identityVerified: job.identityVerified,
   });
 
   return detail.success ? detail.data : undefined;

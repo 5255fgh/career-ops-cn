@@ -7,5 +7,6 @@
   "experienceText": "3-5年",
   "educationText": "本科",
   "detailUrl": "https://www.zhipin.com/job_detail/123456789.html",
-  "description": "负责招聘产品的前端功能开发与维护，要求熟悉 TypeScript 和 React。"
+  "description": "负责招聘产品的前端功能开发与维护，要求熟悉 TypeScript 和 React。",
+  "identityVerified": true
 }
