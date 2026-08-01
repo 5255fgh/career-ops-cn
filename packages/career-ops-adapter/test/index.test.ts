@@ -220,7 +220,7 @@ describe("evaluateWithCareerOps", () => {
       evaluateWithCareerOps(jobDetail("api-auth-error"), { careerOpsRoot }),
       "AUTHENTICATION_ERROR",
     );
-    expect(error.message).not.toContain("sk-fixture-secret-value");
+    expect(error.message).not.toContain("sk-THIS_IS_A_SYNTHETIC_TEST_KEY_NOT_VALID_000000");
   });
 
   it("非零退出返回明确错误", async () => {

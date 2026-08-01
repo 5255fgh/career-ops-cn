@@ -5,6 +5,8 @@ import {
   parseBossDetail,
   parseVisibleBossCards,
   scanSelectedBossDetails,
+  sourceJobIdFromUrl,
+  verifyDetailIdentity,
   type BossJobCard,
   type BossJobDetail,
 } from '@career-ops-cn/boss-adapter';
@@ -129,9 +131,23 @@ export default defineContentScript({
 
       if (ExtractCurrentDetailRequestSchema.safeParse(message).success) {
         const detail = parseBossDetail(document, window.location.href);
+        const identity =
+          detail === null
+            ? null
+            : verifyDetailIdentity({
+                expected: {
+                  sourceJobId: sourceJobIdFromUrl(window.location.href),
+                  url: window.location.href,
+                  title: detail.title,
+                },
+                detail,
+              });
         return ExtractCurrentDetailResponseSchema.parse({
           type: 'boss/extract-current-detail/response',
-          job: detail === null ? null : toJobDetail(detail, false),
+          job:
+            detail === null
+              ? null
+              : toJobDetail(detail, identity?.verified === true),
         });
       }
 

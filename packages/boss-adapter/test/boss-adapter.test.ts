@@ -9,6 +9,7 @@ import {
   parseBossDetail,
   parseVisibleBossCards,
   scanSelectedBossDetails,
+  sourceJobIdFromUrl,
   verifyDetailIdentity,
   waitForBossDetail,
 } from "../src/index.js";
@@ -181,6 +182,48 @@ describe("详情解析", () => {
 });
 
 describe("详情身份校验", () => {
+  it("直接详情页可由页面 URL 身份和标题完成验证", () => {
+    const url = fixtureUrls["job-detail.html"]!;
+    const { window, document } = createDocument("job-detail.html", url);
+    const detail = parseBossDetail(document, url)!;
+
+    const result = verifyDetailIdentity({
+      expected: {
+        sourceJobId: sourceJobIdFromUrl(url),
+        url,
+        title: detail.title,
+      },
+      detail,
+    });
+
+    expect(result.verified).toBe(true);
+    expect(result.matchedSignals).toEqual(["job_identity", "title"]);
+    window.close();
+  });
+
+  it("直接详情页 sourceJobId 冲突时不会被相同 URL 掩盖", () => {
+    const url = fixtureUrls["job-detail.html"]!;
+    const { window, document } = createDocument("job-detail.html", url);
+    const detail = {
+      ...parseBossDetail(document, url)!,
+      sourceJobId: "boss-other",
+    };
+
+    const result = verifyDetailIdentity({
+      expected: {
+        sourceJobId: sourceJobIdFromUrl(url),
+        url,
+        title: detail.title,
+      },
+      detail,
+    });
+
+    expect(result.verified).toBe(false);
+    expect(result.signals.jobIdentity).toBe(false);
+    expect(result.matchedSignals).toEqual(["title"]);
+    window.close();
+  });
+
   it("点击 A 但详情仍为 B 时失败", () => {
     const url = fixtureUrls["stale-detail-b.html"]!;
     const { window, document } = createDocument("stale-detail-b.html", url);
@@ -362,6 +405,34 @@ describe("等待与批量扫描", () => {
       sourceJobId: "boss-3002",
       title: "全栈工程师",
       description: "负责全栈产品研发。",
+    });
+    window.close();
+  });
+
+  it("目标卡片的详情已加载时直接验证且不重复点击", async () => {
+    const url = fixtureUrls["search-detail-panel.html"]!;
+    const { window, document } = createDocument(
+      "search-detail-panel.html",
+      url,
+    );
+    const cardA = document.getElementById("panel-card-a")!;
+    const clicked = vi.fn();
+    cardA.addEventListener("click", clicked);
+
+    const result = await scanSelectedBossDetails({
+      document,
+      url,
+      selections: [{ element: cardA }],
+      timeoutMs: 1_000,
+    });
+
+    expect(clicked).not.toHaveBeenCalled();
+    expect(result.block).toBeNull();
+    expect(result.entries[0]?.result.status).toBe("verified");
+    expect(result.details[0]).toMatchObject({
+      sourceJobId: "boss-3001",
+      title: "Web 前端工程师",
+      description: "负责 Web 产品研发与维护。",
     });
     window.close();
   });

@@ -128,7 +128,7 @@ const normalizeUrl = (value: string | null, baseUrl: string): string | null => {
   }
 };
 
-const sourceJobIdFromUrl = (value: string | null): string | null => {
+export const sourceJobIdFromUrl = (value: string | null): string | null => {
   if (value === null) {
     return null;
   }
@@ -402,21 +402,19 @@ const identityUrlMatches = (
   expected: BossJobIdentity,
   actual: BossJobIdentity,
 ): boolean | null => {
-  const comparisons: boolean[] = [];
-
   if (expected.sourceJobId !== null && actual.sourceJobId !== null) {
-    comparisons.push(expected.sourceJobId === actual.sourceJobId);
+    return expected.sourceJobId === actual.sourceJobId;
   }
 
   if (expected.url !== null && actual.url !== null) {
     const expectedUrl = normalizeUrl(expected.url, expected.url);
     const actualUrl = normalizeUrl(actual.url, actual.url);
     if (expectedUrl !== null && actualUrl !== null) {
-      comparisons.push(expectedUrl === actualUrl);
+      return expectedUrl === actualUrl;
     }
   }
 
-  return comparisons.length === 0 ? null : comparisons.some(Boolean);
+  return null;
 };
 
 const titleMatches = (
@@ -621,6 +619,28 @@ export const scanSelectedBossDetails = async (
 
     const expected = identityFromSelection(selection, options.url);
     const previousDetail = parseBossDetail(options.document, options.url);
+
+    if (previousDetail !== null) {
+      const currentIdentity = verifyDetailIdentity({
+        expected,
+        detail: previousDetail,
+        activeCard: findActiveCard(options.document, options.url),
+      });
+      const predicateMatched =
+        options.predicate?.({ detail: previousDetail, identity: currentIdentity }) ??
+        previousDetail.description !== null;
+
+      if (currentIdentity.verified && predicateMatched) {
+        const result: WaitForBossDetailResult = {
+          status: "verified",
+          detail: previousDetail,
+          identity: currentIdentity,
+        };
+        entries.push({ index, expected, result });
+        details.push(previousDetail);
+        continue;
+      }
+    }
 
     if (options.activate === undefined) {
       activateSelection(selection);

@@ -127,6 +127,22 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : '扫描流程发生未知错误。';
 }
 
+function visibleCardFromDetail(detail: JobDetail): VisibleJobCard {
+  return {
+    index: 0,
+    job: {
+      jobId: detail.jobId,
+      title: detail.title,
+      companyName: detail.companyName,
+      salaryText: detail.salaryText,
+      location: detail.location,
+      experienceText: detail.experienceText,
+      educationText: detail.educationText,
+      detailUrl: detail.detailUrl,
+    },
+  };
+}
+
 export class ScanController {
   readonly config: ScanConfig;
   private readonly content: ContentClient;
@@ -208,6 +224,47 @@ export class ScanController {
       const page = await this.content.detectPage();
       if (page.block !== null && FATAL_PAGE_BLOCKS.has(page.block.reason)) {
         this.stop(page.block.reason as ScanStopReason, `页面已停止扫描：${page.block.reason}`);
+        return this.currentState;
+      }
+
+      if (page.pageType === 'job-detail') {
+        this.update({ status: 'reading-details' });
+        this.updateProgress({ detailTarget: 1 });
+        const detail = await this.content.extractCurrentDetail();
+        this.updateProgress({
+          listJobs: detail === null ? 0 : 1,
+          detailCompleted: 1,
+        });
+
+        if (detail === null) {
+          this.update({
+            status: 'failed',
+            error: '当前职位详情缺少必要字段。',
+          });
+          return this.currentState;
+        }
+
+        const card = visibleCardFromDetail(detail);
+        this.update({ results: [{ card, detail }] });
+        if (!detail.identityVerified) {
+          this.update({
+            status: 'failed',
+            error: '职位详情身份校验失败。',
+          });
+          return this.currentState;
+        }
+
+        const savedJob = await this.bridge.saveJob(detail, controller.signal);
+        this.updateResult(detail.jobId, { savedJob });
+        this.update({ status: 'evaluating' });
+        this.updateProgress({ aiTarget: 1 });
+        const evaluation = await this.bridge.evaluateJob(
+          savedJob.id,
+          controller.signal,
+        );
+        this.updateResult(detail.jobId, { evaluation });
+        this.updateProgress({ aiCompleted: 1 });
+        this.update({ status: 'completed' });
         return this.currentState;
       }
 

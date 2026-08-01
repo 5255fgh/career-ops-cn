@@ -1,1 +1,1 @@
-AuthenticationError: 401 Incorrect API key provided: sk-fixture-secret-value
+AuthenticationError: 401 Incorrect API key provided: sk-THIS_IS_A_SYNTHETIC_TEST_KEY_NOT_VALID_000000

@@ -4,6 +4,7 @@ export {
   parseBossDetail,
   parseVisibleBossCards,
   scanSelectedBossDetails,
+  sourceJobIdFromUrl,
   verifyDetailIdentity,
   waitForBossDetail,
 } from "./adapter.js";

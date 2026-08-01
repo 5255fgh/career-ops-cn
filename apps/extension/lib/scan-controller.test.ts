@@ -106,6 +106,59 @@ function controller(content: ContentClient, bridge: BridgeClient): ScanControlle
 }
 
 describe('ScanController', () => {
+  it('直接职位详情页完成身份校验、保存和 AI 评估闭环', async () => {
+    const detail = detailFor(visibleCard(0));
+    const content = contentMock([]);
+    vi.mocked(content.detectPage).mockResolvedValue({
+      type: 'boss/detect-page/response',
+      pageType: 'job-detail',
+      block: null,
+    });
+    vi.mocked(content.extractCurrentDetail).mockResolvedValue(detail);
+    const bridge = bridgeMock();
+
+    const state = await controller(content, bridge).run();
+
+    expect(state.status).toBe('completed');
+    expect(state.progress).toEqual({
+      listJobs: 1,
+      screenedJobs: 0,
+      detailCompleted: 1,
+      detailTarget: 1,
+      aiCompleted: 1,
+      aiTarget: 1,
+    });
+    expect(state.results[0]).toMatchObject({
+      detail,
+      savedJob: { id: `saved-${detail.jobId}` },
+      evaluation: { score: 88, rawReport: '完整 career-ops 原始报告。' },
+    });
+    expect(content.extractVisibleCards).not.toHaveBeenCalled();
+    expect(bridge.screenJobs).not.toHaveBeenCalled();
+    expect(bridge.saveJob).toHaveBeenCalledWith(detail, expect.any(AbortSignal));
+    expect(bridge.evaluateJob).toHaveBeenCalledOnce();
+  });
+
+  it('直接职位详情身份未验证时不会保存或分析', async () => {
+    const detail = { ...detailFor(visibleCard(0)), identityVerified: false };
+    const content = contentMock([]);
+    vi.mocked(content.detectPage).mockResolvedValue({
+      type: 'boss/detect-page/response',
+      pageType: 'job-detail',
+      block: null,
+    });
+    vi.mocked(content.extractCurrentDetail).mockResolvedValue(detail);
+    const bridge = bridgeMock();
+
+    const state = await controller(content, bridge).run();
+
+    expect(state.status).toBe('failed');
+    expect(state.error).toBe('职位详情身份校验失败。');
+    expect(state.results[0]?.detail).toEqual(detail);
+    expect(bridge.saveJob).not.toHaveBeenCalled();
+    expect(bridge.evaluateJob).not.toHaveBeenCalled();
+  });
+
   it('完整成功流程按状态转换，并逐条保存与显示 AI 结果', async () => {
     const cards = [visibleCard(0), visibleCard(1)];
     const content = contentMock(cards);
