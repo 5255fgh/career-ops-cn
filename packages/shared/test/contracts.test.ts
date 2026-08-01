@@ -242,4 +242,18 @@ describe("其余边界对象", () => {
       }),
     ).toThrow();
   });
+
+  it("EvaluationResult 接受 career-ops summary 元数据", () => {
+    expect(() =>
+      EvaluationResultSchema.parse({
+        score: 84,
+        recommendation: "apply",
+        rawReport: "完整评估报告",
+        company: "示例科技",
+        role: "前端开发工程师",
+        archetype: null,
+        legitimacy: "high",
+      }),
+    ).not.toThrow();
+  });
 });

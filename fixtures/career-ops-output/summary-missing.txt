@@ -1,0 +1,3 @@
+# Incomplete Evaluation
+
+The evaluator returned prose but no machine-readable score summary.

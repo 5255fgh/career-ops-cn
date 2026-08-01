@@ -1,0 +1,9 @@
+# Evaluation
+
+---SCORE_SUMMARY---
+COMPANY: Outlier Inc
+ROLE: Engineer
+SCORE: 5.1
+ARCHETYPE: Builder
+LEGITIMACY: high
+---END_SUMMARY---
