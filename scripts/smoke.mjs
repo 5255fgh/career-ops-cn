@@ -68,8 +68,21 @@ let bridge;
 
 try {
   bridge = await startBridge({
-    environment: { CAREER_OPS_CN_TOKEN: "smoke-token" },
+    environment: { CAREER_OPS_CN_TOKEN: "smoke-token", CAREER_OPS_CN_CAREER_OPS_ROOT: repositoryRoot },
     database,
+    evaluator: async () =>
+      shared.EvaluationResultSchema.parse(
+        JSON.parse(
+          await readFile(
+            path.join(
+              repositoryRoot,
+              "fixtures/contracts/evaluation-result.json",
+            ),
+            "utf8",
+          ),
+        ),
+      ),
+    screenJob: () => ({ decision: "pass", rules: [] }),
     port: 0,
   });
 
@@ -97,8 +110,11 @@ try {
     company: jobDetail.companyName,
     salary: jobDetail.salaryText,
     location: jobDetail.location,
+    experience: jobDetail.experienceText,
+    education: jobDetail.educationText,
     description: jobDetail.description,
     url: jobDetail.detailUrl,
+    identityVerified: true,
   });
   const authorization = { Authorization: "Bearer smoke-token" };
 
