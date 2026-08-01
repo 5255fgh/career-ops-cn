@@ -20,6 +20,12 @@ importers:
 
   apps/bridge:
     dependencies:
+      '@career-ops-cn/career-ops-adapter':
+        specifier: workspace:*
+        version: link:../../packages/career-ops-adapter
+      '@career-ops-cn/screening':
+        specifier: workspace:*
+        version: link:../../packages/screening
       '@career-ops-cn/shared':
         specifier: workspace:*
         version: link:../../packages/shared

@@ -8,11 +8,14 @@ import { ZodError } from "zod";
 
 import { createFakeEvaluator } from "../src/fake-evaluator.js";
 
+const IGNORED_JOB = {} as never;
+const IGNORED_OPTIONS = {} as never;
+
 describe("Fake Evaluator", () => {
   it("读取并校验 evaluation-result fixture", async () => {
     const evaluate = createFakeEvaluator();
 
-    expect(await evaluate()).toEqual({
+    expect(await evaluate(IGNORED_JOB, IGNORED_OPTIONS)).toEqual({
       score: 86,
       recommendation: "建议申请",
       rawReport:
@@ -27,7 +30,9 @@ describe("Fake Evaluator", () => {
 
     try {
       const evaluate = createFakeEvaluator(pathToFileURL(invalidFixturePath));
-      await expect(evaluate()).rejects.toBeInstanceOf(ZodError);
+      await expect(
+        evaluate(IGNORED_JOB, IGNORED_OPTIONS),
+      ).rejects.toBeInstanceOf(ZodError);
     } finally {
       await rm(directory, { recursive: true, force: true });
     }
