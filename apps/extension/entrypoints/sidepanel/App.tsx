@@ -1,80 +1,128 @@
-import {
-  BridgeSettingsSchema,
-  MockJobDetailRequestSchema,
-  MockJobDetailResponseSchema,
-  type EvaluationResult,
-  type JobDetail,
-} from '@career-ops-cn/shared';
-import { type FormEvent, useEffect, useState } from 'react';
+import { BridgeSettingsSchema, type DecisionRequest, type JobHistoryEntry, type ScanConfig } from '@career-ops-cn/shared';
+import { type FormEvent, useCallback, useEffect, useMemo, useState } from 'react';
 import { browser } from 'wxt/browser';
 
-import { BridgeClientError, createBridgeClient } from '../../lib/bridge-client';
+import { createBridgeClient } from '../../lib/bridge-client';
+import { createContentClient } from '../../lib/content-client';
+import {
+  loadExtensionSettings,
+  saveBridgeToken,
+  type ExtensionStorageArea,
+} from '../../lib/extension-settings';
+import {
+  DEFAULT_SCAN_CONFIG,
+  ScanController,
+  type ScanState,
+} from '../../lib/scan-controller';
+import {
+  SidePanelView,
+  type ConnectionState,
+  type HistoryFilter,
+  type PageSnapshot,
+} from './SidePanelView';
 
-const BRIDGE_TOKEN_STORAGE_KEY = 'bridgeToken';
+const extensionStorage: ExtensionStorageArea = {
+  async get(keys) {
+    return browser.storage.local.get(keys);
+  },
+  async set(items) {
+    await browser.storage.local.set(items);
+  },
+};
 
-interface FlowResult {
-  job: JobDetail;
-  evaluation: EvaluationResult;
-}
+const IDLE_SCAN_STATE: ScanState = {
+  status: 'idle',
+  progress: {
+    listJobs: 0,
+    screenedJobs: 0,
+    detailCompleted: 0,
+    detailTarget: 0,
+    aiCompleted: 0,
+    aiTarget: 0,
+  },
+  results: [],
+  stopReason: null,
+  error: null,
+};
 
-async function requestMockJobDetail(): Promise<JobDetail> {
-  const [activeTab] = await browser.tabs.query({ active: true, currentWindow: true });
-
-  if (activeTab?.id === undefined) {
-    throw new Error('找不到当前浏览器标签页。');
-  }
-
-  const request = MockJobDetailRequestSchema.parse({ type: 'mock-job-detail/request' });
-
-  let response: unknown;
-  try {
-    response = await browser.tabs.sendMessage(activeTab.id, request);
-  } catch (error) {
-    throw new Error('无法读取 Mock JobDetail。请打开 zhipin.com 页面并刷新后再试。', {
-      cause: error,
-    });
-  }
-
-  const parsed = MockJobDetailResponseSchema.safeParse(response);
-  if (!parsed.success) {
-    throw new Error('Content Script 返回的 Mock JobDetail 不符合 shared 契约。', {
-      cause: parsed.error,
-    });
-  }
-
-  return parsed.data.job;
-}
-
-function describeError(error: unknown): string {
-  if (error instanceof BridgeClientError || error instanceof Error) {
-    return error.message;
-  }
-
-  return '测试链路失败，请检查当前页面与 Bridge 状态。';
+function messageFromError(error: unknown): string {
+  return error instanceof Error ? error.message : '操作失败。';
 }
 
 export function App() {
-  const [token, setToken] = useState('');
-  const [settingsMessage, setSettingsMessage] = useState('');
-  const [isRunning, setIsRunning] = useState(false);
-  const [flowError, setFlowError] = useState('');
-  const [result, setResult] = useState<FlowResult | null>(null);
+  const content = useMemo(() => createContentClient(), []);
+  const [tokenDraft, setTokenDraft] = useState('');
+  const [savedToken, setSavedToken] = useState('');
+  const [scanConfig, setScanConfig] = useState<ScanConfig>(DEFAULT_SCAN_CONFIG);
+  const [connectionState, setConnectionState] = useState<ConnectionState>('unknown');
+  const [connectionMessage, setConnectionMessage] = useState('');
+  const [pageSnapshot, setPageSnapshot] = useState<PageSnapshot | null>(null);
+  const [pageError, setPageError] = useState('');
+  const [scanState, setScanState] = useState<ScanState>(IDLE_SCAN_STATE);
+  const [selectedJobId, setSelectedJobId] = useState<string | null>(null);
+  const [history, setHistory] = useState<JobHistoryEntry[]>([]);
+  const [historyFilter, setHistoryFilter] = useState<HistoryFilter>('all');
+  const [historyError, setHistoryError] = useState('');
+  const [decisionMessage, setDecisionMessage] = useState('');
+
+  const bridge = useMemo(
+    () => (savedToken === '' ? null : createBridgeClient({ token: savedToken })),
+    [savedToken],
+  );
+  const controller = useMemo(
+    () =>
+      bridge === null
+        ? null
+        : new ScanController({ content, bridge, config: scanConfig }),
+    [bridge, content, scanConfig],
+  );
+
+  const refreshPage = useCallback(async () => {
+    setPageError('');
+    try {
+      const [page, visible] = await Promise.all([
+        content.detectPage(),
+        content.extractVisibleCards(),
+      ]);
+      setPageSnapshot({
+        pageType: page.pageType,
+        block: page.block,
+        jobCount: visible.totalVisible,
+        invalidCount: visible.invalidCount,
+      });
+    } catch (error) {
+      setPageError(messageFromError(error));
+    }
+  }, [content]);
+
+  const refreshHistory = useCallback(async () => {
+    if (bridge === null) {
+      setHistory([]);
+      return;
+    }
+    setHistoryError('');
+    try {
+      setHistory(await bridge.listJobs());
+    } catch (error) {
+      setHistoryError(messageFromError(error));
+    }
+  }, [bridge]);
 
   useEffect(() => {
     let disposed = false;
-
-    void browser.storage.local
-      .get(BRIDGE_TOKEN_STORAGE_KEY)
-      .then((storedValue) => {
-        const parsed = BridgeSettingsSchema.safeParse(storedValue);
-
-        if (!disposed && parsed.success) {
-          setToken(parsed.data.bridgeToken);
+    void loadExtensionSettings(extensionStorage)
+      .then((settings) => {
+        if (!disposed) {
+          setScanConfig(settings.scanConfig);
+          if (settings.bridgeToken !== null) {
+            setTokenDraft(settings.bridgeToken);
+            setSavedToken(settings.bridgeToken);
+          }
         }
       })
-      .catch(() => {
+      .catch((error: unknown) => {
         if (!disposed) {
-          setSettingsMessage('无法读取已保存的 Bridge token。');
+          setConnectionMessage(`无法读取本地设置：${messageFromError(error)}`);
         }
       });
 
@@ -83,117 +131,143 @@ export function App() {
     };
   }, []);
 
-  const saveToken = async (event: FormEvent<HTMLFormElement>) => {
-    event.preventDefault();
-    const parsed = BridgeSettingsSchema.safeParse({ bridgeToken: token });
+  useEffect(() => {
+    if (controller === null) {
+      setScanState(IDLE_SCAN_STATE);
+      return;
+    }
+    return controller.subscribe(setScanState);
+  }, [controller]);
 
-    if (!parsed.success) {
-      setSettingsMessage('请输入 Bridge token。');
+  useEffect(() => {
+    void refreshPage();
+  }, [refreshPage]);
+
+  useEffect(() => {
+    if (bridge === null) {
+      return;
+    }
+    let disposed = false;
+    setConnectionState('checking');
+    void bridge
+      .health()
+      .then((online) => {
+        if (!disposed) {
+          setConnectionState(online ? 'online' : 'offline');
+          setConnectionMessage(online ? 'Token 已保存，Bridge 连接正常。' : 'Bridge 健康检查失败。');
+        }
+      })
+      .catch((error: unknown) => {
+        if (!disposed) {
+          setConnectionState('offline');
+          setConnectionMessage(messageFromError(error));
+        }
+      });
+    void refreshHistory();
+    return () => {
+      disposed = true;
+    };
+  }, [bridge, refreshHistory]);
+
+  useEffect(() => {
+    if (
+      scanState.results.length > 0 &&
+      !scanState.results.some((result) => result.card.job.jobId === selectedJobId)
+    ) {
+      setSelectedJobId(scanState.results[0]?.card.job.jobId ?? null);
+    }
+  }, [scanState.results, selectedJobId]);
+
+  const saveConnection = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    const settings = BridgeSettingsSchema.safeParse({ bridgeToken: tokenDraft });
+    if (!settings.success) {
+      setConnectionState('offline');
+      setConnectionMessage('请输入 Bridge token。');
       return;
     }
 
+    setConnectionState('checking');
+    setConnectionMessage('正在保存并检查 Bridge…');
+    let tokenSaved = false;
     try {
-      await browser.storage.local.set(parsed.data);
-      setToken(parsed.data.bridgeToken);
-      setSettingsMessage('Bridge token 已保存到本机扩展存储。');
-    } catch {
-      setSettingsMessage('Bridge token 保存失败。');
+      await saveBridgeToken(extensionStorage, settings.data.bridgeToken);
+      tokenSaved = true;
+      setSavedToken(settings.data.bridgeToken);
+      const online = await createBridgeClient({
+        token: settings.data.bridgeToken,
+      }).health();
+      setConnectionState(online ? 'online' : 'offline');
+      setConnectionMessage(online ? 'Token 已保存，Bridge 连接正常。' : 'Token 已保存，但 Bridge 未通过健康检查。');
+    } catch (error) {
+      setConnectionState('offline');
+      setConnectionMessage(
+        tokenSaved
+          ? `Token 已保存，但连接失败：${messageFromError(error)}`
+          : `Token 保存失败：${messageFromError(error)}`,
+      );
     }
   };
 
-  const runTestFlow = async () => {
-    const settings = BridgeSettingsSchema.safeParse({ bridgeToken: token });
+  const startScan = async () => {
+    if (controller === null) {
+      setConnectionMessage('请先保存有效的 Bridge token。');
+      return;
+    }
+    setDecisionMessage('');
+    await controller.run();
+    await Promise.all([refreshPage(), refreshHistory()]);
+  };
 
-    if (!settings.success) {
-      setFlowError('请先输入并保存 Bridge token。');
+  const cancelScan = async () => {
+    await controller?.cancel();
+  };
+
+  const saveDecision = async (decision: DecisionRequest['decision']) => {
+    const selected = scanState.results.find(
+      (result) => result.card.job.jobId === selectedJobId,
+    );
+    if (bridge === null || controller === null || selected?.savedJob === undefined) {
+      setDecisionMessage('当前职位尚未保存，无法记录判断。');
       return;
     }
 
-    setIsRunning(true);
-    setFlowError('');
-    setResult(null);
-
+    setDecisionMessage('正在保存判断…');
     try {
-      const job = await requestMockJobDetail();
-      const bridge = createBridgeClient({ token: settings.data.bridgeToken });
-      const savedJob = await bridge.saveJob(job);
-      const evaluation = await bridge.evaluateJob(savedJob.id);
-      setResult({ job, evaluation });
+      const response = await bridge.saveDecision(selected.savedJob.id, { decision });
+      controller.recordDecision(response);
+      setDecisionMessage(`已记录 ${decision}。`);
+      await refreshHistory();
     } catch (error) {
-      setFlowError(describeError(error));
-    } finally {
-      setIsRunning(false);
+      setDecisionMessage(messageFromError(error));
     }
   };
 
   return (
-    <main className="panel">
-      <p className="eyebrow">Career Ops CN</p>
-      <h1>Mock 端到端链路</h1>
-
-      <form className="token-form" onSubmit={(event) => void saveToken(event)}>
-        <label htmlFor="bridge-token">Bridge token</label>
-        <div className="token-row">
-          <input
-            id="bridge-token"
-            type="password"
-            value={token}
-            autoComplete="off"
-            placeholder="输入本机 Bridge token"
-            onChange={(event) => {
-              setToken(event.target.value);
-              setSettingsMessage('');
-            }}
-          />
-          <button className="secondary-button" type="submit">
-            保存
-          </button>
-        </div>
-        {settingsMessage === '' ? null : (
-          <p className="form-message" role="status">
-            {settingsMessage}
-          </p>
-        )}
-      </form>
-
-      <button
-        className="primary-button"
-        type="button"
-        disabled={isRunning}
-        onClick={() => void runTestFlow()}
-      >
-        {isRunning ? '测试中…' : '测试链路'}
-      </button>
-
-      {flowError === '' ? null : (
-        <p className="error-message" role="alert">
-          {flowError}
-        </p>
-      )}
-
-      {result === null ? null : (
-        <section className="result-card" aria-label="评估结果">
-          <p className="result-label">Job</p>
-          <h2>{result.job.title}</h2>
-          <p className="company">{result.job.companyName}</p>
-
-          <dl className="evaluation-summary">
-            <div>
-              <dt>Score</dt>
-              <dd>{result.evaluation.score}</dd>
-            </div>
-            <div>
-              <dt>Recommendation</dt>
-              <dd>{result.evaluation.recommendation}</dd>
-            </div>
-          </dl>
-
-          <div className="raw-report">
-            <h3>Raw report</h3>
-            <p>{result.evaluation.rawReport}</p>
-          </div>
-        </section>
-      )}
-    </main>
+    <SidePanelView
+      tokenDraft={tokenDraft}
+      connectionState={connectionState}
+      connectionMessage={connectionMessage}
+      pageSnapshot={pageSnapshot}
+      pageError={pageError}
+      scanState={scanState}
+      selectedJobId={selectedJobId}
+      history={history}
+      historyFilter={historyFilter}
+      historyError={historyError}
+      decisionMessage={decisionMessage}
+      onTokenChange={(value) => {
+        setTokenDraft(value);
+        setConnectionMessage('');
+      }}
+      onSaveConnection={(event) => void saveConnection(event)}
+      onRefreshPage={() => void refreshPage()}
+      onStartScan={() => void startScan()}
+      onCancelScan={() => void cancelScan()}
+      onSelectJob={setSelectedJobId}
+      onHistoryFilterChange={setHistoryFilter}
+      onRefreshHistory={() => void refreshHistory()}
+      onDecision={(decision) => void saveDecision(decision)}
+    />
   );
 }

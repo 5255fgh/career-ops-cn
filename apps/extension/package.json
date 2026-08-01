@@ -10,6 +10,7 @@
     "test": "vitest run"
   },
   "dependencies": {
+    "@career-ops-cn/boss-adapter": "workspace:*",
     "@career-ops-cn/shared": "workspace:*",
     "react": "^19.2.8",
     "react-dom": "^19.2.8"

@@ -51,6 +51,9 @@ importers:
 
   apps/extension:
     dependencies:
+      '@career-ops-cn/boss-adapter':
+        specifier: workspace:*
+        version: link:../../packages/boss-adapter
       '@career-ops-cn/shared':
         specifier: workspace:*
         version: link:../../packages/shared

@@ -1,4 +1,4 @@
-import { JobDetailSchema } from '@career-ops-cn/shared';
+import { JobCardSchema, JobDetailSchema } from '@career-ops-cn/shared';
 import { describe, expect, it, vi } from 'vitest';
 
 import {
@@ -22,6 +22,17 @@ const fixtureJob = JobDetailSchema.parse({
   identityVerified: true,
 });
 
+const fixtureCard = JobCardSchema.parse({
+  jobId: fixtureJob.jobId,
+  title: fixtureJob.title,
+  companyName: fixtureJob.companyName,
+  salaryText: fixtureJob.salaryText,
+  location: fixtureJob.location,
+  experienceText: fixtureJob.experienceText,
+  educationText: fixtureJob.educationText,
+  detailUrl: fixtureJob.detailUrl,
+});
+
 const savedJob = {
   id: 'job-1',
   source: 'boss',
@@ -39,8 +50,10 @@ const savedJob = {
 
 const evaluation = {
   score: 86,
-  recommendation: '推荐',
+  recommendation: 'apply',
   rawReport: '岗位技术方向与求职偏好较匹配。',
+  archetype: 'Builder',
+  legitimacy: 'high',
 };
 
 function jsonResponse(value: unknown, status = 200): Response {
@@ -125,6 +138,50 @@ describe('Bridge client', () => {
       message: expect.stringContaining('请确认 Bridge 已启动'),
     });
     await expect(client.saveJob(fixtureJob)).rejects.toBeInstanceOf(BridgeUnavailableError);
+  });
+
+  it('校验 health、screen、history 和 decision 的完整边界', async () => {
+    const screening = [{ jobId: fixtureJob.jobId, matched: true, reasons: ['通过硬规则'] }];
+    const decision = { jobId: savedJob.id, decision: 'review' as const };
+    const history = [{ ...savedJob, latestEvaluation: evaluation, decision }];
+    const fetchMock = vi
+      .fn<FetchLike>()
+      .mockResolvedValueOnce(jsonResponse({ status: 'ok' }))
+      .mockResolvedValueOnce(jsonResponse(screening))
+      .mockResolvedValueOnce(jsonResponse(history))
+      .mockResolvedValueOnce(jsonResponse(decision));
+    const client = createBridgeClient({ token: 'test-token', fetchImpl: fetchMock });
+
+    await expect(client.health()).resolves.toBe(true);
+    await expect(client.screenJobs([fixtureCard])).resolves.toEqual(screening);
+    await expect(client.listJobs()).resolves.toEqual(history);
+    await expect(client.saveDecision(savedJob.id, { decision: 'review' })).resolves.toEqual(
+      decision,
+    );
+
+    expect(fetchMock.mock.calls.map(([url]) => String(url))).toEqual([
+      'http://127.0.0.1:3847/health',
+      'http://127.0.0.1:3847/screen',
+      'http://127.0.0.1:3847/jobs',
+      'http://127.0.0.1:3847/jobs/job-1/decision',
+    ]);
+  });
+
+  it('保留 AbortError，让扫描控制器识别用户取消', async () => {
+    const fetchImpl: FetchLike = async (_input, init) =>
+      await new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener(
+          'abort',
+          () => reject(new DOMException('cancelled', 'AbortError')),
+          { once: true },
+        );
+      });
+    const controller = new AbortController();
+    const client = createBridgeClient({ token: 'test-token', fetchImpl });
+    const request = client.listJobs(controller.signal);
+    controller.abort();
+
+    await expect(request).rejects.toMatchObject({ name: 'AbortError' });
   });
 
   it('拒绝 HTTP 错误和不符合 shared Schema 的响应', async () => {

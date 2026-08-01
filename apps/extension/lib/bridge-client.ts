@@ -1,21 +1,38 @@
 import {
+  BridgeErrorResponseSchema,
   BridgeSettingsSchema,
   CreateJobRequestSchema,
+  DecisionRequestSchema,
+  DecisionResponseSchema,
   EvaluationResultSchema,
+  HealthResponseSchema,
+  JobListResponseSchema,
   JobResponseSchema,
+  ScreenRequestSchema,
+  ScreenResponseSchema,
   type CreateJobRequest,
+  type DecisionRequest,
+  type DecisionResponse,
   type EvaluationResult,
+  type JobCard,
   type JobDetail,
+  type JobHistoryEntry,
   type JobResponse,
+  type Preferences,
+  type ScreeningResult,
 } from '@career-ops-cn/shared';
 
-export const DEFAULT_BRIDGE_BASE_URL = 'http://127.0.0.1:3210';
+export const DEFAULT_BRIDGE_BASE_URL = 'http://127.0.0.1:3847';
 
 export type FetchLike = (input: string | URL, init?: RequestInit) => Promise<Response>;
 
 export interface BridgeClient {
-  saveJob(job: JobDetail): Promise<JobResponse>;
-  evaluateJob(jobId: string): Promise<EvaluationResult>;
+  health(signal?: AbortSignal): Promise<boolean>;
+  screenJobs(jobs: readonly JobCard[], preferences?: Preferences, signal?: AbortSignal): Promise<ScreeningResult[]>;
+  saveJob(job: JobDetail, signal?: AbortSignal): Promise<JobResponse>;
+  evaluateJob(jobId: string, signal?: AbortSignal): Promise<EvaluationResult>;
+  listJobs(signal?: AbortSignal): Promise<JobHistoryEntry[]>;
+  saveDecision(jobId: string, decision: DecisionRequest, signal?: AbortSignal): Promise<DecisionResponse>;
 }
 
 export interface CreateBridgeClientOptions {
@@ -24,10 +41,20 @@ export interface CreateBridgeClientOptions {
   fetchImpl?: FetchLike;
 }
 
+interface BridgeClientErrorOptions extends ErrorOptions {
+  status?: number;
+  code?: string;
+}
+
 export class BridgeClientError extends Error {
-  constructor(message: string, options?: ErrorOptions) {
-    super(message, options);
+  readonly status: number | undefined;
+  readonly code: string | undefined;
+
+  constructor(message: string, options: BridgeClientErrorOptions = {}) {
+    super(message, options.cause === undefined ? undefined : { cause: options.cause });
     this.name = 'BridgeClientError';
+    this.status = options.status;
+    this.code = options.code;
   }
 }
 
@@ -36,6 +63,10 @@ export class BridgeUnavailableError extends BridgeClientError {
     super(`无法连接本机 Bridge（${baseUrl}），请确认 Bridge 已启动。`, options);
     this.name = 'BridgeUnavailableError';
   }
+}
+
+export function isAbortError(error: unknown): boolean {
+  return error instanceof Error && error.name === 'AbortError';
 }
 
 export function toCreateJobRequest(job: JobDetail): CreateJobRequest {
@@ -60,30 +91,66 @@ async function fetchBridge(
   token: string,
   path: string,
   init: RequestInit,
+  signal?: AbortSignal,
 ): Promise<Response> {
   try {
     return await fetchImpl(`${baseUrl}${path}`, {
       ...init,
+      ...(signal === undefined ? {} : { signal }),
       headers: {
         Authorization: `Bearer ${token}`,
         ...init.headers,
       },
     });
   } catch (error) {
+    if (signal?.aborted === true || isAbortError(error)) {
+      throw error;
+    }
     throw new BridgeUnavailableError(baseUrl, { cause: error });
   }
 }
 
 async function readResponse(response: Response): Promise<unknown> {
-  if (!response.ok) {
-    throw new BridgeClientError(`Bridge 请求失败（HTTP ${response.status}）。`);
+  let payload: unknown;
+  try {
+    payload = await response.json();
+  } catch (error) {
+    throw new BridgeClientError('Bridge 返回了无法解析的 JSON。', {
+      cause: error,
+      status: response.status,
+    });
   }
 
-  try {
-    return await response.json();
-  } catch (error) {
-    throw new BridgeClientError('Bridge 返回了无法解析的 JSON。', { cause: error });
+  if (!response.ok) {
+    const bridgeError = BridgeErrorResponseSchema.safeParse(payload);
+    throw new BridgeClientError(
+      bridgeError.success
+        ? `Bridge 请求失败：${bridgeError.data.error}（HTTP ${response.status}）。`
+        : `Bridge 请求失败（HTTP ${response.status}）。`,
+      {
+        status: response.status,
+        ...(bridgeError.success ? { code: bridgeError.data.error } : {}),
+      },
+    );
   }
+
+  return payload;
+}
+
+interface SafeSchema<T> {
+  safeParse(value: unknown):
+    | { success: true; data: T }
+    | { success: false; error: unknown };
+}
+
+function parseBridgePayload<T>(schema: SafeSchema<T>, payload: unknown, label: string): T {
+  const parsed = schema.safeParse(payload);
+  if (!parsed.success) {
+    throw new BridgeClientError(`Bridge 返回的 ${label} 数据不符合约定。`, {
+      cause: parsed.error,
+    });
+  }
+  return parsed.data;
 }
 
 export function createBridgeClient({
@@ -95,41 +162,115 @@ export function createBridgeClient({
   const normalizedBaseUrl = baseUrl.replace(/\/$/u, '');
 
   return {
-    async saveJob(job) {
-      const request = toCreateJobRequest(job);
-      const response = await fetchBridge(fetchImpl, normalizedBaseUrl, settings.bridgeToken, '/jobs', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(request),
-      });
-
-      const parsed = JobResponseSchema.safeParse(await readResponse(response));
-      if (!parsed.success) {
-        throw new BridgeClientError('Bridge 返回的 Job 数据不符合约定。', {
-          cause: parsed.error,
-        });
-      }
-
-      return parsed.data;
+    async health(signal) {
+      const response = await fetchBridge(
+        fetchImpl,
+        normalizedBaseUrl,
+        settings.bridgeToken,
+        '/health',
+        { method: 'GET' },
+        signal,
+      );
+      return parseBridgePayload(
+        HealthResponseSchema,
+        await readResponse(response),
+        'Health',
+      ).status === 'ok';
     },
 
-    async evaluateJob(jobId) {
+    async screenJobs(jobs, preferences, signal) {
+      const request = ScreenRequestSchema.parse({
+        jobs: [...jobs],
+        ...(preferences === undefined ? {} : { preferences }),
+      });
+      const response = await fetchBridge(
+        fetchImpl,
+        normalizedBaseUrl,
+        settings.bridgeToken,
+        '/screen',
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(request),
+        },
+        signal,
+      );
+      return parseBridgePayload(
+        ScreenResponseSchema,
+        await readResponse(response),
+        'Screening',
+      );
+    },
+
+    async saveJob(job, signal) {
+      const request = toCreateJobRequest(job);
+      const response = await fetchBridge(
+        fetchImpl,
+        normalizedBaseUrl,
+        settings.bridgeToken,
+        '/jobs',
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(request),
+        },
+        signal,
+      );
+
+      return parseBridgePayload(JobResponseSchema, await readResponse(response), 'Job');
+    },
+
+    async evaluateJob(jobId, signal) {
       const response = await fetchBridge(
         fetchImpl,
         normalizedBaseUrl,
         settings.bridgeToken,
         `/jobs/${encodeURIComponent(jobId)}/evaluate`,
         { method: 'POST' },
+        signal,
       );
+      return parseBridgePayload(
+        EvaluationResultSchema,
+        await readResponse(response),
+        'Evaluation',
+      );
+    },
 
-      const parsed = EvaluationResultSchema.safeParse(await readResponse(response));
-      if (!parsed.success) {
-        throw new BridgeClientError('Bridge 返回的 Evaluation 数据不符合约定。', {
-          cause: parsed.error,
-        });
-      }
+    async listJobs(signal) {
+      const response = await fetchBridge(
+        fetchImpl,
+        normalizedBaseUrl,
+        settings.bridgeToken,
+        '/jobs',
+        { method: 'GET' },
+        signal,
+      );
+      return parseBridgePayload(
+        JobListResponseSchema,
+        await readResponse(response),
+        'Job history',
+      );
+    },
 
-      return parsed.data;
+    async saveDecision(jobId, decision, signal) {
+      const request = DecisionRequestSchema.parse(decision);
+      const response = await fetchBridge(
+        fetchImpl,
+        normalizedBaseUrl,
+        settings.bridgeToken,
+        `/jobs/${encodeURIComponent(jobId)}/decision`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(request),
+        },
+        signal,
+      );
+      return parseBridgePayload(
+        DecisionResponseSchema,
+        await readResponse(response),
+        'Decision',
+      );
     },
   };
 }

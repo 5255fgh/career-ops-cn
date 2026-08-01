@@ -3,11 +3,14 @@ import { DatabaseSync } from "node:sqlite";
 
 import {
   DecisionResponseSchema,
+  EvaluationResultSchema,
+  JobHistoryEntrySchema,
   JobResponseSchema,
   type CreateJobRequest,
   type DecisionRequest,
   type DecisionResponse,
   type EvaluationResult,
+  type JobHistoryEntry,
   type JobResponse,
 } from "@career-ops-cn/shared";
 
@@ -31,6 +34,23 @@ interface JobColumnRow {
   name: string;
 }
 
+interface EvaluationRow {
+  score: number;
+  recommendation: string;
+  raw_report: string;
+  company: string | null;
+  role: string | null;
+  archetype: string | null;
+  legitimacy: string | null;
+}
+
+interface DecisionRow {
+  job_id: string;
+  decision: string;
+  reason: string | null;
+  outcome: string | null;
+}
+
 const JOB_COLUMNS: ReadonlyArray<readonly [string, string]> = [
   ["normalized_url", "TEXT"],
   ["experience", "TEXT"],
@@ -39,6 +59,13 @@ const JOB_COLUMNS: ReadonlyArray<readonly [string, string]> = [
     "identity_verified",
     "INTEGER NOT NULL DEFAULT 0 CHECK (identity_verified IN (0, 1))",
   ],
+];
+
+const EVALUATION_COLUMNS: ReadonlyArray<readonly [string, string]> = [
+  ["company", "TEXT"],
+  ["role", "TEXT"],
+  ["archetype", "TEXT"],
+  ["legitimacy", "TEXT"],
 ];
 
 export interface JobUpsertResult {
@@ -94,7 +121,11 @@ export function initializeDatabase(database: DatabaseSync): void {
       job_id TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
       score INTEGER NOT NULL CHECK (score BETWEEN 0 AND 100),
       recommendation TEXT NOT NULL,
-      raw_report TEXT NOT NULL
+      raw_report TEXT NOT NULL,
+      company TEXT,
+      role TEXT,
+      archetype TEXT,
+      legitimacy TEXT
     ) STRICT;
 
     CREATE TABLE IF NOT EXISTS decisions (
@@ -119,6 +150,19 @@ export function initializeDatabase(database: DatabaseSync): void {
   for (const [name, definition] of JOB_COLUMNS) {
     if (!existingColumns.has(name)) {
       database.exec(`ALTER TABLE jobs ADD COLUMN ${name} ${definition}`);
+    }
+  }
+
+  const existingEvaluationColumns = new Set(
+    (
+      database.prepare("PRAGMA table_info(evaluations)").all() as unknown as
+        JobColumnRow[]
+    ).map(({ name }) => name),
+  );
+
+  for (const [name, definition] of EVALUATION_COLUMNS) {
+    if (!existingEvaluationColumns.has(name)) {
+      database.exec(`ALTER TABLE evaluations ADD COLUMN ${name} ${definition}`);
     }
   }
 
@@ -288,11 +332,62 @@ export function findJob(
   return row === undefined ? undefined : rowToJob(row);
 }
 
-export function listJobs(database: DatabaseSync): JobResponse[] {
-  return (
-    database.prepare("SELECT * FROM jobs ORDER BY rowid").all() as unknown as
-      JobRow[]
-  ).map(rowToJob);
+export function listJobs(database: DatabaseSync): JobHistoryEntry[] {
+  const jobs = database
+    .prepare("SELECT * FROM jobs ORDER BY rowid DESC")
+    .all() as unknown as JobRow[];
+  const latestEvaluation = database.prepare(
+    `
+      SELECT score, recommendation, raw_report, company, role, archetype,
+             legitimacy
+      FROM evaluations
+      WHERE job_id = ?
+      ORDER BY rowid DESC
+      LIMIT 1
+    `,
+  );
+  const decision = database.prepare(
+    "SELECT * FROM decisions WHERE job_id = ?",
+  );
+
+  return jobs.map((row) => {
+    const job = rowToJob(row);
+    const evaluationRow = latestEvaluation.get(row.id) as
+      | EvaluationRow
+      | undefined;
+    const decisionRow = decision.get(row.id) as DecisionRow | undefined;
+
+    return JobHistoryEntrySchema.parse({
+      ...job,
+      ...(evaluationRow === undefined
+        ? {}
+        : {
+            latestEvaluation: EvaluationResultSchema.parse({
+              score: evaluationRow.score,
+              recommendation: evaluationRow.recommendation,
+              rawReport: evaluationRow.raw_report,
+              company: evaluationRow.company,
+              role: evaluationRow.role,
+              archetype: evaluationRow.archetype,
+              legitimacy: evaluationRow.legitimacy,
+            }),
+          }),
+      ...(decisionRow === undefined
+        ? {}
+        : {
+            decision: DecisionResponseSchema.parse({
+              jobId: decisionRow.job_id,
+              decision: decisionRow.decision,
+              ...(decisionRow.reason === null
+                ? {}
+                : { reason: decisionRow.reason }),
+              ...(decisionRow.outcome === null
+                ? {}
+                : { outcome: decisionRow.outcome }),
+            }),
+          }),
+    });
+  });
 }
 
 export function saveEvaluation(
@@ -304,8 +399,9 @@ export function saveEvaluation(
     .prepare(
       `
         INSERT INTO evaluations (
-          id, job_id, score, recommendation, raw_report
-        ) VALUES (?, ?, ?, ?, ?)
+          id, job_id, score, recommendation, raw_report, company, role,
+          archetype, legitimacy
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
       `,
     )
     .run(
@@ -314,6 +410,10 @@ export function saveEvaluation(
       evaluation.score,
       evaluation.recommendation,
       evaluation.rawReport,
+      evaluation.company ?? null,
+      evaluation.role ?? null,
+      evaluation.archetype ?? null,
+      evaluation.legitimacy ?? null,
     );
 }
 

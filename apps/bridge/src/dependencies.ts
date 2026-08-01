@@ -152,7 +152,7 @@ export function toScreeningResult(
 ): ScreeningResult {
   return {
     jobId,
-    matched: result.decision === "pass",
+    matched: result.decision !== "block",
     reasons: result.rules.map(({ reason }) => reason),
   };
 }
