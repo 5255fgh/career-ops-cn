@@ -2,6 +2,7 @@ import type {
   BossPageBlock,
   BossPageType,
   DecisionRequest,
+  DiagnosticEvent,
   JobHistoryEntry,
 } from '@career-ops-cn/shared';
 import type { FormEventHandler } from 'react';
@@ -30,14 +31,18 @@ export interface SidePanelViewProps {
   historyFilter: HistoryFilter;
   historyError: string;
   decisionMessage: string;
+  diagnostics: DiagnosticEvent[];
+  diagnosticsError: string;
   onTokenChange(value: string): void;
   onSaveConnection: FormEventHandler<HTMLFormElement>;
   onRefreshPage(): void;
   onStartScan(): void;
+  onStartAcceptanceSmoke(): void;
   onCancelScan(): void;
   onSelectJob(jobId: string): void;
   onHistoryFilterChange(filter: HistoryFilter): void;
   onRefreshHistory(): void;
+  onRefreshDiagnostics(): void;
   onDecision(decision: DecisionRequest['decision']): void;
 }
 
@@ -194,6 +199,14 @@ export function SidePanelView(props: SidePanelViewProps) {
             onClick={props.onStartScan}
           >
             开始扫描
+          </button>
+          <button
+            className="button button-secondary"
+            type="button"
+            disabled={isScanning || props.connectionState !== 'online'}
+            onClick={props.onStartAcceptanceSmoke}
+          >
+            验收 3 职位
           </button>
           <button
             className="button button-danger"
@@ -395,6 +408,46 @@ export function SidePanelView(props: SidePanelViewProps) {
         </div>
         {props.decisionMessage === '' ? null : (
           <p className="inline-message" role="status">{props.decisionMessage}</p>
+        )}
+      </section>
+
+      <section className="panel-section" aria-labelledby="diagnostics-heading">
+        <div className="section-heading">
+          <div>
+            <span className="section-index">09</span>
+            <h2 id="diagnostics-heading">验收诊断</h2>
+          </div>
+          <button className="text-button" type="button" onClick={props.onRefreshDiagnostics}>
+            刷新
+          </button>
+        </div>
+        {props.diagnosticsError === '' ? null : (
+          <p className="error-message" role="alert">{props.diagnosticsError}</p>
+        )}
+        {props.diagnostics.length === 0 ? (
+          <p className="empty-copy">尚无验收诊断记录。</p>
+        ) : (
+          <ul className="history-list diagnostic-list">
+            {props.diagnostics.slice(0, 30).map((event) => (
+              <li key={event.id}>
+                <div>
+                  <strong>{event.event}</strong>
+                  <span>{new Date(event.createdAt).toLocaleString()}</span>
+                </div>
+                <div className="history-meta">
+                  <span>{event.level}</span>
+                  <span>{event.outcome ?? '—'}</span>
+                  <span>{event.expectedJobId ?? '—'} → {event.actualJobId ?? '—'}</span>
+                </div>
+                {event.message === undefined ? null : (
+                  <p className="row-error">{event.message}</p>
+                )}
+                {event.details === undefined ? null : (
+                  <pre>{JSON.stringify(event.details, null, 2)}</pre>
+                )}
+              </li>
+            ))}
+          </ul>
         )}
       </section>
     </main>

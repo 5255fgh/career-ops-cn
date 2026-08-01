@@ -2,6 +2,7 @@ import {
   ScanConfigSchema,
   type BossPageBlockReason,
   type DecisionResponse,
+  type DiagnosticEventRequest,
   type EvaluationResult,
   type JobDetail,
   type JobResponse,
@@ -127,6 +128,12 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : '扫描流程发生未知错误。';
 }
 
+export interface ScanRunOptions {
+  acceptance?: boolean;
+  maxDetailJobs?: number;
+  maxAiJobs?: number;
+}
+
 function visibleCardFromDetail(detail: JobDetail): VisibleJobCard {
   return {
     index: 0,
@@ -150,6 +157,8 @@ export class ScanController {
   private readonly delay: (milliseconds: number, signal: AbortSignal) => Promise<void>;
   private readonly listeners = new Set<ScanStateListener>();
   private abortController: AbortController | null = null;
+  private currentScanId: string | null = null;
+  private diagnosticError: string | null = null;
   private currentState: ScanState = {
     status: 'idle',
     progress: emptyProgress(),
@@ -205,13 +214,35 @@ export class ScanController {
     this.update({ status: 'failed', stopReason: reason, error: message });
   }
 
-  async run(): Promise<ScanState> {
+  private async diagnose(
+    event: Omit<DiagnosticEventRequest, 'source' | 'scanId'>,
+  ): Promise<void> {
+    if (this.currentScanId === null) {
+      return;
+    }
+    try {
+      await this.bridge.recordDiagnostic({
+        source: 'extension',
+        scanId: this.currentScanId,
+        ...event,
+      });
+    } catch (error) {
+      this.diagnosticError ??= errorMessage(error);
+    }
+  }
+
+  async run(options: ScanRunOptions = {}): Promise<ScanState> {
     if (ACTIVE_STATUSES.has(this.currentState.status)) {
       throw new Error('扫描已在进行中。');
     }
 
     const controller = new AbortController();
     this.abortController = controller;
+    this.currentScanId =
+      options.acceptance === true ? globalThis.crypto.randomUUID() : null;
+    this.diagnosticError = null;
+    const maxDetailJobs = options.maxDetailJobs ?? this.config.maxDetailJobs;
+    const maxAiJobs = options.maxAiJobs ?? this.config.maxAiJobs;
     this.update({
       status: 'reading-list',
       progress: emptyProgress(),
@@ -221,8 +252,25 @@ export class ScanController {
     });
 
     try {
+      await this.diagnose({
+        level: 'info',
+        event: 'acceptance_smoke_started',
+        details: { maxDetailJobs, maxAiJobs },
+      });
       const page = await this.content.detectPage();
+      await this.diagnose({
+        level: page.block === null ? 'info' : 'warning',
+        event: 'page_detected',
+        outcome: page.pageType,
+        details: { block: page.block?.reason ?? null },
+      });
       if (page.block !== null && FATAL_PAGE_BLOCKS.has(page.block.reason)) {
+        await this.diagnose({
+          level: 'warning',
+          event: 'scan_stopped',
+          outcome: page.block.reason,
+          message: `页面已停止扫描：${page.block.reason}`,
+        });
         this.stop(page.block.reason as ScanStopReason, `页面已停止扫描：${page.block.reason}`);
         return this.currentState;
       }
@@ -237,6 +285,12 @@ export class ScanController {
         });
 
         if (detail === null) {
+          await this.diagnose({
+            level: 'error',
+            event: 'detail_mapping',
+            outcome: 'missing_detail',
+            message: '当前职位详情缺少必要字段。',
+          });
           this.update({
             status: 'failed',
             error: '当前职位详情缺少必要字段。',
@@ -246,6 +300,16 @@ export class ScanController {
 
         const card = visibleCardFromDetail(detail);
         this.update({ results: [{ card, detail }] });
+        await this.diagnose({
+          level: detail.identityVerified ? 'info' : 'error',
+          event: 'detail_mapping',
+          jobId: detail.jobId,
+          expectedJobId: detail.jobId,
+          actualJobId: detail.jobId,
+          expectedTitle: detail.title,
+          actualTitle: detail.title,
+          outcome: detail.identityVerified ? 'verified' : 'identity_failure',
+        });
         if (!detail.identityVerified) {
           this.update({
             status: 'failed',
@@ -256,6 +320,14 @@ export class ScanController {
 
         const savedJob = await this.bridge.saveJob(detail, controller.signal);
         this.updateResult(detail.jobId, { savedJob });
+        await this.diagnose({
+          level: 'info',
+          event: 'job_saved',
+          jobId: savedJob.id,
+          actualJobId: detail.jobId,
+          actualTitle: detail.title,
+          outcome: 'saved',
+        });
         this.update({ status: 'evaluating' });
         this.updateProgress({ aiTarget: 1 });
         const evaluation = await this.bridge.evaluateJob(
@@ -263,14 +335,53 @@ export class ScanController {
           controller.signal,
         );
         this.updateResult(detail.jobId, { evaluation });
+        await this.diagnose({
+          level: 'info',
+          event: 'evaluation_received',
+          jobId: savedJob.id,
+          actualJobId: detail.jobId,
+          actualTitle: detail.title,
+          outcome: evaluation.recommendation,
+          details: {
+            score: evaluation.score,
+            rawReportLength: evaluation.rawReport.length,
+          },
+        });
         this.updateProgress({ aiCompleted: 1 });
         this.update({ status: 'completed' });
+        await this.diagnose({
+          level: 'info',
+          event: 'acceptance_smoke_completed',
+          outcome: 'completed',
+          details: { mappedJobs: 1, evaluatedJobs: 1 },
+        });
+        if (this.diagnosticError !== null) {
+          this.update({
+            status: 'failed',
+            error: `验收诊断写入失败：${this.diagnosticError}`,
+          });
+        }
         return this.currentState;
       }
 
       const visible = await this.content.extractVisibleCards();
       const cards = visible.cards.slice(0, this.config.maxListJobs);
       this.updateProgress({ listJobs: visible.totalVisible });
+      await this.diagnose({
+        level: cards.length === 0 ? 'warning' : 'info',
+        event: 'visible_cards_extracted',
+        outcome: cards.length === 0 ? 'empty' : 'success',
+        details: {
+          totalVisible: visible.totalVisible,
+          validCards: cards.length,
+          invalidCards: visible.invalidCount,
+          ...Object.fromEntries(
+            Object.entries(visible.invalidFieldCounts ?? {}).map(
+              ([field, count]) => [`invalid_${field}`, count],
+            ),
+          ),
+        },
+      });
       if (cards.length === 0) {
         this.update({
           status: 'failed',
@@ -299,10 +410,19 @@ export class ScanController {
         }),
       });
       this.updateProgress({ screenedJobs: screenings.length });
+      await this.diagnose({
+        level: 'info',
+        event: 'screening_completed',
+        outcome: 'success',
+        details: {
+          screenedJobs: screenings.length,
+          matchedJobs: screenings.filter((result) => result.matched).length,
+        },
+      });
 
       const detailTargets = cards
         .filter((card) => screeningById.get(card.job.jobId)?.matched === true)
-        .slice(0, this.config.maxDetailJobs);
+        .slice(0, maxDetailJobs);
       this.update({ status: 'reading-details' });
       this.updateProgress({ detailTarget: detailTargets.length });
 
@@ -319,6 +439,59 @@ export class ScanController {
           detailCompleted: this.currentState.progress.detailCompleted + 1,
         });
 
+        await this.diagnose({
+          level:
+            detailResult.outcome === 'success'
+              ? 'info'
+              : detailResult.outcome === 'cancelled'
+                ? 'warning'
+                : 'error',
+          event: 'detail_mapping',
+          expectedJobId: card.job.jobId,
+          expectedTitle: card.job.title,
+          ...(detailResult.outcome === 'success'
+            ? {
+                actualJobId: detailResult.job.jobId,
+                actualTitle: detailResult.job.title,
+              }
+            : detailResult.outcome === 'timeout' ||
+                detailResult.outcome === 'identity_failure'
+              ? {
+                  ...(detailResult.evidence?.actualJobId === undefined
+                    ? {}
+                    : { actualJobId: detailResult.evidence.actualJobId }),
+                  ...(detailResult.evidence?.actualTitle === undefined
+                    ? {}
+                    : { actualTitle: detailResult.evidence.actualTitle }),
+                }
+            : {}),
+          outcome: detailResult.outcome,
+          ...(detailResult.outcome === 'failed'
+            ? { message: detailResult.message }
+            : {}),
+          ...(detailResult.outcome === 'blocked'
+            ? {
+                message: `页面已停止扫描：${detailResult.reason}`,
+                details: { blockReason: detailResult.reason },
+              }
+            : {}),
+          ...(detailResult.outcome === 'timeout' ||
+          detailResult.outcome === 'identity_failure'
+            ? {
+                details: {
+                  detailFound: detailResult.evidence?.detailFound ?? false,
+                  signalJobIdentity:
+                    detailResult.evidence?.signals?.jobIdentity ?? null,
+                  signalTitle: detailResult.evidence?.signals?.title ?? null,
+                  signalActiveCard:
+                    detailResult.evidence?.signals?.activeCard ?? null,
+                  signalContentChanged:
+                    detailResult.evidence?.signals?.contentChanged ?? null,
+                },
+              }
+            : {}),
+        });
+
         if (detailResult.outcome === 'cancelled') {
           throw abortError();
         }
@@ -329,6 +502,12 @@ export class ScanController {
               detailResult.reason as ScanStopReason,
               `页面已停止扫描：${detailResult.reason}`,
             );
+            await this.diagnose({
+              level: 'warning',
+              event: 'scan_stopped',
+              outcome: detailResult.reason,
+              message: `页面已停止扫描：${detailResult.reason}`,
+            });
             return this.currentState;
           }
           consecutiveTimeouts = 0;
@@ -342,6 +521,12 @@ export class ScanController {
           this.updateResult(card.job.jobId, { detailError: '职位详情读取超时。' });
           if (consecutiveTimeouts >= 3) {
             this.stop('detail_timeout_limit', '连续 3 个职位详情读取超时。');
+            await this.diagnose({
+              level: 'error',
+              event: 'scan_stopped',
+              outcome: 'detail_timeout_limit',
+              message: '连续 3 个职位详情读取超时。',
+            });
             return this.currentState;
           }
         } else if (detailResult.outcome === 'identity_failure') {
@@ -350,6 +535,12 @@ export class ScanController {
           this.updateResult(card.job.jobId, { detailError: '职位详情身份校验失败。' });
           if (consecutiveIdentityFailures >= 3) {
             this.stop('identity_failure_limit', '连续 3 个职位详情身份校验失败。');
+            await this.diagnose({
+              level: 'error',
+              event: 'scan_stopped',
+              outcome: 'identity_failure_limit',
+              message: '连续 3 个职位详情身份校验失败。',
+            });
             return this.currentState;
           }
         } else if (detailResult.outcome === 'failed') {
@@ -363,12 +554,30 @@ export class ScanController {
           try {
             const savedJob = await this.bridge.saveJob(detailResult.job, controller.signal);
             this.updateResult(card.job.jobId, { savedJob });
+            await this.diagnose({
+              level: 'info',
+              event: 'job_saved',
+              jobId: savedJob.id,
+              expectedJobId: card.job.jobId,
+              actualJobId: detailResult.job.jobId,
+              expectedTitle: card.job.title,
+              actualTitle: detailResult.job.title,
+              outcome: 'saved',
+            });
           } catch (error) {
             if (controller.signal.aborted || isAbortError(error)) {
               throw error;
             }
             this.updateResult(card.job.jobId, {
               detailError: `保存职位失败：${errorMessage(error)}`,
+            });
+            await this.diagnose({
+              level: 'error',
+              event: 'job_save_failed',
+              expectedJobId: card.job.jobId,
+              expectedTitle: card.job.title,
+              outcome: 'failed',
+              message: errorMessage(error),
             });
           }
         }
@@ -382,7 +591,7 @@ export class ScanController {
         .filter((result): result is ScannedJob & { savedJob: JobResponse } =>
           result.savedJob !== undefined,
         )
-        .slice(0, this.config.maxAiJobs);
+        .slice(0, maxAiJobs);
       this.update({ status: 'evaluating' });
       this.updateProgress({ aiTarget: evaluationTargets.length });
 
@@ -393,12 +602,39 @@ export class ScanController {
             controller.signal,
           );
           this.updateResult(result.card.job.jobId, { evaluation });
+          await this.diagnose({
+            level: 'info',
+            event: 'evaluation_received',
+            jobId: result.savedJob.id,
+            expectedJobId: result.card.job.jobId,
+            expectedTitle: result.card.job.title,
+            ...(result.detail === undefined
+              ? {}
+              : {
+                  actualJobId: result.detail.jobId,
+                  actualTitle: result.detail.title,
+                }),
+            outcome: evaluation.recommendation,
+            details: {
+              score: evaluation.score,
+              rawReportLength: evaluation.rawReport.length,
+            },
+          });
         } catch (error) {
           if (controller.signal.aborted || isAbortError(error)) {
             throw error;
           }
           this.updateResult(result.card.job.jobId, {
             evaluationError: errorMessage(error),
+          });
+          await this.diagnose({
+            level: 'error',
+            event: 'evaluation_failed',
+            jobId: result.savedJob.id,
+            expectedJobId: result.card.job.jobId,
+            expectedTitle: result.card.job.title,
+            outcome: 'failed',
+            message: errorMessage(error),
           });
         }
         this.updateProgress({
@@ -407,20 +643,56 @@ export class ScanController {
       }
 
       this.update({ status: 'completed' });
+      await this.diagnose({
+        level: 'info',
+        event: 'acceptance_smoke_completed',
+        outcome: 'completed',
+        details: {
+          mappedJobs: this.currentState.results.filter(
+            (result) => result.detail !== undefined,
+          ).length,
+          evaluatedJobs: this.currentState.results.filter(
+            (result) => result.evaluation !== undefined,
+          ).length,
+        },
+      });
+      if (this.diagnosticError !== null) {
+        this.update({
+          status: 'failed',
+          error: `验收诊断写入失败：${this.diagnosticError}`,
+        });
+      }
       return this.currentState;
     } catch (error) {
       if (controller.signal.aborted || isAbortError(error)) {
         if (this.currentState.status !== 'cancelled') {
           this.update({ status: 'cancelled', error: null, stopReason: null });
         }
+        await this.diagnose({
+          level: 'warning',
+          event: 'scan_cancelled',
+          outcome: 'cancelled',
+          details: {
+            mappedJobs: this.currentState.results.filter(
+              (result) => result.detail !== undefined,
+            ).length,
+          },
+        });
       } else {
         this.update({ status: 'failed', error: errorMessage(error) });
+        await this.diagnose({
+          level: 'error',
+          event: 'acceptance_smoke_failed',
+          outcome: 'failed',
+          message: errorMessage(error),
+        });
       }
       return this.currentState;
     } finally {
       if (this.abortController === controller) {
         this.abortController = null;
       }
+      this.currentScanId = null;
     }
   }
 
@@ -428,9 +700,17 @@ export class ScanController {
     if (!ACTIVE_STATUSES.has(this.currentState.status)) {
       return;
     }
+    const diagnostic = this.diagnose({
+      level: 'warning',
+      event: 'cancel_requested',
+      outcome: 'requested',
+    });
     this.abortController?.abort();
     this.update({ status: 'cancelled', error: null, stopReason: null });
-    await this.content.cancelDetailScan().catch(() => undefined);
+    await Promise.all([
+      diagnostic,
+      this.content.cancelDetailScan().catch(() => undefined),
+    ]);
   }
 
   recordDecision(decision: DecisionResponse): void {

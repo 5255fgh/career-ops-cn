@@ -4,6 +4,9 @@ import {
   BridgeErrorResponseSchema,
   CreateJobRequestSchema,
   DecisionRequestSchema,
+  DiagnosticEventRequestSchema,
+  DiagnosticListQuerySchema,
+  DiagnosticListResponseSchema,
   EvaluationResultSchema,
   HealthRequestSchema,
   HealthResponseSchema,
@@ -13,6 +16,8 @@ import {
   JobResponseSchema,
   ScreenRequestSchema,
   ScreenResponseSchema,
+  type DiagnosticEvent,
+  type DiagnosticEventRequest,
 } from "@career-ops-cn/shared";
 import Fastify, {
   type FastifyInstance,
@@ -38,8 +43,10 @@ import {
 import {
   findJob,
   initializeDatabase,
+  listDiagnostics,
   listJobs,
   saveDecision,
+  saveDiagnostic,
   saveEvaluation,
   saveJob,
 } from "./database.js";
@@ -97,10 +104,11 @@ function probeDatabase(database: DatabaseSync): void {
 function sendError(
   reply: FastifyReply,
   error: BridgeErrorCode,
+  details: { message?: string; diagnosticId?: string } = {},
 ): FastifyReply {
   return reply
     .code(ERROR_STATUS[error])
-    .send(BridgeErrorResponseSchema.parse({ error }));
+    .send(BridgeErrorResponseSchema.parse({ error, ...details }));
 }
 
 function isExtensionOrigin(origin: string): boolean {
@@ -139,6 +147,13 @@ function runDatabaseOperation<T>(operation: () => T): T {
       cause: error,
     });
   }
+}
+
+function redactDiagnosticText(value: string): string {
+  return value
+    .replace(/\bsk-[A-Za-z0-9_-]+\b/gu, "[REDACTED]")
+    .replace(/(OPENAI_API_KEY\s*[=:]\s*)\S+/giu, "$1[REDACTED]")
+    .replace(/(Authorization\s*:\s*Bearer\s+)\S+/giu, "$1[REDACTED]");
 }
 
 function validateEmptyRequest(
@@ -180,6 +195,7 @@ async function evaluateJob(
   screenJob: ScreenJob,
   config: BridgeConfig,
   job: NonNullable<ReturnType<typeof findJob>>,
+  recordDiagnostic: (input: DiagnosticEventRequest) => DiagnosticEvent,
 ) {
   const detail = buildJobDetail(job);
   if (detail === undefined) {
@@ -228,6 +244,15 @@ async function evaluateJob(
   timeout.unref();
 
   try {
+    recordDiagnostic({
+      source: "bridge",
+      level: "info",
+      event: "evaluation_started",
+      jobId: job.id,
+      ...(job.sourceJobId === undefined
+        ? {}
+        : { details: { sourceJobId: job.sourceJobId } }),
+    });
     const output = await evaluator(detail, {
       careerOpsRoot: config.careerOpsRoot,
       timeoutMs: config.evaluationTimeoutMs,
@@ -246,8 +271,60 @@ async function evaluateJob(
       );
     }
 
+    recordDiagnostic({
+      source: "bridge",
+      level: "info",
+      event: "evaluation_completed",
+      jobId: job.id,
+      outcome: evaluation.data.recommendation,
+      details: {
+        score: evaluation.data.score,
+        rawReportLength: evaluation.data.rawReport.length,
+      },
+    });
     return evaluation.data;
   } catch (error) {
+    if (
+      error instanceof Error &&
+      "code" in error &&
+      error.code === "UPSTREAM_UNAVAILABLE"
+    ) {
+      const httpStatus =
+        "httpStatus" in error && typeof error.httpStatus === "number"
+          ? error.httpStatus
+          : null;
+      const attempts =
+        "attempts" in error && typeof error.attempts === "number"
+          ? error.attempts
+          : 1;
+      const diagnostic = redactDiagnosticText(
+        "diagnostic" in error && typeof error.diagnostic === "string"
+          ? error.diagnostic
+          : error.message,
+      );
+      const savedDiagnostic = recordDiagnostic({
+        source: "bridge",
+        level: "error",
+        event: "evaluation_upstream_failed",
+        jobId: job.id,
+        outcome:
+          httpStatus === null ? "upstream_unavailable" : `http_${httpStatus}`,
+        message: `上游 evaluator 在 ${attempts} 次尝试后仍不可用。`,
+        details: { httpStatus, attempts, diagnostic },
+      });
+      const statusLabel =
+        httpStatus === null ? "不可用" : `HTTP ${httpStatus}`;
+      throw bridgeFailure(
+        "EVALUATION_FAILED",
+        `career-ops provider ${statusLabel}，${attempts} 次尝试均失败。`,
+        {
+          cause: error,
+          publicMessage: `provider ${statusLabel}，已尝试 ${attempts} 次；诊断 ${savedDiagnostic.id}。`,
+          diagnosticId: savedDiagnostic.id,
+        },
+      );
+    }
+
     if (isBridgeFailure(error)) {
       throw error;
     }
@@ -285,6 +362,24 @@ async function evaluateJob(
       }
     }
 
+    recordDiagnostic({
+      source: "bridge",
+      level: "error",
+      event: "evaluation_failed",
+      jobId: job.id,
+      message: redactDiagnosticText(
+        error instanceof Error ? error.message : "未知 evaluator 错误。",
+      ),
+      details: {
+        adapterCode:
+          error instanceof Error &&
+          "code" in error &&
+          typeof error.code === "string"
+            ? error.code
+            : null,
+      },
+    });
+
     throw bridgeFailure("EVALUATION_FAILED", "career-ops 评估失败。", {
       cause: error,
     });
@@ -316,10 +411,21 @@ function buildBridge(
   }
 
   const bridge = Fastify({ logger: false });
+  const recordDiagnostic = (
+    input: DiagnosticEventRequest,
+  ): DiagnosticEvent =>
+    runDatabaseOperation(() => saveDiagnostic(database, input));
 
   bridge.setErrorHandler((error, _request, reply) => {
     if (isBridgeFailure(error)) {
-      return sendError(reply, error.code);
+      return sendError(reply, error.code, {
+        ...(error.publicMessage === undefined
+          ? {}
+          : { message: error.publicMessage }),
+        ...(error.diagnosticId === undefined
+          ? {}
+          : { diagnosticId: error.diagnosticId }),
+      });
     }
 
     return sendError(reply, "EVALUATION_FAILED");
@@ -421,6 +527,46 @@ function buildBridge(
     },
   );
 
+  bridge.post(
+    "/diagnostics",
+    {
+      preHandler: async (request, reply) =>
+        authenticate(request, reply, config.token),
+    },
+    async (request, reply) => {
+      const query = HealthRequestSchema.safeParse(request.query);
+      const body = DiagnosticEventRequestSchema.safeParse(request.body);
+      if (
+        !query.success ||
+        !body.success ||
+        body.data.source !== "extension"
+      ) {
+        return sendError(reply, "INVALID_REQUEST");
+      }
+      return reply.code(200).send(recordDiagnostic(body.data));
+    },
+  );
+
+  bridge.get(
+    "/diagnostics",
+    {
+      preHandler: async (request, reply) =>
+        authenticate(request, reply, config.token),
+    },
+    async (request, reply) => {
+      const query = DiagnosticListQuerySchema.safeParse(request.query);
+      if (!query.success) {
+        return sendError(reply, "INVALID_REQUEST");
+      }
+      const diagnostics = runDatabaseOperation(() =>
+        listDiagnostics(database, query.data.limit),
+      );
+      return reply
+        .code(200)
+        .send(DiagnosticListResponseSchema.parse(diagnostics));
+    },
+  );
+
   bridge.get(
     "/jobs/:id",
     {
@@ -469,6 +615,7 @@ function buildBridge(
         screenJob,
         config,
         job,
+        recordDiagnostic,
       );
       runDatabaseOperation(() =>
         saveEvaluation(database, params.data.id, evaluation),

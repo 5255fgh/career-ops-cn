@@ -206,9 +206,50 @@ export const BridgeErrorResponseSchema = z.strictObject({
     "CAREER_OPS_NOT_FOUND",
     "DATABASE_ERROR",
   ]),
+  message: NonEmptyTextSchema.optional(),
+  diagnosticId: NonEmptyTextSchema.optional(),
 });
 
 export type BridgeErrorResponse = z.infer<typeof BridgeErrorResponseSchema>;
+
+const DiagnosticDetailValueSchema = z.union([
+  z.string(),
+  z.number().finite(),
+  z.boolean(),
+  z.null(),
+]);
+
+export const DiagnosticEventRequestSchema = z.strictObject({
+  source: z.enum(["extension", "bridge"]),
+  level: z.enum(["info", "warning", "error"]),
+  event: NonEmptyTextSchema,
+  scanId: NonEmptyTextSchema.optional(),
+  jobId: NonEmptyTextSchema.optional(),
+  expectedJobId: NonEmptyTextSchema.optional(),
+  actualJobId: NonEmptyTextSchema.optional(),
+  expectedTitle: NonEmptyTextSchema.optional(),
+  actualTitle: NonEmptyTextSchema.optional(),
+  outcome: NonEmptyTextSchema.optional(),
+  message: NonEmptyTextSchema.optional(),
+  details: z.record(z.string(), DiagnosticDetailValueSchema).optional(),
+});
+
+export type DiagnosticEventRequest = z.infer<
+  typeof DiagnosticEventRequestSchema
+>;
+
+export const DiagnosticEventSchema = DiagnosticEventRequestSchema.extend({
+  id: NonEmptyTextSchema,
+  createdAt: z.string().datetime(),
+}).strict();
+
+export type DiagnosticEvent = z.infer<typeof DiagnosticEventSchema>;
+
+export const DiagnosticListQuerySchema = z.strictObject({
+  limit: z.coerce.number().int().min(1).max(200).default(100),
+});
+
+export const DiagnosticListResponseSchema = z.array(DiagnosticEventSchema);
 
 export const BridgeSettingsSchema = z.strictObject({
   bridgeToken: NonEmptyTextSchema,
@@ -294,6 +335,18 @@ export const ExtractVisibleCardsResponseSchema = z.strictObject({
   cards: z.array(VisibleJobCardSchema),
   totalVisible: z.number().int().nonnegative(),
   invalidCount: z.number().int().nonnegative(),
+  invalidFieldCounts: z
+    .strictObject({
+      jobId: z.number().int().nonnegative().optional(),
+      title: z.number().int().nonnegative().optional(),
+      companyName: z.number().int().nonnegative().optional(),
+      salaryText: z.number().int().nonnegative().optional(),
+      location: z.number().int().nonnegative().optional(),
+      experienceText: z.number().int().nonnegative().optional(),
+      educationText: z.number().int().nonnegative().optional(),
+      detailUrl: z.number().int().nonnegative().optional(),
+    })
+    .optional(),
 });
 
 export type ExtractVisibleCardsResponse = z.infer<
@@ -306,6 +359,20 @@ export const StartDetailScanRequestSchema = z.strictObject({
   timeoutMs: z.number().int().positive(),
 });
 
+const DetailIdentityEvidenceSchema = z.strictObject({
+  detailFound: z.boolean(),
+  actualJobId: NonEmptyTextSchema.optional(),
+  actualTitle: NonEmptyTextSchema.optional(),
+  signals: z
+    .strictObject({
+      jobIdentity: z.boolean().nullable(),
+      title: z.boolean().nullable(),
+      activeCard: z.boolean().nullable(),
+      contentChanged: z.boolean().nullable(),
+    })
+    .optional(),
+});
+
 export const StartDetailScanResponseSchema = z.discriminatedUnion("outcome", [
   z.strictObject({
     type: z.literal("boss/start-detail-scan/response"),
@@ -315,10 +382,12 @@ export const StartDetailScanResponseSchema = z.discriminatedUnion("outcome", [
   z.strictObject({
     type: z.literal("boss/start-detail-scan/response"),
     outcome: z.literal("timeout"),
+    evidence: DetailIdentityEvidenceSchema.optional(),
   }),
   z.strictObject({
     type: z.literal("boss/start-detail-scan/response"),
     outcome: z.literal("identity_failure"),
+    evidence: DetailIdentityEvidenceSchema.optional(),
   }),
   z.strictObject({
     type: z.literal("boss/start-detail-scan/response"),

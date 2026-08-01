@@ -208,23 +208,6 @@ export const detectBossPage = (
   url: string,
 ): BossPageType => {
   const pageText = normalizeText(document.body?.textContent) ?? "";
-
-  if (
-    /captcha|challenge|verify/iu.test(url) ||
-    hasAny(document, bossSelectors.page.challengeMarkers) ||
-    hasAnyText(pageText, bossSelectors.pageText.challenge)
-  ) {
-    return "challenge";
-  }
-
-  if (
-    /\/web\/user|\/login/iu.test(url) ||
-    hasAny(document, bossSelectors.page.loginMarkers) ||
-    hasAnyText(pageText, bossSelectors.pageText.login)
-  ) {
-    return "login";
-  }
-
   const hasSearchList = hasAny(
     document,
     bossSelectors.page.searchListContainers,
@@ -234,6 +217,18 @@ export const detectBossPage = (
     bossSelectors.page.companyJobListContainers,
   );
   const hasDetail = hasAny(document, bossSelectors.page.detailContainers);
+
+  if (
+    /captcha|challenge|verify/iu.test(url) ||
+    hasAny(document, bossSelectors.page.challengeMarkers) ||
+    hasAnyText(pageText, bossSelectors.pageText.challenge)
+  ) {
+    return "challenge";
+  }
+
+  if (/\/web\/user|\/login/iu.test(url)) {
+    return "login";
+  }
 
   if (/\/gongsi\/job|\/company\/.*\/jobs/iu.test(url) || hasCompanyList) {
     return "company-job-list";
@@ -249,6 +244,13 @@ export const detectBossPage = (
 
   if (hasSearchList) {
     return "search-list";
+  }
+
+  if (
+    hasAny(document, bossSelectors.page.loginMarkers) ||
+    hasAnyText(pageText, bossSelectors.pageText.login)
+  ) {
+    return "login";
   }
 
   return "unsupported";
@@ -328,6 +330,7 @@ export const parseBossDetail = (
     "href",
   );
   const pageDetailUrl = /\/job_detail\//iu.test(url) ? url : null;
+  const fieldRoot: QueryRoot = pageDetailUrl === null ? container : document;
   const detailUrl = normalizeUrl(
     link?.getAttribute("href") ?? pageDetailUrl,
     url,
@@ -335,14 +338,14 @@ export const parseBossDetail = (
   const detail: BossJobDetail = {
     sourceJobId: readSourceJobId(container, link, detailUrl),
     url: detailUrl,
-    title: readText(container, bossSelectors.detail.title),
-    company: readText(container, bossSelectors.detail.company),
-    salaryRaw: readText(container, bossSelectors.detail.salary),
-    city: readText(container, bossSelectors.detail.city),
-    experience: readText(container, bossSelectors.detail.experience),
-    education: readText(container, bossSelectors.detail.education),
-    tags: readTexts(container, bossSelectors.detail.tags),
-    description: readText(container, bossSelectors.detail.description),
+    title: readText(fieldRoot, bossSelectors.detail.title),
+    company: readText(fieldRoot, bossSelectors.detail.company),
+    salaryRaw: readText(fieldRoot, bossSelectors.detail.salary),
+    city: readText(fieldRoot, bossSelectors.detail.city),
+    experience: readText(fieldRoot, bossSelectors.detail.experience),
+    education: readText(fieldRoot, bossSelectors.detail.education),
+    tags: readTexts(fieldRoot, bossSelectors.detail.tags),
+    description: readText(fieldRoot, bossSelectors.detail.description),
     capturedAt: new Date().toISOString(),
     warnings: [],
   };
@@ -537,7 +540,6 @@ export const waitForBossDetail = async (
       if (detail === null) {
         return;
       }
-
       const identity = verifyDetailIdentity({
         expected: options.expected,
         detail,
@@ -591,7 +593,10 @@ const activateSelection = (selection: BossDetailSelection): void => {
     return;
   }
 
-  selection.element.dispatchEvent(
+  const target =
+    queryFirstWithAttribute(selection.element, bossSelectors.card.links, "href") ??
+    selection.element;
+  target.dispatchEvent(
     new view.MouseEvent("click", { bubbles: true, cancelable: true }),
   );
 };

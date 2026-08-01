@@ -4,7 +4,6 @@ import {
   detectBossPageBlock,
   parseBossDetail,
   parseVisibleBossCards,
-  scanSelectedBossDetails,
   sourceJobIdFromUrl,
   verifyDetailIdentity,
   type BossJobCard,
@@ -25,12 +24,29 @@ import {
   StartDetailScanResponseSchema,
   type JobCard,
   type JobDetail,
+  type StartDetailScanResponse,
   type VisibleJobCard,
 } from '@career-ops-cn/shared';
 import { browser } from 'wxt/browser';
 import { defineContentScript } from 'wxt/utils/define-content-script';
 
-function toJobCard(card: BossJobCard): JobCard | null {
+const JOB_CARD_FIELDS = [
+  'jobId',
+  'title',
+  'companyName',
+  'salaryText',
+  'location',
+  'experienceText',
+  'educationText',
+  'detailUrl',
+] as const;
+
+type JobCardField = (typeof JOB_CARD_FIELDS)[number];
+
+function toJobCard(card: BossJobCard): {
+  job: JobCard | null;
+  invalidFields: JobCardField[];
+} {
   const parsed = JobCardSchema.safeParse({
     jobId: card.sourceJobId,
     title: card.title,
@@ -41,23 +57,125 @@ function toJobCard(card: BossJobCard): JobCard | null {
     educationText: card.education,
     detailUrl: card.url,
   });
-  return parsed.success ? parsed.data : null;
+  if (parsed.success) {
+    return { job: parsed.data, invalidFields: [] };
+  }
+  const invalidFields = new Set<JobCardField>();
+  for (const issue of parsed.error.issues) {
+    const field = issue.path[0];
+    if (
+      typeof field === 'string' &&
+      JOB_CARD_FIELDS.includes(field as JobCardField)
+    ) {
+      invalidFields.add(field as JobCardField);
+    }
+  }
+  return { job: null, invalidFields: [...invalidFields] };
 }
 
-function toJobDetail(detail: BossJobDetail, identityVerified: boolean): JobDetail | null {
+function toJobDetail(
+  detail: BossJobDetail,
+  identityVerified: boolean,
+  fallback?: JobCard,
+): JobDetail | null {
   const parsed = JobDetailSchema.safeParse({
-    jobId: detail.sourceJobId,
-    title: detail.title,
-    companyName: detail.company,
-    salaryText: detail.salaryRaw,
-    location: detail.city,
-    experienceText: detail.experience,
-    educationText: detail.education,
-    detailUrl: detail.url,
+    jobId: detail.sourceJobId ?? fallback?.jobId,
+    title: detail.title ?? fallback?.title,
+    companyName: detail.company ?? fallback?.companyName,
+    salaryText: detail.salaryRaw ?? fallback?.salaryText,
+    location: detail.city ?? fallback?.location,
+    experienceText: detail.experience ?? fallback?.experienceText,
+    educationText: detail.education ?? fallback?.educationText,
+    detailUrl: detail.url ?? fallback?.detailUrl,
     description: detail.description,
     identityVerified,
   });
   return parsed.success ? parsed.data : null;
+}
+
+function detailEvidence(
+  detail: BossJobDetail | null,
+  identity: ReturnType<typeof verifyDetailIdentity> | null,
+) {
+  return {
+    detailFound: detail !== null,
+    ...(detail?.sourceJobId === null || detail?.sourceJobId === undefined
+      ? {}
+      : { actualJobId: detail.sourceJobId }),
+    ...(detail?.title === null || detail?.title === undefined
+      ? {}
+      : { actualTitle: detail.title }),
+    ...(identity === null ? {} : { signals: identity.signals }),
+  };
+}
+
+async function readDetailUrl(
+  card: VisibleJobCard,
+  signal: AbortSignal,
+): Promise<StartDetailScanResponse> {
+  const response = await fetch(card.job.detailUrl, {
+    method: 'GET',
+    credentials: 'include',
+    redirect: 'follow',
+    signal,
+  });
+  const responseUrl = response.url === '' ? card.job.detailUrl : response.url;
+  const html = await response.text();
+  const detailDocument = new DOMParser().parseFromString(html, 'text/html');
+  const block = detectBossPageBlock(detailDocument, responseUrl);
+  if (block !== null) {
+    return StartDetailScanResponseSchema.parse({
+      type: 'boss/start-detail-scan/response',
+      outcome: 'blocked',
+      reason: block.reason,
+    });
+  }
+  if (!response.ok) {
+    return StartDetailScanResponseSchema.parse({
+      type: 'boss/start-detail-scan/response',
+      outcome: 'failed',
+      message: `职位详情请求失败（HTTP ${response.status}）。`,
+    });
+  }
+
+  const detail = parseBossDetail(detailDocument, responseUrl);
+  if (detail === null) {
+    return StartDetailScanResponseSchema.parse({
+      type: 'boss/start-detail-scan/response',
+      outcome: 'blocked',
+      reason: 'unsupported_layout',
+    });
+  }
+  const identity = verifyDetailIdentity({
+    expected: {
+      sourceJobId: card.job.jobId,
+      url: card.job.detailUrl,
+      title: card.job.title,
+    },
+    detail,
+  });
+  if (!identity.verified) {
+    return StartDetailScanResponseSchema.parse({
+      type: 'boss/start-detail-scan/response',
+      outcome: 'identity_failure',
+      evidence: detailEvidence(detail, identity),
+    });
+  }
+
+  const job = toJobDetail(detail, true, card.job);
+  return StartDetailScanResponseSchema.parse(
+    job === null
+      ? {
+          type: 'boss/start-detail-scan/response',
+          outcome: 'failed',
+          message: '职位详情缺少 shared 契约要求的字段。',
+        }
+      : {
+          type: 'boss/start-detail-scan/response',
+          outcome: 'success',
+          job,
+        },
+  );
 }
 
 function queryByPriority(root: Document | Element, selectors: readonly string[]): Element[] {
@@ -97,14 +215,20 @@ function extractVisibleCards(): {
   cards: VisibleJobCard[];
   totalVisible: number;
   invalidCount: number;
+  invalidFieldCounts: Partial<Record<JobCardField, number>>;
 } {
   const parsedCards = parseVisibleBossCards(document, window.location.href);
   const cards: VisibleJobCard[] = [];
+  const invalidFieldCounts: Partial<Record<JobCardField, number>> = {};
 
   parsedCards.forEach((card, index) => {
-    const job = toJobCard(card);
+    const { job, invalidFields } = toJobCard(card);
     if (job !== null) {
       cards.push({ index, job });
+      return;
+    }
+    for (const field of invalidFields) {
+      invalidFieldCounts[field] = (invalidFieldCounts[field] ?? 0) + 1;
     }
   });
 
@@ -112,6 +236,7 @@ function extractVisibleCards(): {
     cards,
     totalVisible: parsedCards.length,
     invalidCount: parsedCards.length - cards.length,
+    invalidFieldCounts,
   };
 }
 
@@ -174,68 +299,7 @@ export default defineContentScript({
             });
           }
 
-          const result = await scanSelectedBossDetails({
-            document,
-            url: window.location.href,
-            selections: [
-              {
-                element,
-                expected: {
-                  sourceJobId: startRequest.data.card.job.jobId,
-                  url: startRequest.data.card.job.detailUrl,
-                  title: startRequest.data.card.job.title,
-                },
-              },
-            ],
-            timeoutMs: startRequest.data.timeoutMs,
-            signal: controller.signal,
-          });
-          const entry = result.entries[0];
-
-          if (result.block !== null) {
-            return StartDetailScanResponseSchema.parse({
-              type: 'boss/start-detail-scan/response',
-              outcome: 'blocked',
-              reason: result.block.reason,
-            });
-          }
-          if (entry?.result.status === 'verified') {
-            const job = toJobDetail(entry.result.detail, true);
-            return StartDetailScanResponseSchema.parse(
-              job === null
-                ? {
-                    type: 'boss/start-detail-scan/response',
-                    outcome: 'failed',
-                    message: '职位详情缺少 shared 契约要求的字段。',
-                  }
-                : {
-                    type: 'boss/start-detail-scan/response',
-                    outcome: 'success',
-                    job,
-                  },
-            );
-          }
-          if (entry?.result.status === 'timeout') {
-            return StartDetailScanResponseSchema.parse({
-              type: 'boss/start-detail-scan/response',
-              outcome:
-                entry.result.lastIdentity?.verified === false
-                  ? 'identity_failure'
-                  : 'timeout',
-            });
-          }
-          if (entry?.result.status === 'aborted' || controller.signal.aborted) {
-            return StartDetailScanResponseSchema.parse({
-              type: 'boss/start-detail-scan/response',
-              outcome: 'cancelled',
-            });
-          }
-
-          return StartDetailScanResponseSchema.parse({
-            type: 'boss/start-detail-scan/response',
-            outcome: 'failed',
-            message: '职位详情读取未返回有效结果。',
-          });
+          return await readDetailUrl(startRequest.data.card, controller.signal);
         } catch (error) {
           return StartDetailScanResponseSchema.parse({
             type: 'boss/start-detail-scan/response',

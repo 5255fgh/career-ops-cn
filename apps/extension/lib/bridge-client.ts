@@ -4,6 +4,9 @@ import {
   CreateJobRequestSchema,
   DecisionRequestSchema,
   DecisionResponseSchema,
+  DiagnosticEventRequestSchema,
+  DiagnosticEventSchema,
+  DiagnosticListResponseSchema,
   EvaluationResultSchema,
   HealthResponseSchema,
   JobListResponseSchema,
@@ -13,6 +16,8 @@ import {
   type CreateJobRequest,
   type DecisionRequest,
   type DecisionResponse,
+  type DiagnosticEvent,
+  type DiagnosticEventRequest,
   type EvaluationResult,
   type JobCard,
   type JobDetail,
@@ -33,6 +38,8 @@ export interface BridgeClient {
   evaluateJob(jobId: string, signal?: AbortSignal): Promise<EvaluationResult>;
   listJobs(signal?: AbortSignal): Promise<JobHistoryEntry[]>;
   saveDecision(jobId: string, decision: DecisionRequest, signal?: AbortSignal): Promise<DecisionResponse>;
+  recordDiagnostic(event: DiagnosticEventRequest, signal?: AbortSignal): Promise<DiagnosticEvent>;
+  listDiagnostics(limit?: number, signal?: AbortSignal): Promise<DiagnosticEvent[]>;
 }
 
 export interface CreateBridgeClientOptions {
@@ -125,7 +132,7 @@ async function readResponse(response: Response): Promise<unknown> {
     const bridgeError = BridgeErrorResponseSchema.safeParse(payload);
     throw new BridgeClientError(
       bridgeError.success
-        ? `Bridge 请求失败：${bridgeError.data.error}（HTTP ${response.status}）。`
+        ? `Bridge 请求失败：${bridgeError.data.message ?? bridgeError.data.error}（HTTP ${response.status}）。`
         : `Bridge 请求失败（HTTP ${response.status}）。`,
       {
         status: response.status,
@@ -270,6 +277,43 @@ export function createBridgeClient({
         DecisionResponseSchema,
         await readResponse(response),
         'Decision',
+      );
+    },
+
+    async recordDiagnostic(event, signal) {
+      const request = DiagnosticEventRequestSchema.parse(event);
+      const response = await fetchBridge(
+        fetchImpl,
+        normalizedBaseUrl,
+        settings.bridgeToken,
+        '/diagnostics',
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(request),
+        },
+        signal,
+      );
+      return parseBridgePayload(
+        DiagnosticEventSchema,
+        await readResponse(response),
+        'Diagnostic',
+      );
+    },
+
+    async listDiagnostics(limit = 100, signal) {
+      const response = await fetchBridge(
+        fetchImpl,
+        normalizedBaseUrl,
+        settings.bridgeToken,
+        `/diagnostics?limit=${encodeURIComponent(String(limit))}`,
+        { method: 'GET' },
+        signal,
+      );
+      return parseBridgePayload(
+        DiagnosticListResponseSchema,
+        await readResponse(response),
+        'Diagnostics',
       );
     },
   };

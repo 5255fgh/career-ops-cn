@@ -171,7 +171,7 @@ try {
     )
     .all()
     .map((row) => row.name);
-  assert.deepEqual(tables, ["decisions", "evaluations", "jobs"]);
+  assert.deepEqual(tables, ["decisions", "diagnostics", "evaluations", "jobs"]);
 
   const jobCount = database.prepare("SELECT count(*) AS count FROM jobs").get();
   assert.equal(jobCount?.count, 1);

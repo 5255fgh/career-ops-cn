@@ -6,6 +6,8 @@ import { DatabaseSync } from "node:sqlite";
 import {
   BridgeErrorResponseSchema,
   DecisionResponseSchema,
+  DiagnosticEventSchema,
+  DiagnosticListResponseSchema,
   EvaluationResultSchema,
   HealthResponseSchema,
   JobListResponseSchema,
@@ -119,7 +121,7 @@ afterEach(async () => {
 });
 
 describe("Bridge 健康、认证与 CORS", () => {
-  it("health 无需 token，并只创建 jobs、evaluations、decisions 三张表", async () => {
+  it("health 无需 token，并创建业务表与 diagnostics 表", async () => {
     const { database } = await createTempDatabase();
     const bridge = createBridge({ environment: TEST_ENVIRONMENT, database });
 
@@ -137,6 +139,7 @@ describe("Bridge 健康、认证与 CORS", () => {
         .all() as Array<{ name: string }>;
       expect(tables.map(({ name }) => name)).toEqual([
         "decisions",
+        "diagnostics",
         "evaluations",
         "jobs",
       ]);
@@ -358,6 +361,65 @@ describe("职位 upsert 与读取", () => {
   });
 });
 
+describe("diagnostics", () => {
+  it("Extension 可写入并按时间读取验收诊断", async () => {
+    const { database } = await createTempDatabase();
+    const bridge = createBridge({ environment: TEST_ENVIRONMENT, database });
+
+    try {
+      const created = await bridge.inject({
+        method: "POST",
+        url: "/diagnostics",
+        headers: AUTHORIZATION,
+        payload: {
+          source: "extension",
+          level: "info",
+          event: "detail_mapping",
+          scanId: "scan-1",
+          expectedJobId: "boss-a",
+          actualJobId: "boss-a",
+          outcome: "success",
+        },
+      });
+      expect(created.statusCode).toBe(200);
+      const diagnostic = DiagnosticEventSchema.parse(created.json());
+
+      const response = await bridge.inject({
+        method: "GET",
+        url: "/diagnostics?limit=20",
+        headers: AUTHORIZATION,
+      });
+      expect(response.statusCode).toBe(200);
+      expect(DiagnosticListResponseSchema.parse(response.json())).toEqual([
+        diagnostic,
+      ]);
+    } finally {
+      await bridge.close();
+    }
+  });
+
+  it("HTTP 接口拒绝伪造 Bridge 来源的诊断", async () => {
+    const { database } = await createTempDatabase();
+    const bridge = createBridge({ environment: TEST_ENVIRONMENT, database });
+
+    try {
+      const response = await bridge.inject({
+        method: "POST",
+        url: "/diagnostics",
+        headers: AUTHORIZATION,
+        payload: {
+          source: "bridge",
+          level: "info",
+          event: "forged",
+        },
+      });
+      expect(response.statusCode).toBe(400);
+    } finally {
+      await bridge.close();
+    }
+  });
+});
+
 describe("evaluate", () => {
   it("传入 JobDetail、配置与 AbortSignal，硬规则 block 强制 skip 并立即保存", async () => {
     const { database } = await createTempDatabase();
@@ -408,6 +470,63 @@ describe("evaluate", () => {
           )
           .get(job.id),
       ).toEqual({ job_id: job.id, recommendation: "skip" });
+    } finally {
+      await bridge.close();
+    }
+  });
+
+  it("provider 网关持续失败时返回诊断 ID 并保存脱敏详情", async () => {
+    const { database } = await createTempDatabase();
+    const evaluator: Evaluator = async () => {
+      throw Object.assign(new Error("provider HTTP 503"), {
+        code: "UPSTREAM_UNAVAILABLE",
+        httpStatus: 503,
+        attempts: 3,
+        diagnostic:
+          "HTTP 503 Authorization: Bearer sk-THIS_IS_A_SYNTHETIC_TEST_KEY_NOT_VALID_000000",
+      });
+    };
+    const bridge = createBridge({
+      environment: TEST_ENVIRONMENT,
+      database,
+      evaluator,
+      screenJob: PASS_SCREEN_JOB,
+    });
+
+    try {
+      const job = await postJob(bridge);
+      const response = await bridge.inject({
+        method: "POST",
+        url: `/jobs/${job.id}/evaluate`,
+        headers: AUTHORIZATION,
+      });
+      expect(response.statusCode).toBe(502);
+      const failure = BridgeErrorResponseSchema.parse(response.json());
+      expect(failure).toMatchObject({
+        error: "EVALUATION_FAILED",
+        message: expect.stringContaining("HTTP 503"),
+      });
+      expect(failure.diagnosticId).toBeDefined();
+
+      const diagnostics = DiagnosticListResponseSchema.parse(
+        (
+          await bridge.inject({
+            method: "GET",
+            url: "/diagnostics?limit=10",
+            headers: AUTHORIZATION,
+          })
+        ).json(),
+      );
+      const diagnostic = diagnostics.find(
+        (entry) => entry.id === failure.diagnosticId,
+      );
+      expect(diagnostic).toMatchObject({
+        event: "evaluation_upstream_failed",
+        details: { httpStatus: 503, attempts: 3 },
+      });
+      expect(JSON.stringify(diagnostic)).not.toContain(
+        "sk-THIS_IS_A_SYNTHETIC_TEST_KEY_NOT_VALID_000000",
+      );
     } finally {
       await bridge.close();
     }

@@ -1,4 +1,4 @@
-import { BridgeSettingsSchema, type DecisionRequest, type JobHistoryEntry, type ScanConfig } from '@career-ops-cn/shared';
+import { BridgeSettingsSchema, type DecisionRequest, type DiagnosticEvent, type JobHistoryEntry, type ScanConfig } from '@career-ops-cn/shared';
 import { type FormEvent, useCallback, useEffect, useMemo, useState } from 'react';
 import { browser } from 'wxt/browser';
 
@@ -64,6 +64,8 @@ export function App() {
   const [historyFilter, setHistoryFilter] = useState<HistoryFilter>('all');
   const [historyError, setHistoryError] = useState('');
   const [decisionMessage, setDecisionMessage] = useState('');
+  const [diagnostics, setDiagnostics] = useState<DiagnosticEvent[]>([]);
+  const [diagnosticsError, setDiagnosticsError] = useState('');
 
   const bridge = useMemo(
     () => (savedToken === '' ? null : createBridgeClient({ token: savedToken })),
@@ -105,6 +107,19 @@ export function App() {
       setHistory(await bridge.listJobs());
     } catch (error) {
       setHistoryError(messageFromError(error));
+    }
+  }, [bridge]);
+
+  const refreshDiagnostics = useCallback(async () => {
+    if (bridge === null) {
+      setDiagnostics([]);
+      return;
+    }
+    try {
+      setDiagnostics(await bridge.listDiagnostics(100));
+      setDiagnosticsError('');
+    } catch (error) {
+      setDiagnosticsError(messageFromError(error));
     }
   }, [bridge]);
 
@@ -163,11 +178,11 @@ export function App() {
           setConnectionMessage(messageFromError(error));
         }
       });
-    void refreshHistory();
+    void Promise.all([refreshHistory(), refreshDiagnostics()]);
     return () => {
       disposed = true;
     };
-  }, [bridge, refreshHistory]);
+  }, [bridge, refreshDiagnostics, refreshHistory]);
 
   useEffect(() => {
     if (
@@ -219,6 +234,24 @@ export function App() {
     await Promise.all([refreshPage(), refreshHistory()]);
   };
 
+  const startAcceptanceSmoke = async () => {
+    if (controller === null) {
+      setConnectionMessage('请先保存有效的 Bridge token。');
+      return;
+    }
+    setDecisionMessage('');
+    await controller.run({
+      acceptance: true,
+      maxDetailJobs: 3,
+      maxAiJobs: 1,
+    });
+    await Promise.all([
+      refreshPage(),
+      refreshHistory(),
+      refreshDiagnostics(),
+    ]);
+  };
+
   const cancelScan = async () => {
     await controller?.cancel();
   };
@@ -256,6 +289,8 @@ export function App() {
       historyFilter={historyFilter}
       historyError={historyError}
       decisionMessage={decisionMessage}
+      diagnostics={diagnostics}
+      diagnosticsError={diagnosticsError}
       onTokenChange={(value) => {
         setTokenDraft(value);
         setConnectionMessage('');
@@ -263,10 +298,12 @@ export function App() {
       onSaveConnection={(event) => void saveConnection(event)}
       onRefreshPage={() => void refreshPage()}
       onStartScan={() => void startScan()}
+      onStartAcceptanceSmoke={() => void startAcceptanceSmoke()}
       onCancelScan={() => void cancelScan()}
       onSelectJob={setSelectedJobId}
       onHistoryFilterChange={setHistoryFilter}
       onRefreshHistory={() => void refreshHistory()}
+      onRefreshDiagnostics={() => void refreshDiagnostics()}
       onDecision={(decision) => void saveDecision(decision)}
     />
   );

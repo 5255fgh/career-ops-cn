@@ -232,6 +232,33 @@ describe("evaluateWithCareerOps", () => {
     expect(error.exitCode).toBe(2);
   });
 
+  it("502/503/504 网关错误有限重试后可以恢复", async () => {
+    const careerOpsRoot = await createFakeCareerOpsRoot();
+    const result = await evaluateWithCareerOps(
+      jobDetail("gateway-retry-success"),
+      { careerOpsRoot },
+    );
+
+    expect(result.score).toBe(84);
+    await expect(
+      readFile(join(careerOpsRoot, "gateway-attempt.txt"), "utf8"),
+    ).resolves.toBe("3");
+  });
+
+  it("网关持续失败时保留状态、次数和脱敏诊断", async () => {
+    const careerOpsRoot = await createFakeCareerOpsRoot();
+    const error = await expectAdapterError(
+      evaluateWithCareerOps(jobDetail("gateway-always-fail"), {
+        careerOpsRoot,
+      }),
+      "UPSTREAM_UNAVAILABLE",
+    );
+
+    expect(error).toMatchObject({ httpStatus: 503, attempts: 3 });
+    expect(error.diagnostic).toContain("upstream overloaded");
+    expect(error.diagnostic).not.toMatch(/\bsk-[A-Za-z0-9_-]+\b/u);
+  });
+
   it("stdout 超限时终止子进程", async () => {
     const careerOpsRoot = await createFakeCareerOpsRoot();
     const error = await expectAdapterError(

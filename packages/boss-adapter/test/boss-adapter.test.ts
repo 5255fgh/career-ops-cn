@@ -38,6 +38,8 @@ const createDocument = (
 const fixtureUrls: Record<string, string> = {
   "search-list.html": "https://www.zhipin.com/web/geek/job?query=typescript",
   "job-detail.html": "https://www.zhipin.com/job_detail/boss-2001.html",
+  "job-detail-standalone.html":
+    "https://www.zhipin.com/job_detail/standalone-2002.html",
   "search-detail-panel.html":
     "https://www.zhipin.com/web/geek/job?query=frontend",
   "company-job-list.html": "https://www.zhipin.com/gongsi/job/example.html",
@@ -198,6 +200,24 @@ describe("详情身份校验", () => {
 
     expect(result.verified).toBe(true);
     expect(result.matchedSignals).toEqual(["job_identity", "title"]);
+    window.close();
+  });
+
+  it("独立详情页从全页读取 banner 与详情正文", () => {
+    const url = fixtureUrls["job-detail-standalone.html"]!;
+    const { window, document } = createDocument(
+      "job-detail-standalone.html",
+      url,
+    );
+
+    expect(parseBossDetail(document, url)).toMatchObject({
+      sourceJobId: "standalone-2002",
+      title: "桌面运维工程师",
+      company: "示例运维公司",
+      salaryRaw: "5-6K",
+      city: "苏州",
+      description: "负责桌面设备、操作系统与办公网络运维。",
+    });
     window.close();
   });
 
@@ -377,6 +397,9 @@ describe("等待与批量扫描", () => {
       url,
     );
     const cardB = document.getElementById("panel-card-b")!;
+    const cardBLink = cardB.querySelector("a.job-card-left")!;
+    const linkClicked = vi.fn();
+    cardBLink.addEventListener("click", linkClicked);
     cardB.addEventListener("click", () => {
       document
         .getElementById("panel-detail")!
@@ -398,6 +421,7 @@ describe("等待与批量扫描", () => {
       timeoutMs: 1_000,
     });
 
+    expect(linkClicked).toHaveBeenCalledOnce();
     expect(result.block).toBeNull();
     expect(result.entries[0]?.result.status).toBe("verified");
     expect(result.details).toHaveLength(1);

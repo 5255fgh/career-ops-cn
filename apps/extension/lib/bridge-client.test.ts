@@ -144,12 +144,27 @@ describe('Bridge client', () => {
     const screening = [{ jobId: fixtureJob.jobId, matched: true, reasons: ['通过硬规则'] }];
     const decision = { jobId: savedJob.id, decision: 'review' as const };
     const history = [{ ...savedJob, latestEvaluation: evaluation, decision }];
+    const diagnosticRequest = {
+      source: 'extension' as const,
+      level: 'info' as const,
+      event: 'detail_mapping',
+      scanId: 'scan-1',
+      expectedJobId: fixtureJob.jobId,
+      actualJobId: fixtureJob.jobId,
+    };
+    const diagnostic = {
+      ...diagnosticRequest,
+      id: 'diag-1',
+      createdAt: '2026-08-01T10:00:00.000Z',
+    };
     const fetchMock = vi
       .fn<FetchLike>()
       .mockResolvedValueOnce(jsonResponse({ status: 'ok' }))
       .mockResolvedValueOnce(jsonResponse(screening))
       .mockResolvedValueOnce(jsonResponse(history))
-      .mockResolvedValueOnce(jsonResponse(decision));
+      .mockResolvedValueOnce(jsonResponse(decision))
+      .mockResolvedValueOnce(jsonResponse(diagnostic))
+      .mockResolvedValueOnce(jsonResponse([diagnostic]));
     const client = createBridgeClient({ token: 'test-token', fetchImpl: fetchMock });
 
     await expect(client.health()).resolves.toBe(true);
@@ -158,12 +173,16 @@ describe('Bridge client', () => {
     await expect(client.saveDecision(savedJob.id, { decision: 'review' })).resolves.toEqual(
       decision,
     );
+    await expect(client.recordDiagnostic(diagnosticRequest)).resolves.toEqual(diagnostic);
+    await expect(client.listDiagnostics(20)).resolves.toEqual([diagnostic]);
 
     expect(fetchMock.mock.calls.map(([url]) => String(url))).toEqual([
       'http://127.0.0.1:3847/health',
       'http://127.0.0.1:3847/screen',
       'http://127.0.0.1:3847/jobs',
       'http://127.0.0.1:3847/jobs/job-1/decision',
+      'http://127.0.0.1:3847/diagnostics',
+      'http://127.0.0.1:3847/diagnostics?limit=20',
     ]);
   });
 

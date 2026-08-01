@@ -3,12 +3,16 @@ import { DatabaseSync } from "node:sqlite";
 
 import {
   DecisionResponseSchema,
+  DiagnosticEventRequestSchema,
+  DiagnosticEventSchema,
   EvaluationResultSchema,
   JobHistoryEntrySchema,
   JobResponseSchema,
   type CreateJobRequest,
   type DecisionRequest,
   type DecisionResponse,
+  type DiagnosticEvent,
+  type DiagnosticEventRequest,
   type EvaluationResult,
   type JobHistoryEntry,
   type JobResponse,
@@ -49,6 +53,23 @@ interface DecisionRow {
   decision: string;
   reason: string | null;
   outcome: string | null;
+}
+
+interface DiagnosticRow {
+  id: string;
+  created_at: string;
+  source: string;
+  level: string;
+  event: string;
+  scan_id: string | null;
+  job_id: string | null;
+  expected_job_id: string | null;
+  actual_job_id: string | null;
+  expected_title: string | null;
+  actual_title: string | null;
+  outcome: string | null;
+  message: string | null;
+  details_json: string | null;
 }
 
 const JOB_COLUMNS: ReadonlyArray<readonly [string, string]> = [
@@ -135,9 +156,29 @@ export function initializeDatabase(database: DatabaseSync): void {
       outcome TEXT
     ) STRICT;
 
+    CREATE TABLE IF NOT EXISTS diagnostics (
+      id TEXT PRIMARY KEY NOT NULL,
+      created_at TEXT NOT NULL,
+      source TEXT NOT NULL CHECK (source IN ('extension', 'bridge')),
+      level TEXT NOT NULL CHECK (level IN ('info', 'warning', 'error')),
+      event TEXT NOT NULL,
+      scan_id TEXT,
+      job_id TEXT,
+      expected_job_id TEXT,
+      actual_job_id TEXT,
+      expected_title TEXT,
+      actual_title TEXT,
+      outcome TEXT,
+      message TEXT,
+      details_json TEXT
+    ) STRICT;
+
     CREATE INDEX IF NOT EXISTS jobs_normalized_url_idx
       ON jobs (source, normalized_url)
       WHERE normalized_url IS NOT NULL;
+
+    CREATE INDEX IF NOT EXISTS diagnostics_created_at_idx
+      ON diagnostics (created_at DESC);
   `);
 
   const existingColumns = new Set(
@@ -458,4 +499,86 @@ export function saveDecision(
     ...(row.reason === null ? {} : { reason: row.reason }),
     ...(row.outcome === null ? {} : { outcome: row.outcome }),
   });
+}
+
+function diagnosticRowToEvent(row: DiagnosticRow): DiagnosticEvent {
+  return DiagnosticEventSchema.parse({
+    id: row.id,
+    createdAt: row.created_at,
+    source: row.source,
+    level: row.level,
+    event: row.event,
+    ...(row.scan_id === null ? {} : { scanId: row.scan_id }),
+    ...(row.job_id === null ? {} : { jobId: row.job_id }),
+    ...(row.expected_job_id === null
+      ? {}
+      : { expectedJobId: row.expected_job_id }),
+    ...(row.actual_job_id === null
+      ? {}
+      : { actualJobId: row.actual_job_id }),
+    ...(row.expected_title === null
+      ? {}
+      : { expectedTitle: row.expected_title }),
+    ...(row.actual_title === null
+      ? {}
+      : { actualTitle: row.actual_title }),
+    ...(row.outcome === null ? {} : { outcome: row.outcome }),
+    ...(row.message === null ? {} : { message: row.message }),
+    ...(row.details_json === null
+      ? {}
+      : { details: JSON.parse(row.details_json) as unknown }),
+  });
+}
+
+export function saveDiagnostic(
+  database: DatabaseSync,
+  input: DiagnosticEventRequest,
+): DiagnosticEvent {
+  const diagnostic = DiagnosticEventRequestSchema.parse(input);
+  const id = randomUUID();
+  const createdAt = new Date().toISOString();
+  const row = database
+    .prepare(
+      `
+        INSERT INTO diagnostics (
+          id, created_at, source, level, event, scan_id, job_id,
+          expected_job_id, actual_job_id, expected_title, actual_title,
+          outcome, message, details_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        RETURNING *
+      `,
+    )
+    .get(
+      id,
+      createdAt,
+      diagnostic.source,
+      diagnostic.level,
+      diagnostic.event,
+      diagnostic.scanId ?? null,
+      diagnostic.jobId ?? null,
+      diagnostic.expectedJobId ?? null,
+      diagnostic.actualJobId ?? null,
+      diagnostic.expectedTitle ?? null,
+      diagnostic.actualTitle ?? null,
+      diagnostic.outcome ?? null,
+      diagnostic.message ?? null,
+      diagnostic.details === undefined
+        ? null
+        : JSON.stringify(diagnostic.details),
+    ) as DiagnosticRow | undefined;
+
+  if (row === undefined) {
+    throw new Error("保存诊断记录后未能读取记录。");
+  }
+  return diagnosticRowToEvent(row);
+}
+
+export function listDiagnostics(
+  database: DatabaseSync,
+  limit: number,
+): DiagnosticEvent[] {
+  const rows = database
+    .prepare("SELECT * FROM diagnostics ORDER BY rowid DESC LIMIT ?")
+    .all(limit) as unknown as DiagnosticRow[];
+  return rows.map(diagnosticRowToEvent);
 }

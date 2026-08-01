@@ -7,14 +7,29 @@ export type BridgeErrorCode = BridgeErrorResponse["error"];
 
 export interface BridgeFailure extends Error {
   code: BridgeErrorCode;
+  publicMessage?: string;
+  diagnosticId?: string;
+}
+
+interface BridgeFailureOptions extends ErrorOptions {
+  publicMessage?: string;
+  diagnosticId?: string;
 }
 
 export function bridgeFailure(
   code: BridgeErrorCode,
   message: string,
-  options?: ErrorOptions,
+  options?: BridgeFailureOptions,
 ): BridgeFailure {
-  return Object.assign(new Error(message, options), { code });
+  return Object.assign(new Error(message, options), {
+    code,
+    ...(options?.publicMessage === undefined
+      ? {}
+      : { publicMessage: options.publicMessage }),
+    ...(options?.diagnosticId === undefined
+      ? {}
+      : { diagnosticId: options.diagnosticId }),
+  });
 }
 
 export function isBridgeFailure(error: unknown): error is BridgeFailure {

@@ -51,7 +51,12 @@ export const bossSelectors = {
       "[data-role='company-name']",
     ],
     salary: [".salary", ".job-salary", "[data-role='salary']"],
-    city: [".job-area", ".job-city", "[data-role='city']"],
+    city: [
+      ".job-area",
+      ".job-city",
+      ".company-location",
+      "[data-role='city']",
+    ],
     experience: [
       ".job-experience",
       ".job-info .tag-list li:nth-child(1)",
@@ -75,8 +80,10 @@ export const bossSelectors = {
       "a[data-role='detail-url']",
     ],
     title: [
+      ".job-banner .name h1",
       ".job-banner .name",
       ".job-detail-header .job-name",
+      ".job-detail-header .job-title",
       "[data-role='job-title']",
     ],
     company: [
@@ -91,6 +98,7 @@ export const bossSelectors = {
     ],
     city: [
       ".job-banner .job-area",
+      ".job-banner .text-city",
       ".job-detail-header .job-area",
       "[data-role='city']",
     ],

@@ -97,21 +97,37 @@ function props(overrides: Partial<SidePanelViewProps> = {}): SidePanelViewProps 
     historyFilter: 'all',
     historyError: '',
     decisionMessage: '已记录 apply。',
+    diagnostics: [
+      {
+        id: 'diag-1',
+        createdAt: '2026-08-01T10:00:00.000Z',
+        source: 'extension',
+        level: 'info',
+        event: 'detail_mapping',
+        scanId: 'scan-1',
+        expectedJobId: 'boss-1',
+        actualJobId: 'boss-1',
+        outcome: 'success',
+      },
+    ],
+    diagnosticsError: '',
     onTokenChange: () => undefined,
     onSaveConnection: () => undefined,
     onRefreshPage: () => undefined,
     onStartScan: () => undefined,
+    onStartAcceptanceSmoke: () => undefined,
     onCancelScan: () => undefined,
     onSelectJob: () => undefined,
     onHistoryFilterChange: () => undefined,
     onRefreshHistory: () => undefined,
+    onRefreshDiagnostics: () => undefined,
     onDecision: () => undefined,
     ...overrides,
   };
 }
 
 describe('SidePanelView', () => {
-  it('只渲染八个指定区块，并显示关键结果字段', () => {
+  it('渲染验收诊断区块，并显示关键结果字段', () => {
     const html = renderToStaticMarkup(<SidePanelView {...props()} />);
 
     for (const heading of [
@@ -123,10 +139,11 @@ describe('SidePanelView', () => {
       '单个职位详情',
       '历史职位',
       '用户判断',
+      '验收诊断',
     ]) {
       expect(html).toContain(heading);
     }
-    expect(html.match(/<section/g)).toHaveLength(8);
+    expect(html.match(/<section/g)).toHaveLength(9);
     expect(html).toContain('12');
     expect(html).toContain('2/2');
     expect(html).toContain('1/1');
@@ -136,6 +153,8 @@ describe('SidePanelView', () => {
     expect(html).toContain('Builder');
     expect(html).toContain('high');
     expect(html).toContain('这是未经改写的 career-ops rawReport。');
+    expect(html).toContain('detail_mapping');
+    expect(html).toContain('boss-1');
     expect(html).not.toContain('strengths');
     expect(html).not.toContain('gaps');
   });

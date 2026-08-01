@@ -93,6 +93,12 @@ function bridgeMock(): BridgeClient {
     })),
     listJobs: vi.fn(async () => []),
     saveDecision: vi.fn(async (jobId, decision) => ({ jobId, ...decision })),
+    recordDiagnostic: vi.fn(async (event) => ({
+      ...event,
+      id: `diag-${Math.random()}`,
+      createdAt: '2026-08-01T10:00:00.000Z',
+    })),
+    listDiagnostics: vi.fn(async () => []),
   };
 }
 
@@ -202,6 +208,35 @@ describe('ScanController', () => {
     expect(sawImmediateEvaluation).toBe(true);
   });
 
+  it('验收模式只映射 3 个职位、评估 1 个并写入诊断', async () => {
+    const cards = [0, 1, 2, 3].map(visibleCard);
+    const content = contentMock(cards);
+    const bridge = bridgeMock();
+
+    const state = await controller(content, bridge).run({
+      acceptance: true,
+      maxDetailJobs: 3,
+      maxAiJobs: 1,
+    });
+
+    expect(state.status).toBe('completed');
+    expect(content.startDetailScan).toHaveBeenCalledTimes(3);
+    expect(bridge.saveJob).toHaveBeenCalledTimes(3);
+    expect(bridge.evaluateJob).toHaveBeenCalledOnce();
+    const diagnostics = vi.mocked(bridge.recordDiagnostic).mock.calls.map(
+      ([event]) => event,
+    );
+    expect(
+      diagnostics.filter((event) => event.event === 'detail_mapping'),
+    ).toHaveLength(3);
+    expect(diagnostics).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ event: 'evaluation_received' }),
+        expect.objectContaining({ event: 'acceptance_smoke_completed' }),
+      ]),
+    );
+  });
+
   it('单个详情普通失败会记录并继续下一个职位', async () => {
     const cards = [visibleCard(0), visibleCard(1)];
     const content = contentMock(cards);
@@ -264,6 +299,34 @@ describe('ScanController', () => {
     expect(bridge.screenJobs).not.toHaveBeenCalled();
   });
 
+  it.each([
+    ['login', 'login_required'],
+    ['challenge', 'challenge'],
+    ['unsupported', 'unsupported_layout'],
+  ] as const)('%s 页面在验收模式中记录阻断且不继续执行', async (pageType, reason) => {
+    const content = contentMock([visibleCard(0)]);
+    vi.mocked(content.detectPage).mockResolvedValue({
+      type: 'boss/detect-page/response',
+      pageType,
+      block: { reason, pageType },
+    });
+    const bridge = bridgeMock();
+
+    const state = await controller(content, bridge).run({
+      acceptance: true,
+      maxDetailJobs: 3,
+      maxAiJobs: 1,
+    });
+
+    expect(state.status).toBe('failed');
+    expect(state.stopReason).toBe(reason);
+    expect(content.extractVisibleCards).not.toHaveBeenCalled();
+    expect(bridge.screenJobs).not.toHaveBeenCalled();
+    expect(bridge.recordDiagnostic).toHaveBeenCalledWith(
+      expect.objectContaining({ event: 'scan_stopped', outcome: reason }),
+    );
+  });
+
   it('用户取消会通知 Content Script，并保留此前已完成的职位', async () => {
     const cards = [visibleCard(0), visibleCard(1)];
     const content = contentMock(cards);
@@ -289,7 +352,11 @@ describe('ScanController', () => {
     });
     const bridge = bridgeMock();
     const scan = controller(content, bridge);
-    const running = scan.run();
+    const running = scan.run({
+      acceptance: true,
+      maxDetailJobs: 3,
+      maxAiJobs: 1,
+    });
     await vi.waitFor(() => expect(content.startDetailScan).toHaveBeenCalledTimes(2));
 
     await scan.cancel();
@@ -299,5 +366,11 @@ describe('ScanController', () => {
     expect(content.cancelDetailScan).toHaveBeenCalledOnce();
     expect(state.results[0]?.savedJob).toBeDefined();
     expect(state.results[1]?.savedJob).toBeUndefined();
+    expect(bridge.recordDiagnostic).toHaveBeenCalledWith(
+      expect.objectContaining({ event: 'cancel_requested' }),
+    );
+    expect(bridge.recordDiagnostic).toHaveBeenCalledWith(
+      expect.objectContaining({ event: 'scan_cancelled' }),
+    );
   });
 });

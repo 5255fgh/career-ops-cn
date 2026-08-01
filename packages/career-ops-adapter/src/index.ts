@@ -17,6 +17,8 @@ const TERMINATION_GRACE_MS = 250;
 const SUMMARY_START = "---SCORE_SUMMARY---";
 const SUMMARY_END = "---END_SUMMARY---";
 const ERROR_EXCERPT_LENGTH = 500;
+const MAX_DIAGNOSTIC_LENGTH = 16 * 1024;
+const GATEWAY_RETRY_DELAYS_MS = [250, 1_000] as const;
 
 const AbortSignalSchema = z.custom<AbortSignal>(
   (value) =>
@@ -70,6 +72,7 @@ export type CareerOpsAdapterErrorCode =
   | "SCRIPT_NOT_FOUND"
   | "PROCESS_START_FAILED"
   | "AUTHENTICATION_ERROR"
+  | "UPSTREAM_UNAVAILABLE"
   | "NON_ZERO_EXIT"
   | "OUTPUT_LIMIT_EXCEEDED"
   | "TIMEOUT"
@@ -127,6 +130,9 @@ interface CareerOpsAdapterErrorOptions {
   exitCode?: number | null;
   signal?: NodeJS.Signals | null;
   stream?: "stdout" | "stderr" | null;
+  httpStatus?: number | null;
+  attempts?: number;
+  diagnostic?: string | null;
 }
 
 export class CareerOpsAdapterError extends Error {
@@ -134,6 +140,9 @@ export class CareerOpsAdapterError extends Error {
   readonly exitCode: number | null;
   readonly signal: NodeJS.Signals | null;
   readonly stream: "stdout" | "stderr" | null;
+  readonly httpStatus: number | null;
+  readonly attempts: number;
+  readonly diagnostic: string | null;
 
   constructor(
     code: CareerOpsAdapterErrorCode,
@@ -149,6 +158,9 @@ export class CareerOpsAdapterError extends Error {
     this.exitCode = options.exitCode ?? null;
     this.signal = options.signal ?? null;
     this.stream = options.stream ?? null;
+    this.httpStatus = options.httpStatus ?? null;
+    this.attempts = options.attempts ?? 1;
+    this.diagnostic = options.diagnostic ?? null;
   }
 }
 
@@ -178,6 +190,22 @@ function errorExcerpt(stderr: string): string {
   return redactSensitiveText(stripAnsi(stderr))
     .trim()
     .slice(0, ERROR_EXCERPT_LENGTH);
+}
+
+function diagnosticText(stderr: string): string {
+  return redactSensitiveText(stripAnsi(stderr))
+    .trim()
+    .slice(0, MAX_DIAGNOSTIC_LENGTH);
+}
+
+function gatewayStatus(stderr: string): 502 | 503 | 504 | null {
+  const match = stripAnsi(stderr).match(
+    /(?:API error:\s*)?HTTP\s+(502|503|504)\b/iu,
+  );
+  if (match?.[1] === "502") return 502;
+  if (match?.[1] === "503") return 503;
+  if (match?.[1] === "504") return 504;
+  return null;
 }
 
 function isAuthenticationError(stderr: string): boolean {
@@ -351,6 +379,23 @@ export function runProcess(options: RunProcessOptions): Promise<RunProcessResult
           return;
         }
 
+        const upstreamStatus = gatewayStatus(stderr);
+        if (upstreamStatus !== null) {
+          rejectPromise(
+            new CareerOpsAdapterError(
+              "UPSTREAM_UNAVAILABLE",
+              `career-ops provider 返回 HTTP ${upstreamStatus}。`,
+              {
+                exitCode,
+                signal: exitSignal,
+                httpStatus: upstreamStatus,
+                diagnostic: diagnosticText(stderr),
+              },
+            ),
+          );
+          return;
+        }
+
         const excerpt = errorExcerpt(stderr);
         const suffix = excerpt.length === 0 ? "" : `：${excerpt}`;
         rejectPromise(
@@ -365,6 +410,31 @@ export function runProcess(options: RunProcessOptions): Promise<RunProcessResult
 
       resolvePromise({ stdout, stderr, exitCode: 0, signal: null });
     });
+  });
+}
+
+async function waitForRetry(
+  milliseconds: number,
+  signal: AbortSignal | undefined,
+): Promise<void> {
+  if (signal?.aborted === true) {
+    throw new CareerOpsAdapterError("CANCELLED", "career-ops 执行已取消。");
+  }
+  await new Promise<void>((resolvePromise, rejectPromise) => {
+    const cleanup = (): void =>
+      signal?.removeEventListener("abort", onAbort);
+    const timer = setTimeout(() => {
+      cleanup();
+      resolvePromise();
+    }, milliseconds);
+    const onAbort = (): void => {
+      clearTimeout(timer);
+      cleanup();
+      rejectPromise(
+        new CareerOpsAdapterError("CANCELLED", "career-ops 执行已取消。"),
+      );
+    };
+    signal?.addEventListener("abort", onAbort, { once: true });
   });
 }
 
@@ -487,16 +557,62 @@ export async function evaluateWithCareerOps(
       { encoding: "utf8", mode: 0o600 },
     );
 
-    const result = await runProcess({
-      command: process.execPath,
-      args: [scriptPath, "--file", jobDetailPath, "--no-save"],
-      cwd: careerOpsRoot,
-      timeoutMs: parsedOptions.data.timeoutMs,
-      maxOutputBytes: parsedOptions.data.maxOutputBytes,
-      ...(parsedOptions.data.signal === undefined
-        ? {}
-        : { signal: parsedOptions.data.signal }),
-    });
+    let result: RunProcessResult | undefined;
+    const gatewayDiagnostics: string[] = [];
+    for (
+      let attempt = 1;
+      attempt <= GATEWAY_RETRY_DELAYS_MS.length + 1;
+      attempt += 1
+    ) {
+      try {
+        result = await runProcess({
+          command: process.execPath,
+          args: [scriptPath, "--file", jobDetailPath, "--no-save"],
+          cwd: careerOpsRoot,
+          timeoutMs: parsedOptions.data.timeoutMs,
+          maxOutputBytes: parsedOptions.data.maxOutputBytes,
+          ...(parsedOptions.data.signal === undefined
+            ? {}
+            : { signal: parsedOptions.data.signal }),
+        });
+        break;
+      } catch (error) {
+        if (
+          !(error instanceof CareerOpsAdapterError) ||
+          error.code !== "UPSTREAM_UNAVAILABLE"
+        ) {
+          throw error;
+        }
+        gatewayDiagnostics.push(
+          `attempt ${attempt}: ${error.diagnostic ?? error.message}`,
+        );
+        const retryDelay = GATEWAY_RETRY_DELAYS_MS[attempt - 1];
+        if (retryDelay === undefined) {
+          throw new CareerOpsAdapterError(
+            "UPSTREAM_UNAVAILABLE",
+            `career-ops provider HTTP ${error.httpStatus ?? "unknown"}，${attempt} 次尝试均失败。`,
+            {
+              cause: error,
+              exitCode: error.exitCode,
+              signal: error.signal,
+              httpStatus: error.httpStatus,
+              attempts: attempt,
+              diagnostic: gatewayDiagnostics
+                .join("\n\n")
+                .slice(0, MAX_DIAGNOSTIC_LENGTH),
+            },
+          );
+        }
+        await waitForRetry(retryDelay, parsedOptions.data.signal);
+      }
+    }
+    if (result === undefined) {
+      throw new CareerOpsAdapterError(
+        "UPSTREAM_UNAVAILABLE",
+        "career-ops provider 重试未返回结果。",
+        { attempts: GATEWAY_RETRY_DELAYS_MS.length + 1 },
+      );
+    }
     const parsedOutput = parseCareerOpsOutput(result.stdout);
     const evaluation = EvaluationResultSchema.parse({
       score: Math.round(parsedOutput.score * 20),

@@ -16,6 +16,7 @@
 - 用 SQLite 保存职位、评估原文和用户主动记录的判断，Bridge 重启后仍可读取。
 - 展示 `career-ops` score、recommendation、结构化摘要字段和完整 raw report。
 - 支持用户取消当前扫描，并在登录失效、challenge、账号风险或不支持布局时停止。
+- “验收 3 职位”由已加载的 Extension 主动执行，过程、职位/JD 映射、取消和错误会写入 Bridge 的 SQLite diagnostics，并可在 Side Panel 查看。
 
 ## 非目标
 
@@ -56,6 +57,8 @@ CAREER_OPS_CN_CAREER_OPS_ROOT=D:\Projects\career-ops
 ## career-ops 配置
 
 `CAREER_OPS_CN_CAREER_OPS_ROOT` 必须指向包含 `openai-eval.mjs` 的 `career-ops` 根目录。Bridge 不修改该仓库，也不会向其 `reports` 目录写报告；适配器固定传入 `--no-save`。
+
+首次使用该本机 `career-ops` 副本时，需在其根目录安装 package.json 已声明的运行依赖；无需执行浏览器安装脚本时可使用 `npm install --ignore-scripts`。
 
 真实模型评估需要在启动 Bridge 的环境中提供 `OPENAI_API_KEY`。`OPENAI_BASE_URL`、`OPENAI_MODEL` 和其他 provider 配置沿用 `career-ops` 自身约定。模型密钥只留在本机 Bridge/career-ops 进程环境中，不要输入扩展，也不会进入 Extension bundle。
 
@@ -99,6 +102,7 @@ pnpm build
 4. 打开 Career Ops CN Side Panel，输入与 Bridge 一致的 token，点击“保存并检查”。
 5. 点击“刷新”确认页面类型和阻断状态。
 6. 点击“开始扫描”。单职位详情页会校验并评估当前职位；搜索页只处理当前可见列表，不会翻页。
+   真实验收时点击“验收 3 职位”：搜索页由 Extension 对当前可见卡片的 BOSS 详情 URL 做同源只读读取，最多解析 3 个匹配详情并只评估 1 个职位，不刷新、新开或关闭页面；单职位详情页执行 1 个职位完整闭环。验收过程中可点击“取消”。
 7. 在结果列表查看硬规则原因、score、recommendation 和 raw report。需要时可由用户主动记录 Apply、Review 或 Skip 判断。
 8. 随时点击“取消”停止当前扫描。
 
@@ -106,7 +110,7 @@ pnpm build
 
 - SQLite 默认路径：`apps/bridge/career-ops-cn.sqlite`
 - 可用 `CAREER_OPS_CN_DATABASE_PATH` 指定其他本机路径
-- 表：`jobs`、`evaluations`、`decisions`
+- 表：`jobs`、`evaluations`、`decisions`、`diagnostics`
 - Bridge token：扩展的 `chrome.storage.local`
 - 扫描配置：扩展的 `chrome.storage.local`
 - 传给 `career-ops` 的临时 JobDetail：系统临时目录，子进程结束后删除
@@ -119,6 +123,7 @@ SQLite 中会保存职位描述和完整 raw report。不要把真实数据库�
 - **Token 无效**：确保 Side Panel 中保存的 token 与 `CAREER_OPS_CN_TOKEN` 完全一致。
 - **career-ops 路径错误**：确认根目录存在且包含 `openai-eval.mjs`；该错误会返回 `CAREER_OPS_NOT_FOUND`。
 - **真实 evaluator 无法认证**：在启动 Bridge 的同一环境提供有效 `OPENAI_API_KEY`，然后重启 Bridge。不要把 Key 填入扩展。
+- **provider HTTP 502/503/504**：适配器会进行 2 次有限重试（共 3 次尝试）。持续失败不会生成伪造 score/raw report；脱敏后的状态、尝试次数和响应摘要会写入 diagnostics，并在 Bridge 错误中返回诊断 ID。
 - **evaluator timeout**：检查 provider 连通性，并按需要调整 `CAREER_OPS_CN_EVALUATION_TIMEOUT_MS`。
 - **用户取消**：Side Panel 显示“已取消”是预期结果，当前子进程会收到取消信号。
 - **登录失效**：在 BOSS 页面重新登录，刷新页面后再次检测。

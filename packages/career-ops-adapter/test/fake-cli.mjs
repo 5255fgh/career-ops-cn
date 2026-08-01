@@ -62,6 +62,26 @@ if (
       await writeFixture("non-zero-exit.stderr.txt", process.stderr);
       process.exitCode = 2;
       break;
+    case "gateway-retry-success": {
+      const attemptPath = join(process.cwd(), "gateway-attempt.txt");
+      let attempt = 0;
+      try {
+        attempt = Number.parseInt(await readFile(attemptPath, "utf8"), 10);
+      } catch {}
+      attempt += 1;
+      await writeFile(attemptPath, String(attempt), "utf8");
+      if (attempt < 3) {
+        await writeFixture("gateway-error.stderr.txt", process.stderr);
+        process.exitCode = 1;
+      } else {
+        await writeFixture("normal-zh.txt");
+      }
+      break;
+    }
+    case "gateway-always-fail":
+      await writeFixture("gateway-error.stderr.txt", process.stderr);
+      process.exitCode = 1;
+      break;
     case "stdout-over-limit":
       await writeFixture("stdout-over-limit.txt");
       break;
