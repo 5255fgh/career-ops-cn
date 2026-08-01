@@ -68,7 +68,10 @@ let bridge;
 
 try {
   bridge = await startBridge({
-    environment: { CAREER_OPS_CN_TOKEN: "smoke-token", CAREER_OPS_CN_CAREER_OPS_ROOT: repositoryRoot },
+    environment: {
+      CAREER_OPS_CN_TOKEN: "smoke-token",
+      CAREER_OPS_CN_CAREER_OPS_ROOT: repositoryRoot,
+    },
     database,
     evaluator: async () =>
       shared.EvaluationResultSchema.parse(
@@ -168,7 +171,7 @@ try {
     )
     .all()
     .map((row) => row.name);
-  assert.deepEqual(tables, ["evaluations", "jobs"]);
+  assert.deepEqual(tables, ["decisions", "evaluations", "jobs"]);
 
   const jobCount = database.prepare("SELECT count(*) AS count FROM jobs").get();
   assert.equal(jobCount?.count, 1);
