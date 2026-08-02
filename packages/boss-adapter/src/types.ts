@@ -23,6 +23,7 @@ export interface BossJobIdentity {
   sourceJobId: string | null;
   url: string | null;
   title: string | null;
+  company?: string | null;
 }
 
 export interface BossJobCard extends BossJobIdentity {
@@ -43,12 +44,14 @@ export interface BossJobDetail extends BossJobCard {
 export type BossIdentitySignal =
   | "job_identity"
   | "title"
+  | "company"
   | "active_card"
   | "content_changed";
 
 export interface BossIdentitySignals {
   jobIdentity: boolean | null;
   title: boolean | null;
+  company: boolean | null;
   activeCard: boolean | null;
   contentChanged: boolean | null;
 }

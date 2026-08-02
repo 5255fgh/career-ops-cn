@@ -37,7 +37,6 @@ export interface SidePanelViewProps {
   onSaveConnection: FormEventHandler<HTMLFormElement>;
   onRefreshPage(): void;
   onStartScan(): void;
-  onStartAcceptanceSmoke(): void;
   onCancelScan(): void;
   onSelectJob(jobId: string): void;
   onHistoryFilterChange(filter: HistoryFilter): void;
@@ -110,7 +109,7 @@ export function SidePanelView(props: SidePanelViewProps) {
       <header className="panel-header">
         <p className="eyebrow">Career Ops CN</p>
         <h1>BOSS 只读职位扫描</h1>
-        <p>仅分析当前可见职位，不翻页、不投递、不联系招聘方。</p>
+        <p>一次点击最多连续处理 3 页；不投递、不联系招聘方。</p>
       </header>
 
       <section className="panel-section" aria-labelledby="connection-heading">
@@ -201,14 +200,6 @@ export function SidePanelView(props: SidePanelViewProps) {
             开始扫描
           </button>
           <button
-            className="button button-secondary"
-            type="button"
-            disabled={isScanning || props.connectionState !== 'online'}
-            onClick={props.onStartAcceptanceSmoke}
-          >
-            验收 3 职位
-          </button>
-          <button
             className="button button-danger"
             type="button"
             disabled={!isScanning}
@@ -223,6 +214,11 @@ export function SidePanelView(props: SidePanelViewProps) {
         {props.scanState.stopReason === null ? null : (
           <p className="stop-reason">停止原因：{props.scanState.stopReason}</p>
         )}
+        {props.scanState.warnings.map((warning) => (
+          <p className="inline-message" role="status" key={warning}>
+            警告：{warning}
+          </p>
+        ))}
       </section>
 
       <section className="panel-section" aria-labelledby="progress-heading">
@@ -234,8 +230,16 @@ export function SidePanelView(props: SidePanelViewProps) {
         </div>
         <dl className="metric-grid progress-grid">
           <div>
-            <dt>当前页职位数</dt>
+            <dt>已处理页数</dt>
+            <dd>{props.scanState.progress.pagesVisited}</dd>
+          </div>
+          <div>
+            <dt>累计可见职位</dt>
             <dd>{props.scanState.progress.listJobs}</dd>
+          </div>
+          <div>
+            <dt>本轮新职位</dt>
+            <dd>{props.scanState.progress.newJobs}</dd>
           </div>
           <div>
             <dt>已筛选数量</dt>
@@ -290,9 +294,11 @@ export function SidePanelView(props: SidePanelViewProps) {
                       )}
                     </span>
                   </button>
-                  {result.screening === undefined ? null : (
+                  {(result.screening ?? result.preScreening) === undefined ? null : (
                     <p className="rule-copy">
-                      硬规则原因：{result.screening.reasons.join('；')}
+                      {(result.screening ?? result.preScreening)?.reasons.length === 0
+                        ? '硬规则：未发现阻断或警告'
+                        : `硬规则原因：${(result.screening ?? result.preScreening)?.reasons.join('；')}`}
                     </p>
                   )}
                   {error === null ? null : <p className="row-error">{error}</p>}
@@ -317,8 +323,8 @@ export function SidePanelView(props: SidePanelViewProps) {
             <h3>{selectedResult.card.job.title}</h3>
             <p className="job-company">{selectedResult.card.job.companyName}</p>
             <dl className="detail-grid">
-              <div><dt>薪资</dt><dd>{selectedResult.card.job.salaryText}</dd></div>
-              <div><dt>地点</dt><dd>{selectedResult.card.job.location}</dd></div>
+              <div><dt>薪资</dt><dd>{selectedResult.detail?.salaryText ?? selectedResult.card.job.salaryText ?? '—'}</dd></div>
+              <div><dt>地点</dt><dd>{selectedResult.detail?.location ?? selectedResult.card.job.location ?? '—'}</dd></div>
               <div><dt>career-ops score</dt><dd>{selectedResult.evaluation?.score ?? '—'}</dd></div>
               <div><dt>archetype</dt><dd>{selectedResult.evaluation?.archetype ?? '—'}</dd></div>
               <div><dt>legitimacy</dt><dd>{selectedResult.evaluation?.legitimacy ?? '—'}</dd></div>
@@ -415,7 +421,7 @@ export function SidePanelView(props: SidePanelViewProps) {
         <div className="section-heading">
           <div>
             <span className="section-index">09</span>
-            <h2 id="diagnostics-heading">验收诊断</h2>
+            <h2 id="diagnostics-heading">扫描诊断</h2>
           </div>
           <button className="text-button" type="button" onClick={props.onRefreshDiagnostics}>
             刷新
@@ -425,7 +431,7 @@ export function SidePanelView(props: SidePanelViewProps) {
           <p className="error-message" role="alert">{props.diagnosticsError}</p>
         )}
         {props.diagnostics.length === 0 ? (
-          <p className="empty-copy">尚无验收诊断记录。</p>
+          <p className="empty-copy">尚无扫描诊断记录。</p>
         ) : (
           <ul className="history-list diagnostic-list">
             {props.diagnostics.slice(0, 30).map((event) => (

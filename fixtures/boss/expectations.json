@@ -1,5 +1,6 @@
 {
   "search-list.html": { "pageType": "search-list", "block": null },
+  "list-minimal-card.html": { "pageType": "search-list", "block": null },
   "job-detail.html": { "pageType": "job-detail", "block": null },
   "job-detail-standalone.html": { "pageType": "job-detail", "block": null },
   "search-detail-panel.html": { "pageType": "search-detail-panel", "block": null },

@@ -72,6 +72,7 @@ const ERROR_STATUS: Record<BridgeErrorCode, number> = {
   JOB_NOT_FOUND: 404,
   INVALID_JOB_DETAIL: 422,
   DETAIL_IDENTITY_UNVERIFIED: 422,
+  HARD_RULE_BLOCKED: 422,
   EVALUATION_FAILED: 502,
   EVALUATION_TIMEOUT: 504,
   CANCELLED: 499,
@@ -195,7 +196,9 @@ async function evaluateJob(
   screenJob: ScreenJob,
   config: BridgeConfig,
   job: NonNullable<ReturnType<typeof findJob>>,
-  recordDiagnostic: (input: DiagnosticEventRequest) => DiagnosticEvent,
+  recordDiagnostic: (
+    input: DiagnosticEventRequest,
+  ) => DiagnosticEvent | undefined,
 ) {
   const detail = buildJobDetail(job);
   if (detail === undefined) {
@@ -215,8 +218,24 @@ async function evaluateJob(
   const screening = await screenJob(
     toScreenableJob(detail),
     toScreeningPreferences(config.preferences),
+    "detail",
   );
   const hardRuleBlocked = screening.decision === "block";
+  if (hardRuleBlocked) {
+    const reasons = screening.rules
+      .filter(({ decision }) => decision === "block")
+      .map(({ reason }) => reason);
+    throw bridgeFailure(
+      "HARD_RULE_BLOCKED",
+      "职位未通过完整硬规则筛选。",
+      {
+        publicMessage:
+          reasons.length === 0
+            ? "职位未通过完整硬规则筛选。"
+            : `职位未通过完整硬规则筛选：${reasons.join("；")}`,
+      },
+    );
+  }
 
   const controller = new AbortController();
   const cancel = () => {
@@ -260,7 +279,7 @@ async function evaluateJob(
     });
     const evaluation = EvaluationResultSchema.safeParse({
       ...output,
-      recommendation: hardRuleBlocked ? "skip" : output.recommendation,
+      recommendation: output.recommendation,
     });
 
     if (!evaluation.success) {
@@ -319,8 +338,13 @@ async function evaluateJob(
         `career-ops provider ${statusLabel}，${attempts} 次尝试均失败。`,
         {
           cause: error,
-          publicMessage: `provider ${statusLabel}，已尝试 ${attempts} 次；诊断 ${savedDiagnostic.id}。`,
-          diagnosticId: savedDiagnostic.id,
+          publicMessage:
+            savedDiagnostic === undefined
+              ? `provider ${statusLabel}，已尝试 ${attempts} 次。`
+              : `provider ${statusLabel}，已尝试 ${attempts} 次；诊断 ${savedDiagnostic.id}。`,
+          ...(savedDiagnostic === undefined
+            ? {}
+            : { diagnosticId: savedDiagnostic.id }),
         },
       );
     }
@@ -415,6 +439,15 @@ function buildBridge(
     input: DiagnosticEventRequest,
   ): DiagnosticEvent =>
     runDatabaseOperation(() => saveDiagnostic(database, input));
+  const recordDiagnosticBestEffort = (
+    input: DiagnosticEventRequest,
+  ): DiagnosticEvent | undefined => {
+    try {
+      return recordDiagnostic(input);
+    } catch {
+      return undefined;
+    }
+  };
 
   bridge.setErrorHandler((error, _request, reply) => {
     if (isBridgeFailure(error)) {
@@ -473,7 +506,11 @@ function buildBridge(
         body.data.jobs.map(async (job) =>
           toScreeningResult(
             job.jobId,
-            await screenJob(toScreenableJob(job), screeningPreferences),
+            await screenJob(
+              toScreenableJob(job),
+              screeningPreferences,
+              body.data.phase,
+            ),
           ),
         ),
       );
@@ -615,7 +652,7 @@ function buildBridge(
         screenJob,
         config,
         job,
-        recordDiagnostic,
+        recordDiagnosticBestEffort,
       );
       runDatabaseOperation(() =>
         saveEvaluation(database, params.data.id, evaluation),

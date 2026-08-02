@@ -33,7 +33,9 @@ const extensionStorage: ExtensionStorageArea = {
 const IDLE_SCAN_STATE: ScanState = {
   status: 'idle',
   progress: {
+    pagesVisited: 0,
     listJobs: 0,
+    newJobs: 0,
     screenedJobs: 0,
     detailCompleted: 0,
     detailTarget: 0,
@@ -43,6 +45,7 @@ const IDLE_SCAN_STATE: ScanState = {
   results: [],
   stopReason: null,
   error: null,
+  warnings: [],
 };
 
 function messageFromError(error: unknown): string {
@@ -231,20 +234,6 @@ export function App() {
     }
     setDecisionMessage('');
     await controller.run();
-    await Promise.all([refreshPage(), refreshHistory()]);
-  };
-
-  const startAcceptanceSmoke = async () => {
-    if (controller === null) {
-      setConnectionMessage('请先保存有效的 Bridge token。');
-      return;
-    }
-    setDecisionMessage('');
-    await controller.run({
-      acceptance: true,
-      maxDetailJobs: 3,
-      maxAiJobs: 1,
-    });
     await Promise.all([
       refreshPage(),
       refreshHistory(),
@@ -298,7 +287,6 @@ export function App() {
       onSaveConnection={(event) => void saveConnection(event)}
       onRefreshPage={() => void refreshPage()}
       onStartScan={() => void startScan()}
-      onStartAcceptanceSmoke={() => void startAcceptanceSmoke()}
       onCancelScan={() => void cancelScan()}
       onSelectJob={setSelectedJobId}
       onHistoryFilterChange={setHistoryFilter}

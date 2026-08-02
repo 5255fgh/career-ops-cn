@@ -24,6 +24,7 @@ import {
   type JobHistoryEntry,
   type JobResponse,
   type Preferences,
+  type ScreeningPhase,
   type ScreeningResult,
 } from '@career-ops-cn/shared';
 
@@ -33,7 +34,12 @@ export type FetchLike = (input: string | URL, init?: RequestInit) => Promise<Res
 
 export interface BridgeClient {
   health(signal?: AbortSignal): Promise<boolean>;
-  screenJobs(jobs: readonly JobCard[], preferences?: Preferences, signal?: AbortSignal): Promise<ScreeningResult[]>;
+  screenJobs(
+    jobs: readonly (JobCard | JobDetail)[],
+    preferences?: Preferences,
+    signal?: AbortSignal,
+    phase?: ScreeningPhase,
+  ): Promise<ScreeningResult[]>;
   saveJob(job: JobDetail, signal?: AbortSignal): Promise<JobResponse>;
   evaluateJob(jobId: string, signal?: AbortSignal): Promise<EvaluationResult>;
   listJobs(signal?: AbortSignal): Promise<JobHistoryEntry[]>;
@@ -185,10 +191,11 @@ export function createBridgeClient({
       ).status === 'ok';
     },
 
-    async screenJobs(jobs, preferences, signal) {
+    async screenJobs(jobs, preferences, signal, phase = 'list') {
       const request = ScreenRequestSchema.parse({
         jobs: [...jobs],
         ...(preferences === undefined ? {} : { preferences }),
+        phase,
       });
       const response = await fetchBridge(
         fetchImpl,

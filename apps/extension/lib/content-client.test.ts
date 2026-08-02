@@ -47,6 +47,11 @@ describe('Content client', () => {
             outcome: 'success',
             job: detail,
           };
+        case 'boss/advance-search-page/request':
+          return {
+            type: 'boss/advance-search-page/response',
+            outcome: 'advanced',
+          };
         case 'boss/cancel-detail-scan/request':
           return { type: 'boss/cancel-detail-scan/response', cancelled: true };
         default:
@@ -69,6 +74,9 @@ describe('Content client', () => {
     await expect(client.startDetailScan(visibleCard, 8_000)).resolves.toMatchObject({
       outcome: 'success',
     });
+    await expect(client.advanceSearchPage(8_000)).resolves.toMatchObject({
+      outcome: 'advanced',
+    });
     await expect(client.cancelDetailScan()).resolves.toBe(true);
 
     expect(sendMessage.mock.calls.map(([, message]) => (message as { type: string }).type)).toEqual([
@@ -76,24 +84,18 @@ describe('Content client', () => {
       'boss/extract-current-detail/request',
       'boss/extract-visible-cards/request',
       'boss/start-detail-scan/request',
+      'boss/advance-search-page/request',
       'boss/cancel-detail-scan/request',
     ]);
   });
 
-  it('AbortSignal 会通知 Content Script 停止当前 MutationObserver', async () => {
-    let finishScan: ((value: unknown) => void) | undefined;
+  it('AbortSignal 会立即结束悬挂消息，并通知 Content Script 停止当前 MutationObserver', async () => {
     const sendMessage = vi.fn<TabsClient['sendMessage']>(async (_tabId, message) => {
       const type = (message as { type?: string }).type;
       if (type === 'boss/start-detail-scan/request') {
-        return await new Promise<unknown>((resolve) => {
-          finishScan = resolve;
-        });
+        return await new Promise<unknown>(() => undefined);
       }
       if (type === 'boss/cancel-detail-scan/request') {
-        finishScan?.({
-          type: 'boss/start-detail-scan/response',
-          outcome: 'cancelled',
-        });
         return { type: 'boss/cancel-detail-scan/response', cancelled: true };
       }
       return undefined;
@@ -107,11 +109,47 @@ describe('Content client', () => {
     await vi.waitFor(() => expect(sendMessage).toHaveBeenCalledOnce());
     controller.abort();
 
-    await expect(scan).resolves.toMatchObject({ outcome: 'cancelled' });
+    await expect(scan).rejects.toMatchObject({ name: 'AbortError' });
     expect(sendMessage).toHaveBeenLastCalledWith(
       7,
       expect.objectContaining({ type: 'boss/cancel-detail-scan/request' }),
     );
+  });
+
+  it('页面检测消息悬挂时也会遵守外部轮次截止信号', async () => {
+    const client = createContentClient({
+      query: async () => [{ id: 8 }],
+      sendMessage: async () => await new Promise<unknown>(() => undefined),
+    });
+    const controller = new AbortController();
+    const detection = client.detectPage(controller.signal);
+    controller.abort(new DOMException('轮次超时。', 'TimeoutError'));
+
+    await expect(detection).rejects.toMatchObject({ name: 'TimeoutError' });
+  });
+
+  it('传统整页翻页导致消息端口断开时，会等待新 Content Script 后继续', async () => {
+    const sendMessage = vi
+      .fn<TabsClient['sendMessage']>()
+      .mockRejectedValueOnce(new Error('The message port closed'))
+      .mockResolvedValueOnce({
+        type: 'boss/detect-page/response',
+        pageType: 'search-list',
+        block: null,
+      });
+    const client = createContentClient({
+      query: async () => [{ id: 9 }],
+      sendMessage,
+    });
+
+    await expect(client.advanceSearchPage(500)).resolves.toEqual({
+      type: 'boss/advance-search-page/response',
+      outcome: 'advanced',
+    });
+    expect(sendMessage.mock.calls.map(([, message]) => (message as { type: string }).type)).toEqual([
+      'boss/advance-search-page/request',
+      'boss/detect-page/request',
+    ]);
   });
 
   it('没有活动标签页时返回明确错误', async () => {

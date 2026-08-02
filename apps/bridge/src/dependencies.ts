@@ -3,6 +3,7 @@ import type {
   JobCard,
   JobDetail,
   Preferences,
+  ScreeningPhase,
   ScreeningResult,
 } from "@career-ops-cn/shared";
 
@@ -59,6 +60,7 @@ export interface JobScreeningResult {
 export type ScreenJob = (
   job: ScreenableJob,
   preferences: ScreeningPreferences,
+  phase?: ScreeningPhase,
 ) => JobScreeningResult | Promise<JobScreeningResult>;
 
 interface ScreeningModule {
@@ -73,8 +75,8 @@ export function toScreenableJob(job: JobCard | JobDetail): ScreenableJob {
   return {
     title: job.title,
     companyName: job.companyName,
-    salaryText: job.salaryText,
-    location: job.location,
+    salaryText: job.salaryText ?? "",
+    location: job.location ?? "",
     description: "description" in job ? job.description : "",
   };
 }
@@ -153,14 +155,16 @@ export function toScreeningResult(
   return {
     jobId,
     matched: result.decision !== "block",
-    reasons: result.rules.map(({ reason }) => reason),
+    reasons: result.rules
+      .filter(({ decision }) => decision !== "pass")
+      .map(({ reason }) => reason),
   };
 }
 
 export function createRealScreenJob(): ScreenJob {
   let implementation: Promise<ScreenJob> | undefined;
 
-  return async (job, preferences) => {
+  return async (job, preferences, phase) => {
     implementation ??= import("@career-ops-cn/screening").then(
       (loaded: ScreeningModule) => {
         if (typeof loaded.screenJob !== "function") {
@@ -169,7 +173,7 @@ export function createRealScreenJob(): ScreenJob {
         return loaded.screenJob as ScreenJob;
       },
     );
-    return (await implementation)(job, preferences);
+    return (await implementation)(job, preferences, phase);
   };
 }
 

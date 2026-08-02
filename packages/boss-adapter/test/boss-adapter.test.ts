@@ -4,6 +4,7 @@ import { Window } from "happy-dom";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
+  bossSelectors,
   detectBossPage,
   detectBossPageBlock,
   parseBossDetail,
@@ -37,6 +38,8 @@ const createDocument = (
 
 const fixtureUrls: Record<string, string> = {
   "search-list.html": "https://www.zhipin.com/web/geek/job?query=typescript",
+  "list-minimal-card.html":
+    "https://www.zhipin.com/web/geek/job?query=frontend",
   "job-detail.html": "https://www.zhipin.com/job_detail/boss-2001.html",
   "job-detail-standalone.html":
     "https://www.zhipin.com/job_detail/standalone-2002.html",
@@ -203,6 +206,38 @@ describe("详情身份校验", () => {
     window.close();
   });
 
+  it("分页 Selector 能识别真实 fixture 中的下一页入口", () => {
+    const url = fixtureUrls["search-list.html"]!;
+    const { window, document } = createDocument("search-list.html", url);
+
+    expect(
+      bossSelectors.pagination.next.some(
+        (selector) => document.querySelector(selector) !== null,
+      ),
+    ).toBe(true);
+    window.close();
+  });
+
+  it("列表卡片只要 ID、标题、公司和详情 URL 即可进入后续流程", () => {
+    const url = fixtureUrls["list-minimal-card.html"]!;
+    const { window, document } = createDocument("list-minimal-card.html", url);
+
+    expect(parseVisibleBossCards(document, url)).toEqual([
+      {
+        sourceJobId: "boss-minimal-1",
+        url: "https://www.zhipin.com/job_detail/boss-minimal-1.html?ka=search_list_1",
+        title: "前端工程师（React）",
+        company: "示例轻量科技",
+        salaryRaw: null,
+        city: null,
+        experience: null,
+        education: null,
+        tags: [],
+      },
+    ]);
+    window.close();
+  });
+
   it("独立详情页从全页读取 banner 与详情正文", () => {
     const url = fixtureUrls["job-detail-standalone.html"]!;
     const { window, document } = createDocument(
@@ -221,7 +256,7 @@ describe("详情身份校验", () => {
     window.close();
   });
 
-  it("直接详情页 sourceJobId 冲突时不会被相同 URL 掩盖", () => {
+  it("sourceJobId 冲突但标准化详情 URL 一致时仍可直接确认", () => {
     const url = fixtureUrls["job-detail.html"]!;
     const { window, document } = createDocument("job-detail.html", url);
     const detail = {
@@ -238,9 +273,53 @@ describe("详情身份校验", () => {
       detail,
     });
 
-    expect(result.verified).toBe(false);
-    expect(result.signals.jobIdentity).toBe(false);
-    expect(result.matchedSignals).toEqual(["title"]);
+    expect(result.verified).toBe(true);
+    expect(result.signals.jobIdentity).toBe(true);
+    expect(result.matchedSignals).toEqual(["job_identity", "title"]);
+    window.close();
+  });
+
+  it("标准化详情 URL 一致时可直接确认身份", () => {
+    const url = fixtureUrls["job-detail.html"]!;
+    const { window, document } = createDocument("job-detail.html", url);
+    const detail = {
+      ...parseBossDetail(document, url)!,
+      sourceJobId: null,
+      url: `${url}?ka=detail#description`,
+    };
+
+    const result = verifyDetailIdentity({
+      expected: {
+        sourceJobId: null,
+        url: `${url}?ka=search_list_1`,
+        title: "完全不同的标题",
+        company: "完全不同的公司",
+      },
+      detail,
+    });
+
+    expect(result.verified).toBe(true);
+    expect(result.signals.jobIdentity).toBe(true);
+    window.close();
+  });
+
+  it("没有强身份信号时允许标题后缀、空格和标点差异，并结合公司判断", () => {
+    const url = fixtureUrls["no-source-id.html"]!;
+    const { window, document } = createDocument("no-source-id.html", url);
+    const detail = parseBossDetail(document, url)!;
+
+    const result = verifyDetailIdentity({
+      expected: {
+        sourceJobId: null,
+        url: null,
+        title: "无编号 前端职位（急聘）",
+        company: detail.company,
+      },
+      detail,
+    });
+
+    expect(result.verified).toBe(true);
+    expect(result.signals).toMatchObject({ title: true, company: true });
     window.close();
   });
 

@@ -4,6 +4,8 @@ import { describe, expect, it } from "vitest";
 import type { ZodType } from "zod";
 
 import {
+  AdvanceSearchPageRequestSchema,
+  AdvanceSearchPageResponseSchema,
   BridgeErrorResponseSchema,
   BridgeSettingsSchema,
   CreateJobRequestSchema,
@@ -66,6 +68,16 @@ const otherStrictContracts: Array<{
   schema: ZodType;
   value: Record<string, unknown>;
 }> = [
+  {
+    name: "AdvanceSearchPageRequest",
+    schema: AdvanceSearchPageRequestSchema,
+    value: { type: "boss/advance-search-page/request", timeoutMs: 8_000 },
+  },
+  {
+    name: "AdvanceSearchPageResponse",
+    schema: AdvanceSearchPageResponseSchema,
+    value: { type: "boss/advance-search-page/response", outcome: "advanced" },
+  },
   {
     name: "Preferences",
     schema: PreferencesSchema,
@@ -230,6 +242,31 @@ describe("其余边界对象", () => {
         detailUrl: "https://example.com/job/123456789",
       }),
     ).toThrow();
+  });
+
+  it("JobCard 只要求身份与详情入口字段", () => {
+    expect(
+      JobCardSchema.parse({
+        jobId: "minimal-1",
+        title: "前端工程师",
+        companyName: "示例科技",
+        detailUrl: "https://www.zhipin.com/job_detail/minimal-1.html",
+      }),
+    ).toEqual({
+      jobId: "minimal-1",
+      title: "前端工程师",
+      companyName: "示例科技",
+      detailUrl: "https://www.zhipin.com/job_detail/minimal-1.html",
+    });
+  });
+
+  it("ScreenRequest 可明确区分列表预筛和详情完整筛选", () => {
+    expect(
+      ScreenRequestSchema.parse({
+        jobs: [readFixture("job-detail.json")],
+        phase: "detail",
+      }),
+    ).toMatchObject({ phase: "detail" });
   });
 
   it("CreateJobRequest 拒绝非 zhipin.com URL", () => {

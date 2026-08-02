@@ -256,6 +256,24 @@ export const detectBossPage = (
   return "unsupported";
 };
 
+export const normalizeBossDetailUrl = (value: string | null): string | null => {
+  if (value === null) {
+    return null;
+  }
+
+  const normalized = normalizeUrl(value, value);
+  if (normalized === null) {
+    return null;
+  }
+
+  const parsed = new URL(normalized);
+  parsed.hostname = parsed.hostname.toLowerCase();
+  parsed.search = "";
+  parsed.hash = "";
+  parsed.pathname = parsed.pathname.replace(/\/+$/u, "") || "/";
+  return parsed.toString();
+};
+
 export const detectBossPageBlock = (
   document: Document,
   url: string,
@@ -405,31 +423,75 @@ const identityUrlMatches = (
   expected: BossJobIdentity,
   actual: BossJobIdentity,
 ): boolean | null => {
-  if (expected.sourceJobId !== null && actual.sourceJobId !== null) {
-    return expected.sourceJobId === actual.sourceJobId;
-  }
+  const jobIdMatch =
+    expected.sourceJobId !== null && actual.sourceJobId !== null
+      ? expected.sourceJobId === actual.sourceJobId
+      : null;
 
+  let urlMatch: boolean | null = null;
   if (expected.url !== null && actual.url !== null) {
-    const expectedUrl = normalizeUrl(expected.url, expected.url);
-    const actualUrl = normalizeUrl(actual.url, actual.url);
+    const expectedUrl = normalizeBossDetailUrl(expected.url);
+    const actualUrl = normalizeBossDetailUrl(actual.url);
     if (expectedUrl !== null && actualUrl !== null) {
-      return expectedUrl === actualUrl;
+      urlMatch = expectedUrl === actualUrl;
     }
   }
 
+  if (jobIdMatch === true || urlMatch === true) {
+    return true;
+  }
+  if (jobIdMatch === false || urlMatch === false) {
+    return false;
+  }
   return null;
+};
+
+const normalizeIdentityText = (
+  value: string | null | undefined,
+): string | null => {
+  const text = normalizeText(value);
+  if (text === null) {
+    return null;
+  }
+
+  const normalized = text
+    .normalize("NFKC")
+    .toLocaleLowerCase("zh-CN")
+    .replace(/[\p{P}\p{S}\p{White_Space}]+/gu, "");
+  return normalized.length > 0 ? normalized : null;
+};
+
+const relaxedTextMatches = (
+  expected: string | null | undefined,
+  actual: string | null | undefined,
+): boolean | null => {
+  const expectedText = normalizeIdentityText(expected);
+  const actualText = normalizeIdentityText(actual);
+  if (expectedText === null || actualText === null) {
+    return null;
+  }
+
+  if (expectedText === actualText) {
+    return true;
+  }
+
+  const shorter =
+    expectedText.length <= actualText.length ? expectedText : actualText;
+  const longer = shorter === expectedText ? actualText : expectedText;
+  return shorter.length >= 3 && longer.includes(shorter);
 };
 
 const titleMatches = (
   expected: BossJobIdentity,
   actual: BossJobIdentity,
 ): boolean | null => {
-  const expectedTitle = normalizeText(expected.title);
-  const actualTitle = normalizeText(actual.title);
-  return expectedTitle === null || actualTitle === null
-    ? null
-    : expectedTitle === actualTitle;
+  return relaxedTextMatches(expected.title, actual.title);
 };
+
+const companyMatches = (
+  expected: BossJobIdentity,
+  actual: BossJobIdentity,
+): boolean | null => relaxedTextMatches(expected.company, actual.company);
 
 const activeCardMatches = (
   expected: BossJobIdentity,
@@ -444,7 +506,15 @@ const activeCardMatches = (
     return identityMatch;
   }
 
-  return titleMatches(expected, activeCard);
+  const titleMatch = titleMatches(expected, activeCard);
+  const companyMatch = companyMatches(expected, activeCard);
+  if (titleMatch === true && (companyMatch === true || companyMatch === null)) {
+    return true;
+  }
+  if (companyMatch === true && titleMatch === null) {
+    return true;
+  }
+  return titleMatch === false || companyMatch === false ? false : null;
 };
 
 export const verifyDetailIdentity = (
@@ -459,6 +529,7 @@ export const verifyDetailIdentity = (
   const signals = {
     jobIdentity: identityUrlMatches(input.expected, input.detail),
     title: titleMatches(input.expected, input.detail),
+    company: companyMatches(input.expected, input.detail),
     activeCard: activeCardMatches(input.expected, input.activeCard),
     contentChanged:
       previousHash === null ? null : previousHash !== currentDetailHash,
@@ -468,6 +539,7 @@ export const verifyDetailIdentity = (
   > = [
     ["job_identity", signals.jobIdentity],
     ["title", signals.title],
+    ["company", signals.company],
     ["active_card", signals.activeCard],
     ["content_changed", signals.contentChanged],
   ];
@@ -475,8 +547,13 @@ export const verifyDetailIdentity = (
     .filter((entry) => entry[1] === true)
     .map((entry) => entry[0]);
 
+  const fallbackVerified =
+    signals.jobIdentity === null &&
+    ((signals.title === true && signals.company === true) ||
+      (signals.title === true && signals.activeCard === true));
+
   return {
-    verified: matchedSignals.length >= 2,
+    verified: signals.jobIdentity === true || fallbackVerified,
     signals,
     matchedSignals,
     detailHash: currentDetailHash,

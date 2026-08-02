@@ -128,6 +128,17 @@ export const bossSelectors = {
     ".job-card-box.active",
     "[data-jobid][aria-selected='true']",
   ],
+  pagination: {
+    next: [
+      "a[ka='page-next']",
+      ".options-pages a.next",
+      ".pagination a.next",
+      "button[aria-label='下一页']",
+      "a[aria-label='下一页']",
+    ],
+    disabled:
+      ".disabled, [disabled], [aria-disabled='true'], [class*='disabled']",
+  },
   visibility: {
     hiddenAncestor:
       "[hidden], [aria-hidden='true'], [style*='display: none'], [style*='display:none'], [style*='visibility: hidden'], [style*='visibility:hidden']",

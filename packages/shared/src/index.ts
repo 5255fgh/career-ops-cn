@@ -22,10 +22,10 @@ export const JobCardSchema = z.strictObject({
   jobId: NonEmptyTextSchema,
   title: NonEmptyTextSchema,
   companyName: NonEmptyTextSchema,
-  salaryText: NonEmptyTextSchema,
-  location: NonEmptyTextSchema,
-  experienceText: NonEmptyTextSchema,
-  educationText: NonEmptyTextSchema,
+  salaryText: NonEmptyTextSchema.optional(),
+  location: NonEmptyTextSchema.optional(),
+  experienceText: NonEmptyTextSchema.optional(),
+  educationText: NonEmptyTextSchema.optional(),
   detailUrl: ZhipinUrlSchema,
 });
 
@@ -119,9 +119,16 @@ export const ScreeningResultSchema = z.strictObject({
 
 export type ScreeningResult = z.infer<typeof ScreeningResultSchema>;
 
+export const ScreeningPhaseSchema = z.enum(["list", "detail"]);
+
+export type ScreeningPhase = z.infer<typeof ScreeningPhaseSchema>;
+
+export const ScreenableJobSchema = z.union([JobDetailSchema, JobCardSchema]);
+
 export const ScreenRequestSchema = z.strictObject({
-  jobs: z.array(JobCardSchema),
+  jobs: z.array(ScreenableJobSchema),
   preferences: PreferencesSchema.optional(),
+  phase: ScreeningPhaseSchema.default("list"),
 });
 
 export type ScreenRequest = z.infer<typeof ScreenRequestSchema>;
@@ -200,6 +207,7 @@ export const BridgeErrorResponseSchema = z.strictObject({
     "JOB_NOT_FOUND",
     "INVALID_JOB_DETAIL",
     "DETAIL_IDENTITY_UNVERIFIED",
+    "HARD_RULE_BLOCKED",
     "EVALUATION_FAILED",
     "EVALUATION_TIMEOUT",
     "CANCELLED",
@@ -258,11 +266,12 @@ export const BridgeSettingsSchema = z.strictObject({
 export type BridgeSettings = z.infer<typeof BridgeSettingsSchema>;
 
 export const ScanConfigSchema = z.strictObject({
-  maxListJobs: z.number().int().positive(),
-  maxDetailJobs: z.number().int().positive(),
+  maxPages: z.number().int().positive(),
+  maxNewJobs: z.number().int().positive(),
   maxAiJobs: z.number().int().positive(),
   detailTimeoutMs: z.number().int().positive(),
-  detailCooldownMs: z.number().int().nonnegative(),
+  requestIntervalMs: z.number().int().nonnegative(),
+  maxRoundMs: z.number().int().positive(),
 });
 
 export type ScanConfig = z.infer<typeof ScanConfigSchema>;
@@ -367,6 +376,7 @@ const DetailIdentityEvidenceSchema = z.strictObject({
     .strictObject({
       jobIdentity: z.boolean().nullable(),
       title: z.boolean().nullable(),
+      company: z.boolean().nullable(),
       activeCard: z.boolean().nullable(),
       contentChanged: z.boolean().nullable(),
     })
@@ -402,11 +412,53 @@ export const StartDetailScanResponseSchema = z.discriminatedUnion("outcome", [
     type: z.literal("boss/start-detail-scan/response"),
     outcome: z.literal("failed"),
     message: NonEmptyTextSchema,
+    failureKind: z.enum([
+      "network",
+      "http",
+      "missing_fields",
+      "layout",
+      "unknown",
+    ]),
+    retryable: z.boolean(),
   }),
 ]);
 
 export type StartDetailScanResponse = z.infer<
   typeof StartDetailScanResponseSchema
+>;
+
+export const AdvanceSearchPageRequestSchema = z.strictObject({
+  type: z.literal("boss/advance-search-page/request"),
+  timeoutMs: z.number().int().positive(),
+});
+
+export const AdvanceSearchPageResponseSchema = z.discriminatedUnion("outcome", [
+  z.strictObject({
+    type: z.literal("boss/advance-search-page/response"),
+    outcome: z.literal("advanced"),
+  }),
+  z.strictObject({
+    type: z.literal("boss/advance-search-page/response"),
+    outcome: z.literal("end"),
+  }),
+  z.strictObject({
+    type: z.literal("boss/advance-search-page/response"),
+    outcome: z.literal("blocked"),
+    reason: BossPageBlockReasonSchema,
+  }),
+  z.strictObject({
+    type: z.literal("boss/advance-search-page/response"),
+    outcome: z.literal("cancelled"),
+  }),
+  z.strictObject({
+    type: z.literal("boss/advance-search-page/response"),
+    outcome: z.literal("failed"),
+    message: NonEmptyTextSchema,
+  }),
+]);
+
+export type AdvanceSearchPageResponse = z.infer<
+  typeof AdvanceSearchPageResponseSchema
 >;
 
 export const CancelDetailScanRequestSchema = z.strictObject({
@@ -457,6 +509,8 @@ export const ExtensionMessageSchema = z.union([
   ExtractVisibleCardsResponseSchema,
   StartDetailScanRequestSchema,
   StartDetailScanResponseSchema,
+  AdvanceSearchPageRequestSchema,
+  AdvanceSearchPageResponseSchema,
   CancelDetailScanRequestSchema,
   CancelDetailScanResponseSchema,
 ]);

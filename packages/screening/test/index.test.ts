@@ -166,6 +166,22 @@ describe("parseCnSalary", () => {
 });
 
 describe("screenJob", () => {
+  it("列表预筛不因 JD 为空或未命中详情技能而阻断", () => {
+    const result = screenJob(
+      { ...baseJob, title: "普通前端工程师", description: "" },
+      { ...basePreferences, skill: { requiredAny: ["Rust"] } },
+      "list",
+    );
+
+    expect(result.decision).not.toBe("block");
+    expect(result.rules.some(({ ruleId }) => ruleId.startsWith("jd."))).toBe(
+      false,
+    );
+    expect(
+      result.rules.some(({ ruleId }) => ruleId === "skill.required_any"),
+    ).toBe(false);
+  });
+
   it("城市前缀匹配允许地点，并输出全部规则字段", () => {
     const result = screenJob(baseJob, basePreferences);
 

@@ -225,7 +225,7 @@ describe("screen", () => {
         {
           jobId: JOB_CARD.jobId,
           matched: true,
-          reasons: ["命中 TypeScript"],
+          reasons: [],
         },
       ]);
       expect(screenJob).toHaveBeenCalledWith(
@@ -237,6 +237,7 @@ describe("screen", () => {
           description: "",
         },
         PREFERENCES,
+        "list",
       );
     } finally {
       await bridge.close();
@@ -362,7 +363,7 @@ describe("职位 upsert 与读取", () => {
 });
 
 describe("diagnostics", () => {
-  it("Extension 可写入并按时间读取验收诊断", async () => {
+  it("Extension 可写入并按时间读取扫描诊断", async () => {
     const { database } = await createTempDatabase();
     const bridge = createBridge({ environment: TEST_ENVIRONMENT, database });
 
@@ -418,10 +419,53 @@ describe("diagnostics", () => {
       await bridge.close();
     }
   });
+
+  it("详情阶段把完整 JD 和 phase 交给硬规则筛选", async () => {
+    const { database } = await createTempDatabase();
+    const screenJob = vi.fn<ScreenJob>(() => ({
+      decision: "pass",
+      rules: [{ decision: "pass", reason: "详情规则通过" }],
+    }));
+    const bridge = createBridge({
+      environment: TEST_ENVIRONMENT,
+      database,
+      screenJob,
+    });
+
+    try {
+      const response = await bridge.inject({
+        method: "POST",
+        url: "/screen",
+        headers: AUTHORIZATION,
+        payload: {
+          jobs: [
+            {
+              ...JOB_CARD,
+              description: JOB.description,
+              identityVerified: true,
+            },
+          ],
+          phase: "detail",
+        },
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(screenJob).toHaveBeenCalledWith(
+        expect.objectContaining({ description: JOB.description }),
+        PREFERENCES,
+        "detail",
+      );
+      expect(ScreenResponseSchema.parse(response.json())[0]?.reasons).toEqual(
+        [],
+      );
+    } finally {
+      await bridge.close();
+    }
+  });
 });
 
 describe("evaluate", () => {
-  it("传入 JobDetail、配置与 AbortSignal，硬规则 block 强制 skip 并立即保存", async () => {
+  it("完整硬规则 block 时拒绝 AI 调用且不伪造评估", async () => {
     const { database } = await createTempDatabase();
     const evaluator = vi.fn<Evaluator>(async (_job, _options) => ({
       score: 92,
@@ -446,30 +490,66 @@ describe("evaluate", () => {
         url: `/jobs/${job.id}/evaluate`,
         headers: AUTHORIZATION,
       });
-      expect(response.statusCode).toBe(200);
-      const evaluation = EvaluationResultSchema.parse(response.json());
-      expect(evaluation.recommendation).toBe("skip");
+      expect(response.statusCode).toBe(422);
+      expect(BridgeErrorResponseSchema.parse(response.json())).toMatchObject({
+        error: "HARD_RULE_BLOCKED",
+        message: expect.stringContaining("命中硬规则"),
+      });
 
-      expect(evaluator).toHaveBeenCalledOnce();
-      const [detail, options] = evaluator.mock.calls[0] ?? [];
-      expect(detail).toMatchObject({
-        jobId: JOB.sourceJobId,
-        description: JOB.description,
-        identityVerified: true,
-      });
-      expect(options).toMatchObject({
-        careerOpsRoot: TEST_ENVIRONMENT.CAREER_OPS_CN_CAREER_OPS_ROOT,
-        timeoutMs: 5000,
-      });
-      expect(options?.signal).toBeInstanceOf(AbortSignal);
+      expect(evaluator).not.toHaveBeenCalled();
 
       expect(
         database
           .prepare(
-            "SELECT job_id, recommendation FROM evaluations WHERE job_id = ?",
+            "SELECT job_id FROM evaluations WHERE job_id = ?",
           )
           .get(job.id),
-      ).toEqual({ job_id: job.id, recommendation: "skip" });
+      ).toBeUndefined();
+    } finally {
+      await bridge.close();
+    }
+  });
+
+  it("diagnostics 表写入失败不改变已通过硬规则的评估结果", async () => {
+    const { database } = await createTempDatabase();
+    const evaluator = vi.fn<Evaluator>(async () => ({
+      score: 90,
+      recommendation: "apply",
+      rawReport: "业务评估成功。",
+    }));
+    const bridge = createBridge({
+      environment: TEST_ENVIRONMENT,
+      database,
+      evaluator,
+      screenJob: PASS_SCREEN_JOB,
+    });
+
+    try {
+      database.exec(`
+        CREATE TRIGGER fail_diagnostics_insert
+        BEFORE INSERT ON diagnostics
+        BEGIN
+          SELECT RAISE(FAIL, 'diagnostics unavailable');
+        END;
+      `);
+      const job = await postJob(bridge);
+      const response = await bridge.inject({
+        method: "POST",
+        url: `/jobs/${job.id}/evaluate`,
+        headers: AUTHORIZATION,
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(EvaluationResultSchema.parse(response.json())).toMatchObject({
+        score: 90,
+        recommendation: "apply",
+      });
+      expect(evaluator).toHaveBeenCalledOnce();
+      expect(
+        database
+          .prepare("SELECT recommendation FROM evaluations WHERE job_id = ?")
+          .get(job.id),
+      ).toEqual({ recommendation: "apply" });
     } finally {
       await bridge.close();
     }

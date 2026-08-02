@@ -1,6 +1,7 @@
 export {
   detectBossPage,
   detectBossPageBlock,
+  normalizeBossDetailUrl,
   parseBossDetail,
   parseVisibleBossCards,
   scanSelectedBossDetails,

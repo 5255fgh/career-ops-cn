@@ -7,7 +7,9 @@ import { SidePanelView, type SidePanelViewProps } from './SidePanelView';
 const completedState: ScanState = {
   status: 'completed',
   progress: {
+    pagesVisited: 2,
     listJobs: 12,
+    newJobs: 8,
     screenedJobs: 12,
     detailCompleted: 2,
     detailTarget: 2,
@@ -16,6 +18,7 @@ const completedState: ScanState = {
   },
   stopReason: null,
   error: null,
+  warnings: [],
   results: [
     {
       card: {
@@ -115,7 +118,6 @@ function props(overrides: Partial<SidePanelViewProps> = {}): SidePanelViewProps 
     onSaveConnection: () => undefined,
     onRefreshPage: () => undefined,
     onStartScan: () => undefined,
-    onStartAcceptanceSmoke: () => undefined,
     onCancelScan: () => undefined,
     onSelectJob: () => undefined,
     onHistoryFilterChange: () => undefined,
@@ -127,7 +129,7 @@ function props(overrides: Partial<SidePanelViewProps> = {}): SidePanelViewProps 
 }
 
 describe('SidePanelView', () => {
-  it('渲染验收诊断区块，并显示关键结果字段', () => {
+  it('渲染扫描诊断区块，并显示关键结果字段', () => {
     const html = renderToStaticMarkup(<SidePanelView {...props()} />);
 
     for (const heading of [
@@ -139,7 +141,7 @@ describe('SidePanelView', () => {
       '单个职位详情',
       '历史职位',
       '用户判断',
-      '验收诊断',
+      '扫描诊断',
     ]) {
       expect(html).toContain(heading);
     }

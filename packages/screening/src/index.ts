@@ -66,6 +66,8 @@ export interface RuleResult {
 
 export type ScreeningDecision = "pass" | "review" | "block";
 
+export type ScreeningPhase = "list" | "detail";
+
 export interface JobScreeningResult {
   readonly decision: ScreeningDecision;
   readonly score: number | null;
@@ -549,18 +551,29 @@ function scoreNonBlockedRules(rules: readonly RuleResult[]): number {
 export function screenJob(
   job: ScreenableJob,
   preferences: ScreeningPreferences,
+  phase: ScreeningPhase = "detail",
 ): JobScreeningResult {
   const salary = parseCnSalary(job.salaryText);
-  const rules: readonly RuleResult[] = [
+  const listRules: readonly RuleResult[] = [
     evaluateLocation(job, preferences),
     evaluateSalary(salary, preferences),
     evaluateCompany(job, preferences),
     evaluateKeywordBlocklist(job, preferences),
     evaluateKeywordWarning(job, preferences),
-    evaluateRequiredSkills(job, preferences),
-    evaluateJdEmpty(job),
-    evaluateJdTooShort(job, preferences),
   ];
+  const rules: readonly RuleResult[] =
+    phase === "list"
+      ? listRules.map((rule) =>
+          rule.decision === "unknown"
+            ? { ...rule, decision: "pass" as const }
+            : rule,
+        )
+      : [
+          ...listRules,
+          evaluateRequiredSkills(job, preferences),
+          evaluateJdEmpty(job),
+          evaluateJdTooShort(job, preferences),
+        ];
 
   if (rules.some((rule) => rule.decision === "block")) {
     return { decision: "block", score: null, salary, rules };
