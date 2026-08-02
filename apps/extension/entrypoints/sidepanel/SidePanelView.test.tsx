@@ -74,7 +74,13 @@ const completedState: ScanState = {
         legitimacy: 'high',
         rawReport: '这是未经改写的 career-ops rawReport。',
       },
-      decision: { jobId: 'saved-1', decision: 'apply' },
+      candidate: {
+        jobId: 'saved-1',
+        decision: 'apply',
+        note: '优先跟进',
+        applicationStatus: 'interviewing',
+        updatedAt: '2026-08-01T10:00:00.000Z',
+      },
     },
   ],
 };
@@ -93,7 +99,7 @@ function props(overrides: Partial<SidePanelViewProps> = {}): SidePanelViewProps 
     pageError: '',
     scanState: completedState,
     selectedJobId: 'boss-1',
-    history: [
+    candidates: [
       {
         id: 'saved-1',
         source: 'boss',
@@ -103,13 +109,22 @@ function props(overrides: Partial<SidePanelViewProps> = {}): SidePanelViewProps 
         identityVerified: true,
         firstSeenAt: '2026-08-01T10:00:00.000Z',
         lastSeenAt: '2026-08-01T10:00:00.000Z',
+        latestScreening: completedState.results[0]!.screening,
         latestEvaluation: completedState.results[0]!.evaluation,
-        decision: { jobId: 'saved-1', decision: 'apply' },
+        candidate: completedState.results[0]!.candidate,
       },
     ],
-    historyFilter: 'all',
+    candidateTotal: 1,
+    candidateDecisionFilter: 'all',
+    applicationStatusFilter: 'all',
+    candidateSort: 'last-seen-desc',
+    selectedCandidateId: 'saved-1',
+    candidateDecision: 'apply',
+    candidateNote: '优先跟进',
+    applicationStatus: 'interviewing',
     historyError: '',
-    decisionMessage: '已记录 apply。',
+    candidateMessage: '候选池记录已保存。',
+    exportMessage: '',
     diagnostics: [
       {
         id: 'diag-1',
@@ -130,10 +145,17 @@ function props(overrides: Partial<SidePanelViewProps> = {}): SidePanelViewProps 
     onStartScan: () => undefined,
     onCancelScan: () => undefined,
     onSelectJob: () => undefined,
-    onHistoryFilterChange: () => undefined,
+    onCandidateDecisionFilterChange: () => undefined,
+    onApplicationStatusFilterChange: () => undefined,
+    onCandidateSortChange: () => undefined,
+    onSelectCandidate: () => undefined,
+    onCandidateDecisionChange: () => undefined,
+    onCandidateNoteChange: () => undefined,
+    onApplicationStatusChange: () => undefined,
     onRefreshHistory: () => undefined,
+    onSaveCandidate: () => undefined,
+    onExport: () => undefined,
     onRefreshDiagnostics: () => undefined,
-    onDecision: () => undefined,
     ...overrides,
   };
 }
@@ -149,8 +171,8 @@ describe('SidePanelView', () => {
       '进度',
       '结果列表',
       '单个职位详情',
-      '历史职位',
-      '用户判断',
+      '候选池',
+      '备注与投递状态',
       '扫描诊断',
     ]) {
       expect(html).toContain(heading);
@@ -165,6 +187,11 @@ describe('SidePanelView', () => {
     expect(html).toContain('Builder');
     expect(html).toContain('high');
     expect(html).toContain('这是未经改写的 career-ops rawReport。');
+    expect(html).toContain('硬规则结果');
+    expect(html).toContain('优先跟进');
+    expect(html).toContain('面试中');
+    expect(html).toContain('导出 CSV');
+    expect(html).toContain('导出 JSON');
     expect(html).toContain('detail_mapping');
     expect(html).toContain('boss-1');
     expect(html).not.toContain('strengths');

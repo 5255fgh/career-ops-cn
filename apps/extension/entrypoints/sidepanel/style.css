@@ -18,7 +18,8 @@ body {
 
 button,
 input,
-select {
+select,
+textarea {
   font: inherit;
 }
 
@@ -86,9 +87,7 @@ pre {
 .section-heading > div,
 .input-row,
 .control-row,
-.decision-row,
-.result-row,
-.history-list li {
+.result-row {
   display: flex;
   align-items: center;
 }
@@ -153,7 +152,8 @@ pre {
 }
 
 .token-form label,
-.filter-label {
+.filter-grid label,
+.candidate-editor label {
   display: block;
   margin-bottom: 6px;
   color: #5c6860;
@@ -162,13 +162,13 @@ pre {
 }
 
 .input-row,
-.control-row,
-.decision-row {
+.control-row {
   gap: 7px;
 }
 
 input,
-select {
+select,
+textarea {
   width: 100%;
   min-width: 0;
   border: 1px solid #cbd4cd;
@@ -187,13 +187,13 @@ select {
 }
 
 input:focus,
-select:focus {
+select:focus,
+textarea:focus {
   border-color: #3f8058;
   box-shadow: 0 0 0 3px rgb(63 128 88 / 12%);
 }
 
-.button,
-.decision-button {
+.button {
   border-radius: 8px;
   font-weight: 750;
 }
@@ -441,45 +441,79 @@ select:focus {
 }
 
 .history-list li {
-  justify-content: space-between;
-  gap: 8px;
-  padding: 9px 10px;
+  display: block;
+  padding: 0;
 }
 
 .history-meta {
-  flex: 0 0 auto;
-  align-items: flex-end;
-  gap: 2px;
+  display: flex;
+  flex-flow: row wrap;
+  gap: 4px 8px;
+  padding: 0 10px 8px;
 }
 
-.decision-row {
+.header-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+.candidate-count {
+  margin-bottom: 9px;
+  color: #69736d;
+  font-size: 10px;
+}
+
+.filter-grid,
+.candidate-editor {
   display: grid;
-  grid-template-columns: repeat(3, 1fr);
+  gap: 9px;
 }
 
-.decision-button {
-  padding: 8px 5px;
-  border: 1px solid #d2d9d3;
-  background: #f7f8f7;
-  color: #4d5851;
+.filter-grid {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
 }
 
-.decision-apply {
-  border-color: #b8dbc2;
-  background: #eaf6ed;
-  color: #1d6b3c;
+.filter-grid label,
+.candidate-editor label {
+  margin-bottom: 0;
 }
 
-.decision-review {
-  border-color: #ead79a;
-  background: #fff7df;
-  color: #76570f;
+.filter-grid select,
+.candidate-editor select,
+.candidate-editor textarea {
+  margin-top: 5px;
 }
 
-.decision-skip {
-  border-color: #dfc4bf;
-  background: #fff0ed;
-  color: #8a4036;
+.candidate-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  width: 100%;
+  gap: 10px;
+  padding: 10px;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  text-align: left;
+}
+
+.candidate-row > span:first-child {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+}
+
+.candidate-row-selected {
+  background: #edf5ef;
+  box-shadow: inset 3px 0 #35764c;
+}
+
+.candidate-editor textarea {
+  width: 100%;
+  min-height: 88px;
+  padding: 9px 10px;
+  resize: vertical;
 }
 
 @media (max-width: 350px) {
@@ -490,5 +524,9 @@ select:focus {
 
   .button-secondary {
     width: 100%;
+  }
+
+  .filter-grid {
+    grid-template-columns: 1fr;
   }
 }

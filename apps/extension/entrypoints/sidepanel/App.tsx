@@ -1,14 +1,31 @@
-import { BridgeSettingsSchema, type DecisionRequest, type DiagnosticEvent, type JobHistoryEntry, type ScanConfig } from '@career-ops-cn/shared';
+import {
+  BridgeSettingsSchema,
+  type ApplicationStatus,
+  type CandidateDecision,
+  type DiagnosticEvent,
+  type JobHistoryEntry,
+  type ScanConfig,
+} from '@career-ops-cn/shared';
 import { type FormEvent, useCallback, useEffect, useMemo, useState } from 'react';
 import { browser } from 'wxt/browser';
 
 import { createBridgeClient } from '../../lib/bridge-client';
+import {
+  filterAndSortCandidates,
+  type ApplicationStatusFilter,
+  type CandidateDecisionFilter,
+  type CandidateSort,
+} from '../../lib/candidate-pool';
 import { createContentClient } from '../../lib/content-client';
 import {
   loadExtensionSettings,
   saveBridgeToken,
   type ExtensionStorageArea,
 } from '../../lib/extension-settings';
+import {
+  serializeJobsAsCsv,
+  serializeJobsAsJson,
+} from '../../lib/job-export';
 import {
   DEFAULT_SCAN_CONFIG,
   ScanController,
@@ -17,7 +34,6 @@ import {
 import {
   SidePanelView,
   type ConnectionState,
-  type HistoryFilter,
   type PageSnapshot,
 } from './SidePanelView';
 
@@ -58,6 +74,21 @@ function messageFromError(error: unknown): string {
   return error instanceof Error ? error.message : '操作失败。';
 }
 
+function downloadTextFile(
+  contents: string,
+  filename: string,
+  mediaType: string,
+): void {
+  const url = URL.createObjectURL(
+    new Blob([contents], { type: `${mediaType};charset=utf-8` }),
+  );
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = filename;
+  link.click();
+  URL.revokeObjectURL(url);
+}
+
 export function App() {
   const content = useMemo(() => createContentClient(), []);
   const [tokenDraft, setTokenDraft] = useState('');
@@ -70,9 +101,23 @@ export function App() {
   const [scanState, setScanState] = useState<ScanState>(IDLE_SCAN_STATE);
   const [selectedJobId, setSelectedJobId] = useState<string | null>(null);
   const [history, setHistory] = useState<JobHistoryEntry[]>([]);
-  const [historyFilter, setHistoryFilter] = useState<HistoryFilter>('all');
+  const [candidateDecisionFilter, setCandidateDecisionFilter] =
+    useState<CandidateDecisionFilter>('all');
+  const [applicationStatusFilter, setApplicationStatusFilter] =
+    useState<ApplicationStatusFilter>('all');
+  const [candidateSort, setCandidateSort] =
+    useState<CandidateSort>('last-seen-desc');
+  const [selectedCandidateId, setSelectedCandidateId] = useState<string | null>(
+    null,
+  );
+  const [candidateDecision, setCandidateDecision] =
+    useState<CandidateDecision>('review');
+  const [candidateNote, setCandidateNote] = useState('');
+  const [applicationStatus, setApplicationStatus] =
+    useState<ApplicationStatus>('not_applied');
   const [historyError, setHistoryError] = useState('');
-  const [decisionMessage, setDecisionMessage] = useState('');
+  const [candidateMessage, setCandidateMessage] = useState('');
+  const [exportMessage, setExportMessage] = useState('');
   const [diagnostics, setDiagnostics] = useState<DiagnosticEvent[]>([]);
   const [diagnosticsError, setDiagnosticsError] = useState('');
 
@@ -86,6 +131,23 @@ export function App() {
         ? null
         : new ScanController({ content, bridge, config: scanConfig }),
     [bridge, content, scanConfig],
+  );
+  const visibleCandidates = useMemo(
+    () =>
+      filterAndSortCandidates(history, {
+        decision: candidateDecisionFilter,
+        applicationStatus: applicationStatusFilter,
+        sort: candidateSort,
+      }),
+    [
+      applicationStatusFilter,
+      candidateDecisionFilter,
+      candidateSort,
+      history,
+    ],
+  );
+  const selectedCandidate = history.find(
+    ({ id }) => id === selectedCandidateId,
   );
 
   const refreshPage = useCallback(async () => {
@@ -113,7 +175,13 @@ export function App() {
     }
     setHistoryError('');
     try {
-      setHistory(await bridge.listJobs());
+      const jobs = await bridge.listJobs();
+      setHistory(jobs);
+      setSelectedCandidateId((current) =>
+        current !== null && jobs.some(({ id }) => id === current)
+          ? current
+          : jobs[0]?.id ?? null,
+      );
     } catch (error) {
       setHistoryError(messageFromError(error));
     }
@@ -229,6 +297,28 @@ export function App() {
     }
   }, [scanState.results, selectedJobId]);
 
+  useEffect(() => {
+    if (selectedCandidate === undefined) {
+      return;
+    }
+    setCandidateDecision(selectedCandidate.candidate?.decision ?? 'review');
+    setCandidateNote(selectedCandidate.candidate?.note ?? '');
+    setApplicationStatus(
+      selectedCandidate.candidate?.applicationStatus ?? 'not_applied',
+    );
+    setCandidateMessage('');
+  }, [selectedCandidateId, selectedCandidate?.candidate?.updatedAt]);
+
+  useEffect(() => {
+    if (
+      selectedCandidateId !== null &&
+      visibleCandidates.some(({ id }) => id === selectedCandidateId)
+    ) {
+      return;
+    }
+    setSelectedCandidateId(visibleCandidates[0]?.id ?? null);
+  }, [selectedCandidateId, visibleCandidates]);
+
   const saveConnection = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     const settings = BridgeSettingsSchema.safeParse({ bridgeToken: tokenDraft });
@@ -265,7 +355,7 @@ export function App() {
       setConnectionMessage('请先保存有效的 Bridge token。');
       return;
     }
-    setDecisionMessage('');
+    setCandidateMessage('');
     await controller.run();
     await Promise.all([
       refreshPage(),
@@ -278,24 +368,51 @@ export function App() {
     await controller?.cancel();
   };
 
-  const saveDecision = async (decision: DecisionRequest['decision']) => {
-    const selected = scanState.results.find(
-      (result) => result.card.job.jobId === selectedJobId,
-    );
-    if (bridge === null || controller === null || selected?.savedJob === undefined) {
-      setDecisionMessage('当前职位尚未保存，无法记录判断。');
+  const saveCandidate = async () => {
+    if (bridge === null || selectedCandidate === undefined) {
+      setCandidateMessage('请选择一个已保存的职位。');
       return;
     }
 
-    setDecisionMessage('正在保存判断…');
+    setCandidateMessage('正在保存候选池记录…');
     try {
-      const response = await bridge.saveDecision(selected.savedJob.id, { decision });
-      controller.recordDecision(response);
-      setDecisionMessage(`已记录 ${decision}。`);
-      await refreshHistory();
+      const candidate = await bridge.saveCandidate(selectedCandidate.id, {
+        decision: candidateDecision,
+        note: candidateNote.trim() === '' ? null : candidateNote,
+        applicationStatus,
+      });
+      setHistory((jobs) =>
+        jobs.map((job) =>
+          job.id === selectedCandidate.id ? { ...job, candidate } : job,
+        ),
+      );
+      controller?.recordCandidate(candidate);
+      setCandidateMessage('候选池记录已保存。');
     } catch (error) {
-      setDecisionMessage(messageFromError(error));
+      setCandidateMessage(messageFromError(error));
     }
+  };
+
+  const exportCandidates = (format: 'csv' | 'json') => {
+    if (visibleCandidates.length === 0) {
+      setExportMessage('当前筛选结果为空，未生成导出文件。');
+      return;
+    }
+    const date = new Date().toISOString().slice(0, 10);
+    if (format === 'csv') {
+      downloadTextFile(
+        serializeJobsAsCsv(visibleCandidates),
+        `career-ops-cn-${date}.csv`,
+        'text/csv',
+      );
+    } else {
+      downloadTextFile(
+        serializeJobsAsJson(visibleCandidates),
+        `career-ops-cn-${date}.json`,
+        'application/json',
+      );
+    }
+    setExportMessage(`已导出 ${visibleCandidates.length} 个职位。`);
   };
 
   return (
@@ -307,10 +424,18 @@ export function App() {
       pageError={pageError}
       scanState={scanState}
       selectedJobId={selectedJobId}
-      history={history}
-      historyFilter={historyFilter}
+      candidates={visibleCandidates}
+      candidateTotal={history.length}
+      candidateDecisionFilter={candidateDecisionFilter}
+      applicationStatusFilter={applicationStatusFilter}
+      candidateSort={candidateSort}
+      selectedCandidateId={selectedCandidateId}
+      candidateDecision={candidateDecision}
+      candidateNote={candidateNote}
+      applicationStatus={applicationStatus}
       historyError={historyError}
-      decisionMessage={decisionMessage}
+      candidateMessage={candidateMessage}
+      exportMessage={exportMessage}
       diagnostics={diagnostics}
       diagnosticsError={diagnosticsError}
       onTokenChange={(value) => {
@@ -321,11 +446,26 @@ export function App() {
       onRefreshPage={() => void refreshPage()}
       onStartScan={() => void startScan()}
       onCancelScan={() => void cancelScan()}
-      onSelectJob={setSelectedJobId}
-      onHistoryFilterChange={setHistoryFilter}
+      onSelectJob={(jobId) => {
+        setSelectedJobId(jobId);
+        const savedJobId = scanState.results.find(
+          (result) => result.card.job.jobId === jobId,
+        )?.savedJob?.id;
+        if (savedJobId !== undefined) {
+          setSelectedCandidateId(savedJobId);
+        }
+      }}
+      onCandidateDecisionFilterChange={setCandidateDecisionFilter}
+      onApplicationStatusFilterChange={setApplicationStatusFilter}
+      onCandidateSortChange={setCandidateSort}
+      onSelectCandidate={setSelectedCandidateId}
+      onCandidateDecisionChange={setCandidateDecision}
+      onCandidateNoteChange={setCandidateNote}
+      onApplicationStatusChange={setApplicationStatus}
       onRefreshHistory={() => void refreshHistory()}
+      onSaveCandidate={() => void saveCandidate()}
+      onExport={exportCandidates}
       onRefreshDiagnostics={() => void refreshDiagnostics()}
-      onDecision={(decision) => void saveDecision(decision)}
     />
   );
 }

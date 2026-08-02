@@ -178,23 +178,51 @@ export const EvaluationResponseSchema = z.strictObject({
 
 export type EvaluationResponse = z.infer<typeof EvaluationResponseSchema>;
 
-export const DecisionRequestSchema = z.strictObject({
-  decision: z.enum(["apply", "review", "skip"]),
-  reason: NonEmptyTextSchema.optional(),
-  outcome: NonEmptyTextSchema.optional(),
+export const CandidateDecisionSchema = z.enum(["apply", "review", "skip"]);
+
+export type CandidateDecision = z.infer<typeof CandidateDecisionSchema>;
+
+export const ApplicationStatusSchema = z.enum([
+  "not_applied",
+  "applied",
+  "interviewing",
+  "offer",
+  "rejected",
+  "withdrawn",
+]);
+
+export type ApplicationStatus = z.infer<typeof ApplicationStatusSchema>;
+
+const CandidateNoteSchema = NonEmptyTextSchema.max(4_000);
+
+export const CandidateUpdateRequestSchema = z
+  .strictObject({
+    decision: CandidateDecisionSchema.nullable().optional(),
+    note: CandidateNoteSchema.nullable().optional(),
+    applicationStatus: ApplicationStatusSchema.optional(),
+  })
+  .refine((value) => Object.keys(value).length > 0, {
+    message: "至少需要更新一个候选池字段。",
+  });
+
+export type CandidateUpdateRequest = z.infer<
+  typeof CandidateUpdateRequestSchema
+>;
+
+export const CandidateRecordSchema = z.strictObject({
+  jobId: NonEmptyTextSchema,
+  decision: CandidateDecisionSchema.nullable(),
+  note: CandidateNoteSchema.nullable(),
+  applicationStatus: ApplicationStatusSchema,
+  updatedAt: z.string().datetime(),
 });
 
-export type DecisionRequest = z.infer<typeof DecisionRequestSchema>;
-
-export const DecisionResponseSchema = DecisionRequestSchema.extend({
-  jobId: NonEmptyTextSchema,
-}).strict();
-
-export type DecisionResponse = z.infer<typeof DecisionResponseSchema>;
+export type CandidateRecord = z.infer<typeof CandidateRecordSchema>;
 
 export const JobHistoryEntrySchema = JobResponseSchema.extend({
+  latestScreening: ScreeningResultSchema.optional(),
   latestEvaluation: EvaluationResultSchema.optional(),
-  decision: DecisionResponseSchema.optional(),
+  candidate: CandidateRecordSchema.optional(),
 }).strict();
 
 export type JobHistoryEntry = z.infer<typeof JobHistoryEntrySchema>;
@@ -202,14 +230,6 @@ export type JobHistoryEntry = z.infer<typeof JobHistoryEntrySchema>;
 export const JobListResponseSchema = z.array(JobHistoryEntrySchema);
 
 export type JobListResponse = z.infer<typeof JobListResponseSchema>;
-
-export const UserDecisionSchema = z.strictObject({
-  jobId: NonEmptyTextSchema,
-  decision: z.enum(["interested", "not_interested"]),
-  note: NonEmptyTextSchema.optional(),
-});
-
-export type UserDecision = z.infer<typeof UserDecisionSchema>;
 
 export const HealthRequestSchema = z.strictObject({});
 
@@ -623,37 +643,7 @@ export const CancelDetailScanResponseSchema = z.strictObject({
   cancelled: z.boolean(),
 });
 
-export const PageContextRequestSchema = z.strictObject({
-  type: z.literal("page-context/request"),
-});
-
-export type PageContextRequest = z.infer<typeof PageContextRequestSchema>;
-
-export const PageContextResponseSchema = z.strictObject({
-  type: z.literal("page-context/response"),
-  isZhipin: z.boolean(),
-});
-
-export type PageContextResponse = z.infer<typeof PageContextResponseSchema>;
-
-export const MockJobDetailRequestSchema = z.strictObject({
-  type: z.literal("mock-job-detail/request"),
-});
-
-export type MockJobDetailRequest = z.infer<typeof MockJobDetailRequestSchema>;
-
-export const MockJobDetailResponseSchema = z.strictObject({
-  type: z.literal("mock-job-detail/response"),
-  job: JobDetailSchema,
-});
-
-export type MockJobDetailResponse = z.infer<typeof MockJobDetailResponseSchema>;
-
 export const ExtensionMessageSchema = z.union([
-  PageContextRequestSchema,
-  PageContextResponseSchema,
-  MockJobDetailRequestSchema,
-  MockJobDetailResponseSchema,
   DetectPageRequestSchema,
   DetectPageResponseSchema,
   ExtractCurrentDetailRequestSchema,

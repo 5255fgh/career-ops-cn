@@ -5,7 +5,7 @@ import { DatabaseSync } from "node:sqlite";
 
 import {
   BridgeErrorResponseSchema,
-  DecisionResponseSchema,
+  CandidateRecordSchema,
   DiagnosticEventSchema,
   DiagnosticListResponseSchema,
   EvaluationResponseSchema,
@@ -147,11 +147,12 @@ describe("Bridge 健康、认证与 CORS", () => {
         )
         .all() as Array<{ name: string }>;
       expect(tables.map(({ name }) => name)).toEqual([
-        "decisions",
+        "candidate_records",
         "diagnostics",
         "evaluations",
         "jobs",
         "scan_runs",
+        "screenings",
       ]);
     } finally {
       await bridge.close();
@@ -927,6 +928,13 @@ describe("evaluate", () => {
           )
           .get(job.id),
       ).toBeUndefined();
+      expect(
+        database
+          .prepare(
+            "SELECT matched, reasons_json FROM screenings WHERE job_id = ?",
+          )
+          .get(job.id),
+      ).toEqual({ matched: 0, reasons_json: '["命中硬规则"]' });
     } finally {
       await bridge.close();
     }
@@ -1183,8 +1191,8 @@ describe("evaluate", () => {
   });
 });
 
-describe("decision 与持久化", () => {
-  it("GET /jobs 返回最近评估与用户判断", async () => {
+describe("候选池与持久化", () => {
+  it("GET /jobs 分开返回硬规则、AI 原文和候选池记录", async () => {
     const { database } = await createTempDatabase();
     const evaluator = vi.fn<Evaluator>(async () => ({
       score: 89,
@@ -1210,13 +1218,17 @@ describe("decision 与持久化", () => {
         headers: AUTHORIZATION,
       });
       expect(evaluation.statusCode).toBe(200);
-      const decision = await bridge.inject({
+      const candidate = await bridge.inject({
         method: "POST",
-        url: `/jobs/${job.id}/decision`,
+        url: `/jobs/${job.id}/candidate`,
         headers: AUTHORIZATION,
-        payload: { decision: "apply" },
+        payload: {
+          decision: "apply",
+          note: "优先跟进",
+          applicationStatus: "applied",
+        },
       });
-      expect(decision.statusCode).toBe(200);
+      expect(candidate.statusCode).toBe(200);
 
       const response = await bridge.inject({
         method: "GET",
@@ -1226,6 +1238,11 @@ describe("decision 与持久化", () => {
       const [history] = JobListResponseSchema.parse(response.json());
       expect(history).toMatchObject({
         id: job.id,
+        latestScreening: {
+          jobId: JOB.sourceJobId,
+          matched: true,
+          reasons: [],
+        },
         latestEvaluation: {
           score: 89,
           recommendation: "apply",
@@ -1233,14 +1250,19 @@ describe("decision 与持久化", () => {
           legitimacy: "high",
           rawReport: "完整评估报告",
         },
-        decision: { jobId: job.id, decision: "apply" },
+        candidate: {
+          jobId: job.id,
+          decision: "apply",
+          note: "优先跟进",
+          applicationStatus: "applied",
+        },
       });
     } finally {
       await bridge.close();
     }
   });
 
-  it("对同一 job 幂等更新 decision", async () => {
+  it("对同一 job 幂等更新备注、用户判断和投递状态", async () => {
     const { database } = await createTempDatabase();
     const bridge = createBridge({ environment: TEST_ENVIRONMENT, database });
 
@@ -1248,25 +1270,31 @@ describe("decision 与持久化", () => {
       const job = await postJob(bridge);
       const first = await bridge.inject({
         method: "POST",
-        url: `/jobs/${job.id}/decision`,
+        url: `/jobs/${job.id}/candidate`,
         headers: AUTHORIZATION,
-        payload: { decision: "apply", reason: "匹配目标" },
+        payload: {
+          decision: "apply",
+          note: "匹配目标",
+          applicationStatus: "not_applied",
+        },
       });
       expect(first.statusCode).toBe(200);
 
       const second = await bridge.inject({
         method: "POST",
-        url: `/jobs/${job.id}/decision`,
+        url: `/jobs/${job.id}/candidate`,
         headers: AUTHORIZATION,
-        payload: { decision: "skip", outcome: "已人工确认" },
+        payload: { decision: "skip", applicationStatus: "withdrawn" },
       });
-      expect(DecisionResponseSchema.parse(second.json())).toEqual({
+      expect(CandidateRecordSchema.parse(second.json())).toEqual({
         jobId: job.id,
         decision: "skip",
-        outcome: "已人工确认",
+        note: "匹配目标",
+        applicationStatus: "withdrawn",
+        updatedAt: expect.any(String),
       });
       expect(
-        database.prepare("SELECT count(*) AS count FROM decisions").get(),
+        database.prepare("SELECT count(*) AS count FROM candidate_records").get(),
       ).toEqual({ count: 1 });
     } finally {
       await bridge.close();

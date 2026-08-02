@@ -4,7 +4,7 @@
 
 `career-ops-cn` 是一个本机运行、只读、由用户主动触发的 BOSS 直聘职位筛选与评估工具。浏览器扩展负责读取当前页面和展示结果，本地 Bridge 负责鉴权、规则筛选、SQLite 持久化，并通过本机 `career-ops` 的 `openai-eval.mjs` 生成评估。
 
-每轮扫描必须由用户主动点击触发；启动后会在当前 BOSS 搜索条件下按固定预算自动处理后续页。项目不会代表用户投递职位、发送消息或操作联系方式，用户判断也仍需手动记录。
+每轮扫描必须由用户主动点击触发；启动后会在当前 BOSS 搜索条件下按固定预算自动处理后续页。项目不会代表用户投递职位、发送消息或操作联系方式；用户判断、备注和投递状态都由用户手动记录。
 
 ## 功能
 
@@ -16,10 +16,11 @@
 - 在单职位详情页完成 JobDetail 提取、职位身份校验、Bridge 保存和 `career-ops` 评估。
 - 在保存或评估前校验职位身份，避免把职位 B 的详情保存或分析为职位 A。
 - Bridge 只监听 `127.0.0.1`，业务接口要求 Bearer token。
-- 用 SQLite 保存权威 scan run、职位、评估原文和用户主动记录的判断；关闭后重开 Side Panel 仍可读取本轮阶段、计数和已保存结果。
+- 用 SQLite 分开保存权威 scan run、职位、完整硬规则结果、AI 评估原文和用户主动记录的候选池信息；关闭后重开 Side Panel 仍可读取本轮阶段、计数和已保存结果。
 - 已处理且职位卡片输入未变化的职位复用已保存详情；相同 JD、用户资料版本、规则、Prompt、模型和输出结构生成相同 cache key，不重复调用 evaluator。
 - 职位再次出现会更新 `last_seen_at`、本轮 run 和搜索来源；JD 变化后生成新的 `jd_hash` 并重新执行详情筛选和 AI 评估，不因暂时未出现而删除职位。
-- 展示 `career-ops` score、recommendation、结构化摘要字段和完整 raw report。
+- 候选池分开展示硬规则结果与 `career-ops` score、recommendation、结构化摘要字段和完整 raw report。
+- 候选池支持用户判断、备注、投递状态、筛选和排序；当前筛选结果可导出为带 UTF-8 BOM 的 CSV 或完整 JSON。
 - 支持用户取消当前扫描，并在登录失效、challenge、账号风险或不支持布局时停止。
 - 扫描过程、翻页、职位/JD 映射、取消和错误会尽力写入 SQLite diagnostics；diagnostics 失败只显示警告，不会反转已完成的扫描结果。
 - 单职位超时、字段缺失、身份校验、布局、保存或 AI 失败只影响该职位；登录失效、challenge、账号风险、搜索页整体无法识别或连续同类 Parser 错误才停止整轮。
@@ -58,7 +59,13 @@ CAREER_OPS_CN_TOKEN=使用一个仅本机保存的随机长 token
 CAREER_OPS_CN_CAREER_OPS_ROOT=D:\Projects\career-ops
 ```
 
-可选配置包括 Bridge 端口、SQLite 路径、评估超时、JSON 格式的规则偏好，以及写入评估缓存键的 profile/Prompt/model/schema 版本；模型标识优先读取 `CAREER_OPS_CN_MODEL_ID`，未设置时沿用 `OPENAI_MODEL`，可用变量见 [.env.example](./.env.example)。
+可选配置包括 Bridge 端口、SQLite 路径、评估超时、JSON 格式的规则偏好，以及写入评估缓存键的 profile/Prompt/model/schema 版本；模型标识优先读取 `CAREER_OPS_CN_MODEL_ID`，未设置时沿用 `OPENAI_MODEL`，可用变量见 [.env.example](./.env.example)。配置完成后运行：
+
+```powershell
+pnpm doctor
+```
+
+`doctor` 会检查 Node/pnpm、Bridge token、`career-ops` evaluator、SQLite 目录、扩展构建和当前 Bridge 连接；Bridge 尚未启动只会显示警告。
 
 ## career-ops 配置
 
@@ -76,14 +83,14 @@ CAREER_OPS_CN_CAREER_OPS_ROOT=D:\Projects\career-ops
 pnpm dev:bridge
 ```
 
-构建后启动：
+日常使用先构建，再从仓库根目录启动 Bridge：
 
 ```powershell
 pnpm build
-pnpm --filter @career-ops-cn/bridge start
+pnpm start
 ```
 
-默认地址是 `http://127.0.0.1:3847`。Bridge 提供 `/health`、`/scan-runs`、`/scan-runs/latest`、scan run 进度/取消/中断接口、`/screen`、`/jobs/observe`、`/jobs`、`/jobs/:id/evaluate`、`/jobs/:id/decision` 和 `/diagnostics`；除 `GET /health` 外都要求与 `CAREER_OPS_CN_TOKEN` 一致的 Bearer token。Bridge 不支持绑定 `0.0.0.0`。
+默认地址是 `http://127.0.0.1:3847`。Bridge 提供 `/health`、`/scan-runs`、`/scan-runs/latest`、scan run 进度/取消/中断接口、`/screen`、`/jobs/observe`、`/jobs`、`/jobs/:id/evaluate`、`/jobs/:id/candidate` 和 `/diagnostics`；除 `GET /health` 外都要求与 `CAREER_OPS_CN_TOKEN` 一致的 Bearer token。Bridge 不支持绑定 `0.0.0.0`。
 
 ## Extension 加载
 
@@ -108,8 +115,10 @@ pnpm build
 4. 打开 Career Ops CN Side Panel，输入与 Bridge 一致的 token，点击“保存并检查”。
 5. 点击“刷新”确认页面类型和阻断状态。
 6. 点击“开始扫描”。单职位详情页会校验并评估当前职位；搜索页会在当前搜索条件下自动翻页，达到 3 页、60 个新职位、连续两页无新增、页面末尾或 10 分钟任一条件即停止。过程中可随时点击“取消”。
-7. 在结果列表查看硬规则原因、score、recommendation 和 raw report。需要时可由用户主动记录 Apply、Review 或 Skip 判断。
-8. 随时点击“取消”停止当前扫描。
+7. 在“候选池”中分开查看完整硬规则结果和 AI 原始结果；可按用户判断与投递状态筛选，并按最近发现、AI 分数或职位名称排序。
+8. 选择职位后记录 Apply、Review 或 Skip、备注和投递状态，再点击“保存候选池记录”。这些操作只写本机 SQLite，不会在 BOSS 上投递或联系任何人。
+9. 点击“导出 CSV”或“导出 JSON”导出当前筛选结果。CSV 带 UTF-8 BOM，Excel 直接打开时中文正常；两种格式都包含职位、硬规则、AI 原文、备注和投递状态。
+10. 随时点击“取消”停止当前扫描。
 
 关闭 Side Panel 会停止浏览器侧执行并把未完成 run 标记为 `interrupted`，不会把长任务移入 MV3 Background。重新打开后会主动读取最近 run，展示已完成页数、职位数、失败摘要和已保存结果；点击“重新开始”会新建一轮，并由 Bridge 增量复用已有详情和评估。
 
@@ -117,7 +126,7 @@ pnpm build
 
 - SQLite 默认路径：`apps/bridge/career-ops-cn.sqlite`
 - 可用 `CAREER_OPS_CN_DATABASE_PATH` 指定其他本机路径
-- 表：`scan_runs`、`jobs`、`evaluations`、`decisions`、`diagnostics`
+- 表：`scan_runs`、`jobs`、`screenings`、`evaluations`、`candidate_records`、`diagnostics`
 - Bridge token：扩展的 `chrome.storage.local`
 - 扫描配置：扩展的 `chrome.storage.local`
 - 传给 `career-ops` 的临时 JobDetail：系统临时目录，子进程结束后删除
@@ -127,6 +136,8 @@ SQLite 中会保存职位描述和完整 raw report。不要把真实数据库�
 固定清理规则：diagnostics 只保留最近 5000 条；成功 run 只保留最近 100 次；失败、取消或中断 run 约 30 天后清理；同一职位只保留最近 3 个评估版本。系统不保存整页原始 HTML。
 
 ## 故障排查
+
+先运行 `pnpm doctor`。它不会显示 token 或模型密钥的值；按 `FAIL` 项修复配置，Bridge 未启动产生的 `WARN` 可在启动后再次检查。
 
 - **Bridge 离线**：确认 `pnpm dev:bridge` 正在运行，并检查端口是否被占用。
 - **Token 无效**：确保 Side Panel 中保存的 token 与 `CAREER_OPS_CN_TOKEN` 完全一致。
@@ -144,7 +155,7 @@ SQLite 中会保存职位描述和完整 raw report。不要把真实数据库�
 
 ## 当前限制
 
-- 第一阶段只支持 BOSS 直聘网页版。
+- 当前版本只支持 BOSS 直聘网页版。
 - 自动翻页依赖 BOSS 当前页面仍能识别出“下一页”控件；站点改版后可能需要更新 Selector fixture。
 - 扫描执行仍只存在于用户主动打开的前台 Extension 上下文；Bridge/SQLite 持久化状态和结果，但关闭 Side Panel 不会在后台继续操纵 BOSS 页面。
 - BOSS 列表不提供完整 JD。卡片字段未变化时会按要求跳过重复详情读取；远端仅修改 JD、但列表字段完全不变的情况，要等后续显式读取到新详情后才能发现并生成新 `jd_hash`。
@@ -154,6 +165,8 @@ SQLite 中会保存职位描述和完整 raw report。不要把真实数据库�
 
 ## 常用命令
 
+- `pnpm doctor`：检查本机配置、evaluator、扩展构建和 Bridge 连接。
+- `pnpm start`：启动已经构建的本机 Bridge。
 - `pnpm typecheck`：检查全部 workspace 的 TypeScript 类型。
 - `pnpm test`：运行全部 Vitest 测试。
 - `pnpm build`：构建 workspace 和 Chromium MV3 扩展。

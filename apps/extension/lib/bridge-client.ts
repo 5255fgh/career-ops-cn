@@ -1,9 +1,9 @@
 import {
   BridgeErrorResponseSchema,
   BridgeSettingsSchema,
+  CandidateRecordSchema,
+  CandidateUpdateRequestSchema,
   CreateScanRunRequestSchema,
-  DecisionRequestSchema,
-  DecisionResponseSchema,
   DiagnosticEventRequestSchema,
   DiagnosticEventSchema,
   DiagnosticListResponseSchema,
@@ -22,8 +22,8 @@ import {
   ScreenRequestSchema,
   ScreenResponseSchema,
   UpdateScanRunRequestSchema,
-  type DecisionRequest,
-  type DecisionResponse,
+  type CandidateRecord,
+  type CandidateUpdateRequest,
   type DiagnosticEvent,
   type DiagnosticEventRequest,
   type EvaluationResponse,
@@ -62,7 +62,7 @@ export interface BridgeClient {
   saveJob(job: JobDetail, signal?: AbortSignal, context?: ScanJobContext): Promise<JobResponse>;
   evaluateJob(jobId: string, signal?: AbortSignal, scanRunId?: string): Promise<EvaluationResponse>;
   listJobs(signal?: AbortSignal): Promise<JobHistoryEntry[]>;
-  saveDecision(jobId: string, decision: DecisionRequest, signal?: AbortSignal): Promise<DecisionResponse>;
+  saveCandidate(jobId: string, update: CandidateUpdateRequest, signal?: AbortSignal): Promise<CandidateRecord>;
   recordDiagnostic(event: DiagnosticEventRequest, signal?: AbortSignal): Promise<DiagnosticEvent>;
   listDiagnostics(limit?: number, signal?: AbortSignal): Promise<DiagnosticEvent[]>;
 }
@@ -427,13 +427,13 @@ export function createBridgeClient({
       );
     },
 
-    async saveDecision(jobId, decision, signal) {
-      const request = DecisionRequestSchema.parse(decision);
+    async saveCandidate(jobId, update, signal) {
+      const request = CandidateUpdateRequestSchema.parse(update);
       const response = await fetchBridge(
         fetchImpl,
         normalizedBaseUrl,
         settings.bridgeToken,
-        `/jobs/${encodeURIComponent(jobId)}/decision`,
+        `/jobs/${encodeURIComponent(jobId)}/candidate`,
         {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -442,9 +442,9 @@ export function createBridgeClient({
         signal,
       );
       return parseBridgePayload(
-        DecisionResponseSchema,
+        CandidateRecordSchema,
         await readResponse(response),
-        'Decision',
+        'CandidateRecord',
       );
     },
 

@@ -1,12 +1,18 @@
 import type {
+  ApplicationStatus,
   BossPageBlock,
   BossPageType,
-  DecisionRequest,
+  CandidateDecision,
   DiagnosticEvent,
   JobHistoryEntry,
 } from '@career-ops-cn/shared';
 import type { FormEventHandler } from 'react';
 
+import type {
+  ApplicationStatusFilter,
+  CandidateDecisionFilter,
+  CandidateSort,
+} from '../../lib/candidate-pool';
 import type { ScanState, ScannedJob } from '../../lib/scan-controller';
 
 export interface PageSnapshot {
@@ -17,7 +23,6 @@ export interface PageSnapshot {
 }
 
 export type ConnectionState = 'unknown' | 'checking' | 'online' | 'offline';
-export type HistoryFilter = 'all' | DecisionRequest['decision'];
 
 export interface SidePanelViewProps {
   tokenDraft: string;
@@ -27,10 +32,18 @@ export interface SidePanelViewProps {
   pageError: string;
   scanState: ScanState;
   selectedJobId: string | null;
-  history: JobHistoryEntry[];
-  historyFilter: HistoryFilter;
+  candidates: JobHistoryEntry[];
+  candidateTotal: number;
+  candidateDecisionFilter: CandidateDecisionFilter;
+  applicationStatusFilter: ApplicationStatusFilter;
+  candidateSort: CandidateSort;
+  selectedCandidateId: string | null;
+  candidateDecision: CandidateDecision;
+  candidateNote: string;
+  applicationStatus: ApplicationStatus;
   historyError: string;
-  decisionMessage: string;
+  candidateMessage: string;
+  exportMessage: string;
   diagnostics: DiagnosticEvent[];
   diagnosticsError: string;
   onTokenChange(value: string): void;
@@ -39,10 +52,17 @@ export interface SidePanelViewProps {
   onStartScan(): void;
   onCancelScan(): void;
   onSelectJob(jobId: string): void;
-  onHistoryFilterChange(filter: HistoryFilter): void;
+  onCandidateDecisionFilterChange(filter: CandidateDecisionFilter): void;
+  onApplicationStatusFilterChange(filter: ApplicationStatusFilter): void;
+  onCandidateSortChange(sort: CandidateSort): void;
+  onSelectCandidate(jobId: string): void;
+  onCandidateDecisionChange(decision: CandidateDecision): void;
+  onCandidateNoteChange(note: string): void;
+  onApplicationStatusChange(status: ApplicationStatus): void;
   onRefreshHistory(): void;
+  onSaveCandidate(): void;
+  onExport(format: 'csv' | 'json'): void;
   onRefreshDiagnostics(): void;
-  onDecision(decision: DecisionRequest['decision']): void;
 }
 
 const ACTIVE_SCAN_STATUSES = new Set<ScanState['status']>([
@@ -90,6 +110,30 @@ function connectionLabel(state: ConnectionState): string {
   }
 }
 
+function applicationStatusLabel(value: ApplicationStatus): string {
+  switch (value) {
+    case 'applied':
+      return '已投递';
+    case 'interviewing':
+      return '面试中';
+    case 'offer':
+      return '已获 Offer';
+    case 'rejected':
+      return '未通过';
+    case 'withdrawn':
+      return '已放弃';
+    default:
+      return '未投递';
+  }
+}
+
+function screeningLabel(job: JobHistoryEntry): string {
+  if (job.latestScreening === undefined) {
+    return '待筛选';
+  }
+  return job.latestScreening.matched ? '通过' : '阻断';
+}
+
 function resultError(result: ScannedJob): string | null {
   return result.detailError ?? result.evaluationError ?? null;
 }
@@ -99,10 +143,8 @@ export function SidePanelView(props: SidePanelViewProps) {
   const selectedResult = props.scanState.results.find(
     (result) => result.card.job.jobId === props.selectedJobId,
   );
-  const visibleHistory = props.history.filter(
-    (job) =>
-      props.historyFilter === 'all' ||
-      job.decision?.decision === props.historyFilter,
+  const selectedCandidate = props.candidates.find(
+    ({ id }) => id === props.selectedCandidateId,
   );
 
   return (
@@ -341,11 +383,23 @@ export function SidePanelView(props: SidePanelViewProps) {
               <div><dt>career-ops score</dt><dd>{selectedResult.evaluation?.score ?? '—'}</dd></div>
               <div><dt>archetype</dt><dd>{selectedResult.evaluation?.archetype ?? '—'}</dd></div>
               <div><dt>legitimacy</dt><dd>{selectedResult.evaluation?.legitimacy ?? '—'}</dd></div>
-              <div><dt>用户 decision</dt><dd>{selectedResult.decision?.decision ?? '未判断'}</dd></div>
+              <div><dt>用户判断</dt><dd>{selectedResult.candidate?.decision ?? '未判断'}</dd></div>
             </dl>
             <div className="detail-copy">
               <h4>职位描述</h4>
               <p>{selectedResult.detail?.description ?? '详情尚未读取成功。'}</p>
+            </div>
+            <div className="detail-copy">
+              <h4>硬规则结果</h4>
+              <p>
+                {selectedResult.screening === undefined
+                  ? '尚无完整硬规则结果。'
+                  : selectedResult.screening.reasons.length === 0
+                    ? selectedResult.screening.matched
+                      ? '通过；未发现阻断或警告。'
+                      : '未通过。'
+                    : `${selectedResult.screening.matched ? '通过' : '阻断'}：${selectedResult.screening.reasons.join('；')}`}
+              </p>
             </div>
             <div className="detail-copy">
               <h4>rawReport</h4>
@@ -355,78 +409,193 @@ export function SidePanelView(props: SidePanelViewProps) {
         )}
       </section>
 
-      <section className="panel-section" aria-labelledby="history-heading">
+      <section className="panel-section" aria-labelledby="candidate-heading">
         <div className="section-heading">
           <div>
             <span className="section-index">07</span>
-            <h2 id="history-heading">历史职位</h2>
+            <h2 id="candidate-heading">候选池</h2>
           </div>
-          <button className="text-button" type="button" onClick={props.onRefreshHistory}>
-            刷新
-          </button>
+          <div className="header-actions">
+            <button className="text-button" type="button" onClick={() => props.onExport('csv')}>
+              导出 CSV
+            </button>
+            <button className="text-button" type="button" onClick={() => props.onExport('json')}>
+              导出 JSON
+            </button>
+            <button className="text-button" type="button" onClick={props.onRefreshHistory}>
+              刷新
+            </button>
+          </div>
         </div>
-        <label className="filter-label" htmlFor="history-filter">用户判断筛选</label>
-        <select
-          id="history-filter"
-          value={props.historyFilter}
-          onChange={(event) => props.onHistoryFilterChange(event.target.value as HistoryFilter)}
-        >
-          <option value="all">全部</option>
-          <option value="apply">Apply</option>
-          <option value="review">Review</option>
-          <option value="skip">Skip</option>
-        </select>
+        <p className="candidate-count">
+          当前显示 {props.candidates.length} / {props.candidateTotal}
+        </p>
+        <div className="filter-grid">
+          <label>
+            用户判断
+            <select
+              value={props.candidateDecisionFilter}
+              onChange={(event) =>
+                props.onCandidateDecisionFilterChange(
+                  event.target.value as CandidateDecisionFilter,
+                )
+              }
+            >
+              <option value="all">全部</option>
+              <option value="unreviewed">未判断</option>
+              <option value="apply">Apply</option>
+              <option value="review">Review</option>
+              <option value="skip">Skip</option>
+            </select>
+          </label>
+          <label>
+            投递状态
+            <select
+              value={props.applicationStatusFilter}
+              onChange={(event) =>
+                props.onApplicationStatusFilterChange(
+                  event.target.value as ApplicationStatusFilter,
+                )
+              }
+            >
+              <option value="all">全部</option>
+              <option value="not_applied">未投递</option>
+              <option value="applied">已投递</option>
+              <option value="interviewing">面试中</option>
+              <option value="offer">已获 Offer</option>
+              <option value="rejected">未通过</option>
+              <option value="withdrawn">已放弃</option>
+            </select>
+          </label>
+          <label>
+            排序
+            <select
+              value={props.candidateSort}
+              onChange={(event) =>
+                props.onCandidateSortChange(event.target.value as CandidateSort)
+              }
+            >
+              <option value="last-seen-desc">最近发现优先</option>
+              <option value="score-desc">AI 分数优先</option>
+              <option value="title-asc">职位名称</option>
+            </select>
+          </label>
+        </div>
         {props.historyError === '' ? null : (
           <p className="error-message" role="alert">{props.historyError}</p>
         )}
-        {visibleHistory.length === 0 ? (
-          <p className="empty-copy">没有符合筛选条件的历史职位。</p>
+        {props.exportMessage === '' ? null : (
+          <p className="inline-message" role="status">{props.exportMessage}</p>
+        )}
+        {props.candidates.length === 0 ? (
+          <p className="empty-copy">没有符合筛选条件的候选职位。</p>
         ) : (
           <ul className="history-list">
-            {visibleHistory.map((job) => (
+            {props.candidates.map((job) => (
               <li key={job.id}>
-                <div>
-                  <strong>{job.title}</strong>
-                  <span>{job.company}</span>
-                </div>
-                <div className="history-meta">
-                  <span>{recommendationLabel(job.latestEvaluation?.recommendation)}</span>
+                <button
+                  type="button"
+                  className={
+                    job.id === props.selectedCandidateId
+                      ? 'candidate-row candidate-row-selected'
+                      : 'candidate-row'
+                  }
+                  onClick={() => props.onSelectCandidate(job.id)}
+                >
+                  <span>
+                    <strong>{job.title}</strong>
+                    <span>{job.company}</span>
+                  </span>
                   <span>{job.latestEvaluation?.score ?? '—'} 分</span>
-                  <span>{job.decision?.decision ?? '未判断'}</span>
+                </button>
+                <div className="history-meta">
+                  <span>硬规则：{screeningLabel(job)}</span>
+                  <span>AI：{recommendationLabel(job.latestEvaluation?.recommendation)}</span>
+                  <span>判断：{job.candidate?.decision ?? '未判断'}</span>
+                  <span>
+                    状态：{applicationStatusLabel(job.candidate?.applicationStatus ?? 'not_applied')}
+                  </span>
                 </div>
+                {job.latestScreening?.reasons.length ? (
+                  <p className="rule-copy">
+                    硬规则原因：{job.latestScreening.reasons.join('；')}
+                  </p>
+                ) : null}
               </li>
             ))}
           </ul>
         )}
       </section>
 
-      <section className="panel-section" aria-labelledby="decision-heading">
+      <section className="panel-section" aria-labelledby="candidate-edit-heading">
         <div className="section-heading">
           <div>
             <span className="section-index">08</span>
-            <h2 id="decision-heading">用户判断</h2>
+            <h2 id="candidate-edit-heading">备注与投递状态</h2>
           </div>
         </div>
         <p className="decision-context">
-          {selectedResult?.savedJob === undefined
-            ? '选择一个已保存的职位后记录判断。'
-            : `${selectedResult.savedJob.title} · ${selectedResult.savedJob.company}`}
+          {selectedCandidate === undefined
+            ? '从候选池选择一个职位后编辑。'
+            : `${selectedCandidate.title} · ${selectedCandidate.company}`}
         </p>
-        <div className="decision-row">
-          {(['apply', 'review', 'skip'] as const).map((decision) => (
-            <button
-              key={decision}
-              className={`decision-button decision-${decision}`}
-              type="button"
-              disabled={selectedResult?.savedJob === undefined}
-              onClick={() => props.onDecision(decision)}
+        <div className="candidate-editor">
+          <label>
+            用户判断
+            <select
+              disabled={selectedCandidate === undefined}
+              value={props.candidateDecision}
+              onChange={(event) =>
+                props.onCandidateDecisionChange(
+                  event.target.value as CandidateDecision,
+                )
+              }
             >
-              {recommendationLabel(decision)}
-            </button>
-          ))}
+              <option value="apply">Apply</option>
+              <option value="review">Review</option>
+              <option value="skip">Skip</option>
+            </select>
+          </label>
+          <label>
+            投递状态
+            <select
+              disabled={selectedCandidate === undefined}
+              value={props.applicationStatus}
+              onChange={(event) =>
+                props.onApplicationStatusChange(
+                  event.target.value as ApplicationStatus,
+                )
+              }
+            >
+              <option value="not_applied">未投递</option>
+              <option value="applied">已投递</option>
+              <option value="interviewing">面试中</option>
+              <option value="offer">已获 Offer</option>
+              <option value="rejected">未通过</option>
+              <option value="withdrawn">已放弃</option>
+            </select>
+          </label>
+          <label>
+            备注
+            <textarea
+              disabled={selectedCandidate === undefined}
+              maxLength={4000}
+              value={props.candidateNote}
+              placeholder="记录人工判断、跟进信息或下一步"
+              onChange={(event) => props.onCandidateNoteChange(event.target.value)}
+            />
+          </label>
+          <button
+            className="button button-primary"
+            type="button"
+            disabled={selectedCandidate === undefined}
+            onClick={props.onSaveCandidate}
+          >
+            保存候选池记录
+          </button>
         </div>
-        {props.decisionMessage === '' ? null : (
-          <p className="inline-message" role="status">{props.decisionMessage}</p>
+        {props.candidateMessage === '' ? null : (
+          <p className="inline-message" role="status">{props.candidateMessage}</p>
         )}
       </section>
 

@@ -2,8 +2,9 @@ import { DatabaseSync } from "node:sqlite";
 
 import {
   BridgeErrorResponseSchema,
+  CandidateRecordSchema,
+  CandidateUpdateRequestSchema,
   CreateScanRunRequestSchema,
-  DecisionRequestSchema,
   DiagnosticEventRequestSchema,
   DiagnosticListQuerySchema,
   DiagnosticListResponseSchema,
@@ -54,7 +55,9 @@ import {
 } from "./dependencies.js";
 import {
   findJob,
+  findJobBySourceJobId,
   findEvaluationByCacheKey,
+  findScreeningByInput,
   findLatestScanRun,
   findScanRun,
   initializeDatabase,
@@ -65,10 +68,11 @@ import {
   listJobsForScanRun,
   observeJobs,
   requestScanRunCancel,
-  saveDecision,
+  saveCandidate,
   saveDiagnostic,
   saveEvaluation,
   saveJob,
+  saveScreening,
   createScanRun,
   updateScanRun,
 } from "./database.js";
@@ -229,11 +233,29 @@ function findCurrentEvaluation(
   return evaluation === undefined ? undefined : { evaluation, metadata };
 }
 
+function findCurrentScreening(
+  database: DatabaseSync,
+  config: BridgeConfig,
+  job: NonNullable<ReturnType<typeof findJob>>,
+) {
+  const detail = buildJobDetail(job);
+  if (detail === undefined || !job.identityVerified) {
+    return undefined;
+  }
+  const metadata = buildEvaluationCacheMetadata(detail, config);
+  const screening = findScreeningByInput(
+    database,
+    job.id,
+    metadata.jdHash,
+    metadata.rulesHash,
+  );
+  return screening === undefined ? undefined : { screening, metadata };
+}
+
 async function evaluateJob(
   request: FastifyRequest,
   reply: FastifyReply,
   evaluator: Evaluator,
-  screenJob: ScreenJob,
   config: BridgeConfig,
   job: NonNullable<ReturnType<typeof findJob>>,
   recordDiagnostic: (
@@ -252,28 +274,6 @@ async function evaluateJob(
     throw bridgeFailure(
       "DETAIL_IDENTITY_UNVERIFIED",
       "职位详情身份尚未验证。",
-    );
-  }
-
-  const screening = await screenJob(
-    toScreenableJob(detail),
-    toScreeningPreferences(config.preferences),
-    "detail",
-  );
-  const hardRuleBlocked = screening.decision === "block";
-  if (hardRuleBlocked) {
-    const reasons = screening.rules
-      .filter(({ decision }) => decision === "block")
-      .map(({ reason }) => reason);
-    throw bridgeFailure(
-      "HARD_RULE_BLOCKED",
-      "职位未通过完整硬规则筛选。",
-      {
-        publicMessage:
-          reasons.length === 0
-            ? "职位未通过完整硬规则筛选。"
-            : `职位未通过完整硬规则筛选：${reasons.join("；")}`,
-      },
     );
   }
 
@@ -567,15 +567,28 @@ function buildBridge(
             ? []
             : listJobsForScanRun(database, run.id).map((job) => {
                 const {
+                  latestScreening: _latestScreening,
                   latestEvaluation: _latestEvaluation,
                   ...jobWithoutEvaluation
                 } = job;
-                const current = findCurrentEvaluation(database, config, job);
+                const currentScreening = findCurrentScreening(
+                  database,
+                  config,
+                  job,
+                );
+                const currentEvaluation = findCurrentEvaluation(
+                  database,
+                  config,
+                  job,
+                );
                 return {
                   ...jobWithoutEvaluation,
-                  ...(current === undefined
+                  ...(currentScreening === undefined
                     ? {}
-                    : { latestEvaluation: current.evaluation }),
+                    : { latestScreening: currentScreening.screening }),
+                  ...(currentEvaluation === undefined
+                    ? {}
+                    : { latestEvaluation: currentEvaluation.evaluation }),
                 };
               });
         return run === undefined
@@ -687,16 +700,42 @@ function buildBridge(
       const preferences = body.data.preferences ?? config.preferences;
       const screeningPreferences = toScreeningPreferences(preferences);
       const results = await Promise.all(
-        body.data.jobs.map(async (job) =>
-          toScreeningResult(
+        body.data.jobs.map(async (job) => {
+          const result = toScreeningResult(
             job.jobId,
             await screenJob(
               toScreenableJob(job),
               screeningPreferences,
               body.data.phase,
             ),
-          ),
-        ),
+          );
+          const detail = JobDetailSchema.safeParse(job);
+          if (
+            body.data.phase === "detail" &&
+            body.data.preferences === undefined &&
+            detail.success
+          ) {
+            const savedJob = runDatabaseOperation(() =>
+              findJobBySourceJobId(database, detail.data.jobId),
+            );
+            if (savedJob !== undefined) {
+              const metadata = buildEvaluationCacheMetadata(
+                detail.data,
+                config,
+              );
+              runDatabaseOperation(() =>
+                saveScreening(
+                  database,
+                  savedJob.id,
+                  result,
+                  metadata.jdHash,
+                  metadata.rulesHash,
+                ),
+              );
+            }
+          }
+          return result;
+        }),
       );
       return reply.code(200).send(ScreenResponseSchema.parse(results));
     },
@@ -733,15 +772,34 @@ function buildBridge(
           if (observation.action === "read-detail") {
             return observation;
           }
-          const current = findCurrentEvaluation(
+          const currentScreening = findCurrentScreening(
             database,
             config,
             observation.job,
           );
+          const currentEvaluation = findCurrentEvaluation(
+            database,
+            config,
+            observation.job,
+          );
+          const {
+            latestScreening: _latestScreening,
+            latestEvaluation: _latestEvaluation,
+            ...job
+          } = observation.job;
           return {
             ...observation,
-            evaluation: current?.evaluation ?? null,
-            cacheHit: current !== undefined,
+            job: {
+              ...job,
+              ...(currentScreening === undefined
+                ? {}
+                : { latestScreening: currentScreening.screening }),
+              ...(currentEvaluation === undefined
+                ? {}
+                : { latestEvaluation: currentEvaluation.evaluation }),
+            },
+            evaluation: currentEvaluation?.evaluation ?? null,
+            cacheHit: currentEvaluation !== undefined,
           };
         }),
       );
@@ -912,6 +970,42 @@ function buildBridge(
         return sendError(reply, "DETAIL_IDENTITY_UNVERIFIED");
       }
       const metadata = buildEvaluationCacheMetadata(detail, config);
+      const currentScreening = runDatabaseOperation(() =>
+        findCurrentScreening(database, config, job),
+      );
+      const screening =
+        currentScreening?.screening ??
+        toScreeningResult(
+          detail.jobId,
+          await screenJob(
+            toScreenableJob(detail),
+            toScreeningPreferences(config.preferences),
+            "detail",
+          ),
+        );
+      if (currentScreening === undefined) {
+        runDatabaseOperation(() =>
+          saveScreening(
+            database,
+            job.id,
+            screening,
+            metadata.jdHash,
+            metadata.rulesHash,
+          ),
+        );
+      }
+      if (!screening.matched) {
+        throw bridgeFailure(
+          "HARD_RULE_BLOCKED",
+          "职位未通过完整硬规则筛选。",
+          {
+            publicMessage:
+              screening.reasons.length === 0
+                ? "职位未通过完整硬规则筛选。"
+                : `职位未通过完整硬规则筛选：${screening.reasons.join("；")}`,
+          },
+        );
+      }
       const cached = runDatabaseOperation(() =>
         findEvaluationByCacheKey(database, job.id, metadata.cacheKey),
       );
@@ -939,7 +1033,6 @@ function buildBridge(
         request,
         reply,
         evaluator,
-        screenJob,
         config,
         job,
         recordDiagnosticBestEffort,
@@ -960,7 +1053,7 @@ function buildBridge(
   );
 
   bridge.post(
-    "/jobs/:id/decision",
+    "/jobs/:id/candidate",
     {
       preHandler: async (request, reply) =>
         authenticate(request, reply, config.token),
@@ -968,7 +1061,7 @@ function buildBridge(
     async (request, reply) => {
       const params = JobIdParamsSchema.safeParse(request.params);
       const query = HealthRequestSchema.safeParse(request.query);
-      const body = DecisionRequestSchema.safeParse(request.body);
+      const body = CandidateUpdateRequestSchema.safeParse(request.body);
       if (!params.success || !query.success || !body.success) {
         return sendError(reply, "INVALID_REQUEST");
       }
@@ -978,10 +1071,12 @@ function buildBridge(
         return sendError(reply, "JOB_NOT_FOUND");
       }
 
-      const decision = runDatabaseOperation(() =>
-        saveDecision(database, params.data.id, body.data),
+      const candidate = runDatabaseOperation(() =>
+        saveCandidate(database, params.data.id, body.data),
       );
-      return reply.code(200).send(decision);
+      return reply
+        .code(200)
+        .send(CandidateRecordSchema.parse(candidate));
     },
   );
 

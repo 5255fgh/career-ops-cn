@@ -6,11 +6,12 @@ import type { ZodType } from "zod";
 import {
   AdvanceSearchPageRequestSchema,
   AdvanceSearchPageResponseSchema,
+  ApplicationStatusSchema,
   BridgeErrorResponseSchema,
   BridgeSettingsSchema,
+  CandidateRecordSchema,
+  CandidateUpdateRequestSchema,
   CreateJobRequestSchema,
-  DecisionRequestSchema,
-  DecisionResponseSchema,
   EvaluationResponseSchema,
   EvaluationResultSchema,
   HealthBadRequestResponseSchema,
@@ -24,16 +25,11 @@ import {
   ObserveJobsRequestSchema,
   ScanRunSchema,
   UpdateScanRunRequestSchema,
-  MockJobDetailRequestSchema,
-  MockJobDetailResponseSchema,
-  PageContextRequestSchema,
-  PageContextResponseSchema,
   PreferencesSchema,
   PossibleDuplicateSchema,
   ScreenRequestSchema,
   ScreenResponseSchema,
   ScreeningResultSchema,
-  UserDecisionSchema,
 } from "../src/index.js";
 
 const readFixture = (filename: string): Record<string, unknown> =>
@@ -94,11 +90,6 @@ const otherStrictContracts: Array<{
       jd: { minimumLength: 20 },
     },
   },
-  {
-    name: "UserDecision",
-    schema: UserDecisionSchema,
-    value: { jobId: "123456789", decision: "interested" },
-  },
   { name: "HealthRequest", schema: HealthRequestSchema, value: {} },
   {
     name: "HealthResponse",
@@ -111,16 +102,6 @@ const otherStrictContracts: Array<{
     value: { error: "INVALID_REQUEST" },
   },
   {
-    name: "PageContextRequest",
-    schema: PageContextRequestSchema,
-    value: { type: "page-context/request" },
-  },
-  {
-    name: "PageContextResponse",
-    schema: PageContextResponseSchema,
-    value: { type: "page-context/response", isZhipin: true },
-  },
-  {
     name: "BridgeSettings",
     schema: BridgeSettingsSchema,
     value: { bridgeToken: "test-token" },
@@ -129,19 +110,6 @@ const otherStrictContracts: Array<{
     name: "BridgeErrorResponse",
     schema: BridgeErrorResponseSchema,
     value: { error: "JOB_NOT_FOUND" },
-  },
-  {
-    name: "MockJobDetailRequest",
-    schema: MockJobDetailRequestSchema,
-    value: { type: "mock-job-detail/request" },
-  },
-  {
-    name: "MockJobDetailResponse",
-    schema: MockJobDetailResponseSchema,
-    value: {
-      type: "mock-job-detail/response",
-      job: readFixture("job-detail.json"),
-    },
   },
   {
     name: "CreateJobRequest",
@@ -193,17 +161,23 @@ const otherStrictContracts: Array<{
     },
   },
   {
-    name: "DecisionRequest",
-    schema: DecisionRequestSchema,
-    value: { decision: "review", reason: "需要人工复核" },
+    name: "CandidateUpdateRequest",
+    schema: CandidateUpdateRequestSchema,
+    value: {
+      decision: "review",
+      note: "需要人工复核",
+      applicationStatus: "not_applied",
+    },
   },
   {
-    name: "DecisionResponse",
-    schema: DecisionResponseSchema,
+    name: "CandidateRecord",
+    schema: CandidateRecordSchema,
     value: {
       jobId: "1",
       decision: "apply",
-      outcome: "已确认",
+      note: "已完成首次沟通",
+      applicationStatus: "interviewing",
+      updatedAt: "2026-08-01T11:00:00.000Z",
     },
   },
   {
@@ -281,6 +255,12 @@ describe("其余边界对象", () => {
         cacheHit: true,
       }),
     ).not.toThrow();
+  });
+
+  it("候选池更新至少包含一个字段，并限制投递状态", () => {
+    expect(() => CandidateUpdateRequestSchema.parse({})).toThrow();
+    expect(() => ApplicationStatusSchema.parse("interviewing")).not.toThrow();
+    expect(() => ApplicationStatusSchema.parse("自动投递中")).toThrow();
   });
 
   it("JobCard 拒绝非 zhipin.com URL", () => {

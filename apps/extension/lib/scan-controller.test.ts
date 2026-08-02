@@ -167,7 +167,13 @@ function bridgeMock(): BridgeClient {
       cacheHit: false,
     })),
     listJobs: vi.fn(async () => []),
-    saveDecision: vi.fn(async (jobId, decision) => ({ jobId, ...decision })),
+    saveCandidate: vi.fn(async (jobId, update) => ({
+      jobId,
+      decision: update.decision ?? null,
+      note: update.note ?? null,
+      applicationStatus: update.applicationStatus ?? 'not_applied',
+      updatedAt: '2026-08-01T10:00:00.000Z',
+    })),
     recordDiagnostic: vi.fn(async (event) => ({
       ...event,
       id: `diag-${Math.random()}`,
@@ -568,6 +574,45 @@ describe('ScanController', () => {
     expect(state.progress.cacheHits).toBe(1);
     expect(content.startDetailScan).not.toHaveBeenCalled();
     expect(bridge.evaluateJob).not.toHaveBeenCalled();
+  });
+
+  it('旧职位 cache miss 时重建完整硬规则，阻断后不调用 AI', async () => {
+    const card = visibleCard(0);
+    const content = contentMock([[card]]);
+    const bridge = bridgeMock();
+    const existing = savedFor(detailFor(card));
+    vi.mocked(bridge.observeJobs).mockResolvedValue([
+      {
+        sourceJobId: card.job.jobId,
+        action: 'reuse',
+        job: existing,
+        evaluation: null,
+        cacheHit: false,
+      },
+    ]);
+    vi.mocked(bridge.screenJobs).mockResolvedValue([
+      {
+        jobId: card.job.jobId,
+        matched: false,
+        reasons: ['命中完整硬规则'],
+      },
+    ]);
+
+    const state = await controller(content, bridge).run({ maxPages: 1 });
+
+    expect(state.status).toBe('completed');
+    expect(state.results[0]?.screening).toMatchObject({
+      matched: false,
+      reasons: ['命中完整硬规则'],
+    });
+    expect(bridge.screenJobs).toHaveBeenCalledWith(
+      [expect.objectContaining({ description: expect.any(String) })],
+      undefined,
+      expect.any(AbortSignal),
+      'detail',
+    );
+    expect(bridge.evaluateJob).not.toHaveBeenCalled();
+    expect(content.startDetailScan).not.toHaveBeenCalled();
   });
 
   it('单轮达到最长时间后以正常预算停止，不进入失控循环', async () => {

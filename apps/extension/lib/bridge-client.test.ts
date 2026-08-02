@@ -189,10 +189,21 @@ describe('Bridge client', () => {
     await expect(client.saveJob(fixtureJob)).rejects.toBeInstanceOf(BridgeUnavailableError);
   });
 
-  it('校验 health、screen、history 和 decision 的完整边界', async () => {
+  it('校验 health、screen、候选池和 diagnostics 的完整边界', async () => {
     const screening = [{ jobId: fixtureJob.jobId, matched: true, reasons: ['通过硬规则'] }];
-    const decision = { jobId: savedJob.id, decision: 'review' as const };
-    const history = [{ ...savedJob, latestEvaluation: evaluation, decision }];
+    const candidate = {
+      jobId: savedJob.id,
+      decision: 'review' as const,
+      note: '重点关注',
+      applicationStatus: 'not_applied' as const,
+      updatedAt: '2026-08-01T10:00:00.000Z',
+    };
+    const history = [{
+      ...savedJob,
+      latestScreening: screening[0],
+      latestEvaluation: evaluation,
+      candidate,
+    }];
     const diagnosticRequest = {
       source: 'extension' as const,
       level: 'info' as const,
@@ -211,7 +222,7 @@ describe('Bridge client', () => {
       .mockResolvedValueOnce(jsonResponse({ status: 'ok' }))
       .mockResolvedValueOnce(jsonResponse(screening))
       .mockResolvedValueOnce(jsonResponse(history))
-      .mockResolvedValueOnce(jsonResponse(decision))
+      .mockResolvedValueOnce(jsonResponse(candidate))
       .mockResolvedValueOnce(jsonResponse(diagnostic))
       .mockResolvedValueOnce(jsonResponse([diagnostic]));
     const client = createBridgeClient({ token: 'test-token', fetchImpl: fetchMock });
@@ -219,9 +230,13 @@ describe('Bridge client', () => {
     await expect(client.health()).resolves.toBe(true);
     await expect(client.screenJobs([fixtureCard])).resolves.toEqual(screening);
     await expect(client.listJobs()).resolves.toEqual(history);
-    await expect(client.saveDecision(savedJob.id, { decision: 'review' })).resolves.toEqual(
-      decision,
-    );
+    await expect(
+      client.saveCandidate(savedJob.id, {
+        decision: 'review',
+        note: '重点关注',
+        applicationStatus: 'not_applied',
+      }),
+    ).resolves.toEqual(candidate);
     await expect(client.recordDiagnostic(diagnosticRequest)).resolves.toEqual(diagnostic);
     await expect(client.listDiagnostics(20)).resolves.toEqual([diagnostic]);
 
@@ -229,7 +244,7 @@ describe('Bridge client', () => {
       'http://127.0.0.1:3847/health',
       'http://127.0.0.1:3847/screen',
       'http://127.0.0.1:3847/jobs',
-      'http://127.0.0.1:3847/jobs/job-1/decision',
+      'http://127.0.0.1:3847/jobs/job-1/candidate',
       'http://127.0.0.1:3847/diagnostics',
       'http://127.0.0.1:3847/diagnostics?limit=20',
     ]);

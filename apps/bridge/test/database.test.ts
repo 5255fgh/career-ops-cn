@@ -2,7 +2,11 @@ import { DatabaseSync } from "node:sqlite";
 
 import { afterEach, describe, expect, it } from "vitest";
 
-import { findJob, initializeDatabase } from "../src/database.js";
+import {
+  findJob,
+  findJobHistory,
+  initializeDatabase,
+} from "../src/database.js";
 
 const databases: DatabaseSync[] = [];
 
@@ -82,6 +86,9 @@ describe("SQLite migration", () => {
         ('legacy-evaluation-3', 'legacy-job', 82, 'review', '旧评估 3'),
         ('legacy-evaluation-4', 'legacy-job', 83, 'review', '旧评估 4'),
         ('legacy-evaluation-5', 'legacy-job', 84, 'apply', '旧评估 5');
+
+      INSERT INTO decisions (job_id, decision, reason, outcome)
+      VALUES ('legacy-job', 'apply', '旧备注', 'applied');
     `);
 
     expect(() => initializeDatabase(database)).not.toThrow();
@@ -90,6 +97,9 @@ describe("SQLite migration", () => {
       .prepare("SELECT name FROM sqlite_schema WHERE type = 'table'")
       .all() as Array<{ name: string }>;
     expect(tables.map(({ name }) => name)).toContain("scan_runs");
+    expect(tables.map(({ name }) => name)).toContain("candidate_records");
+    expect(tables.map(({ name }) => name)).toContain("screenings");
+    expect(tables.map(({ name }) => name)).not.toContain("decisions");
 
     const jobColumns = database
       .prepare("PRAGMA table_info(jobs)")
@@ -128,6 +138,12 @@ describe("SQLite migration", () => {
       lastSeenAt: expect.any(String),
       jdHash: expect.stringMatching(/^[a-f0-9]{64}$/u),
       identityVerified: false,
+    });
+    expect(findJobHistory(database, "legacy-job")?.candidate).toMatchObject({
+      jobId: "legacy-job",
+      decision: "apply",
+      note: "旧备注",
+      applicationStatus: "applied",
     });
     expect(
       database

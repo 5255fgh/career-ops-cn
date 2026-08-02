@@ -2,15 +2,16 @@ import { randomUUID } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
 
 import {
-  DecisionResponseSchema,
+  CandidateRecordSchema,
   DiagnosticEventRequestSchema,
   DiagnosticEventSchema,
   EvaluationResultSchema,
   JobHistoryEntrySchema,
   JobResponseSchema,
   ScanRunSchema,
-  type DecisionRequest,
-  type DecisionResponse,
+  ScreeningResultSchema,
+  type CandidateRecord,
+  type CandidateUpdateRequest,
   type DiagnosticEvent,
   type DiagnosticEventRequest,
   type EvaluationResult,
@@ -19,6 +20,7 @@ import {
   type JobResponse,
   type SaveJobRequest,
   type ScanRun,
+  type ScreeningResult,
   type UpdateScanRunRequest,
 } from "@career-ops-cn/shared";
 
@@ -65,11 +67,22 @@ interface EvaluationRow {
   legitimacy: string | null;
 }
 
-interface DecisionRow {
+interface CandidateRow {
   job_id: string;
-  decision: string;
-  reason: string | null;
-  outcome: string | null;
+  decision: string | null;
+  note: string | null;
+  application_status: string;
+  updated_at: string;
+}
+
+interface ScreeningRow {
+  job_id: string;
+  source_job_id: string;
+  matched: number;
+  reasons_json: string;
+  jd_hash: string;
+  rules_hash: string;
+  created_at: string;
 }
 
 interface DiagnosticRow {
@@ -194,6 +207,54 @@ function tableColumns(database: DatabaseSync, table: string): Set<string> {
         ColumnRow[]
     ).map(({ name }) => name),
   );
+}
+
+function tableExists(database: DatabaseSync, table: string): boolean {
+  const row = database
+    .prepare(
+      "SELECT 1 AS found FROM sqlite_master WHERE type = 'table' AND name = ?",
+    )
+    .get(table) as { found?: number } | undefined;
+  return row?.found === 1;
+}
+
+function migrateLegacyDecisions(database: DatabaseSync): void {
+  if (!tableExists(database, "decisions")) {
+    return;
+  }
+
+  const migratedAt = new Date().toISOString();
+  database
+    .prepare(
+      `INSERT OR IGNORE INTO candidate_records (
+         job_id, decision, note, application_status, updated_at
+       )
+       SELECT job_id,
+              decision,
+              CASE
+                WHEN outcome IN (
+                  'not_applied', 'applied', 'interviewing', 'offer',
+                  'rejected', 'withdrawn'
+                ) THEN reason
+                WHEN reason IS NOT NULL AND outcome IS NOT NULL
+                  THEN reason || char(10) || '旧状态：' || outcome
+                WHEN reason IS NOT NULL THEN reason
+                WHEN outcome IS NOT NULL THEN '旧状态：' || outcome
+                ELSE NULL
+              END,
+              CASE outcome
+                WHEN 'applied' THEN 'applied'
+                WHEN 'interviewing' THEN 'interviewing'
+                WHEN 'offer' THEN 'offer'
+                WHEN 'rejected' THEN 'rejected'
+                WHEN 'withdrawn' THEN 'withdrawn'
+                ELSE 'not_applied'
+              END,
+              ?
+       FROM decisions`,
+    )
+    .run(migratedAt);
+  database.exec("DROP TABLE decisions");
 }
 
 function addMissingColumns(
@@ -350,11 +411,25 @@ export function initializeDatabase(database: DatabaseSync): void {
       latency_ms INTEGER CHECK (latency_ms IS NULL OR latency_ms >= 0)
     ) STRICT;
 
-    CREATE TABLE IF NOT EXISTS decisions (
+    CREATE TABLE IF NOT EXISTS screenings (
       job_id TEXT PRIMARY KEY NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
-      decision TEXT NOT NULL CHECK (decision IN ('apply', 'review', 'skip')),
-      reason TEXT,
-      outcome TEXT
+      source_job_id TEXT NOT NULL,
+      matched INTEGER NOT NULL CHECK (matched IN (0, 1)),
+      reasons_json TEXT NOT NULL,
+      jd_hash TEXT NOT NULL,
+      rules_hash TEXT NOT NULL,
+      created_at TEXT NOT NULL
+    ) STRICT;
+
+    CREATE TABLE IF NOT EXISTS candidate_records (
+      job_id TEXT PRIMARY KEY NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+      decision TEXT CHECK (decision IS NULL OR decision IN ('apply', 'review', 'skip')),
+      note TEXT,
+      application_status TEXT NOT NULL DEFAULT 'not_applied'
+        CHECK (application_status IN (
+          'not_applied', 'applied', 'interviewing', 'offer', 'rejected', 'withdrawn'
+        )),
+      updated_at TEXT NOT NULL
     ) STRICT;
 
     CREATE TABLE IF NOT EXISTS diagnostics (
@@ -377,6 +452,7 @@ export function initializeDatabase(database: DatabaseSync): void {
 
   addMissingColumns(database, "jobs", JOB_COLUMNS);
   addMissingColumns(database, "evaluations", EVALUATION_COLUMNS);
+  migrateLegacyDecisions(database);
   backfillJobMetadata(database);
 
   database.exec(`
@@ -390,6 +466,9 @@ export function initializeDatabase(database: DatabaseSync): void {
     CREATE UNIQUE INDEX IF NOT EXISTS evaluations_job_cache_key_idx
       ON evaluations (job_id, cache_key)
       WHERE cache_key IS NOT NULL;
+
+    CREATE INDEX IF NOT EXISTS screenings_input_idx
+      ON screenings (job_id, jd_hash, rules_hash);
 
     CREATE INDEX IF NOT EXISTS diagnostics_created_at_idx
       ON diagnostics (created_at DESC);
@@ -581,6 +660,16 @@ export function findJob(
   return row === undefined ? undefined : rowToJob(row);
 }
 
+export function findJobBySourceJobId(
+  database: DatabaseSync,
+  sourceJobId: string,
+): JobResponse | undefined {
+  const row = database
+    .prepare("SELECT * FROM jobs WHERE source = 'boss' AND source_job_id = ?")
+    .get(sourceJobId) as JobRow | undefined;
+  return row === undefined ? undefined : rowToJob(row);
+}
+
 function evaluationRowToResult(row: EvaluationRow): EvaluationResult {
   return EvaluationResultSchema.parse({
     score: row.score,
@@ -590,6 +679,24 @@ function evaluationRowToResult(row: EvaluationRow): EvaluationResult {
     ...(row.role === null ? {} : { role: row.role }),
     ...(row.archetype === null ? {} : { archetype: row.archetype }),
     ...(row.legitimacy === null ? {} : { legitimacy: row.legitimacy }),
+  });
+}
+
+function screeningRowToResult(row: ScreeningRow): ScreeningResult {
+  return ScreeningResultSchema.parse({
+    jobId: row.source_job_id,
+    matched: row.matched === 1,
+    reasons: JSON.parse(row.reasons_json) as unknown,
+  });
+}
+
+function candidateRowToRecord(row: CandidateRow): CandidateRecord {
+  return CandidateRecordSchema.parse({
+    jobId: row.job_id,
+    decision: row.decision,
+    note: row.note,
+    applicationStatus: row.application_status,
+    updatedAt: row.updated_at,
   });
 }
 
@@ -607,29 +714,24 @@ function rowToJobHistory(
        LIMIT 1`,
     )
     .get(row.id) as EvaluationRow | undefined;
-  const decisionRow = database
-    .prepare("SELECT * FROM decisions WHERE job_id = ?")
-    .get(row.id) as DecisionRow | undefined;
+  const screeningRow = database
+    .prepare("SELECT * FROM screenings WHERE job_id = ?")
+    .get(row.id) as ScreeningRow | undefined;
+  const candidateRow = database
+    .prepare("SELECT * FROM candidate_records WHERE job_id = ?")
+    .get(row.id) as CandidateRow | undefined;
 
   return JobHistoryEntrySchema.parse({
     ...rowToJob(row),
+    ...(screeningRow === undefined
+      ? {}
+      : { latestScreening: screeningRowToResult(screeningRow) }),
     ...(evaluationRow === undefined
       ? {}
       : { latestEvaluation: evaluationRowToResult(evaluationRow) }),
-    ...(decisionRow === undefined
+    ...(candidateRow === undefined
       ? {}
-      : {
-          decision: DecisionResponseSchema.parse({
-            jobId: decisionRow.job_id,
-            decision: decisionRow.decision,
-            ...(decisionRow.reason === null
-              ? {}
-              : { reason: decisionRow.reason }),
-            ...(decisionRow.outcome === null
-              ? {}
-              : { outcome: decisionRow.outcome }),
-          }),
-        }),
+      : { candidate: candidateRowToRecord(candidateRow) }),
   });
 }
 
@@ -767,6 +869,59 @@ export function findEvaluationByCacheKey(
   return row === undefined ? undefined : evaluationRowToResult(row);
 }
 
+export function findScreeningByInput(
+  database: DatabaseSync,
+  jobId: string,
+  jdHash: string,
+  rulesHash: string,
+): ScreeningResult | undefined {
+  const row = database
+    .prepare(
+      `SELECT * FROM screenings
+       WHERE job_id = ? AND jd_hash = ? AND rules_hash = ?`,
+    )
+    .get(jobId, jdHash, rulesHash) as ScreeningRow | undefined;
+  return row === undefined ? undefined : screeningRowToResult(row);
+}
+
+export function saveScreening(
+  database: DatabaseSync,
+  jobId: string,
+  screening: ScreeningResult,
+  jdHash: string,
+  rulesHash: string,
+): ScreeningResult {
+  const parsed = ScreeningResultSchema.parse(screening);
+  const row = database
+    .prepare(
+      `INSERT INTO screenings (
+         job_id, source_job_id, matched, reasons_json, jd_hash, rules_hash,
+         created_at
+       ) VALUES (?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT (job_id) DO UPDATE SET
+         source_job_id = excluded.source_job_id,
+         matched = excluded.matched,
+         reasons_json = excluded.reasons_json,
+         jd_hash = excluded.jd_hash,
+         rules_hash = excluded.rules_hash,
+         created_at = excluded.created_at
+       RETURNING *`,
+    )
+    .get(
+      jobId,
+      parsed.jobId,
+      parsed.matched ? 1 : 0,
+      JSON.stringify(parsed.reasons),
+      jdHash,
+      rulesHash,
+      new Date().toISOString(),
+    ) as ScreeningRow | undefined;
+  if (row === undefined) {
+    throw new Error("保存硬规则结果后未能读取记录。");
+  }
+  return screeningRowToResult(row);
+}
+
 export function saveEvaluation(
   database: DatabaseSync,
   jobId: string,
@@ -821,40 +976,49 @@ export function saveEvaluation(
     .run(jobId, jobId, MAX_EVALUATIONS_PER_JOB);
 }
 
-export function saveDecision(
+export function saveCandidate(
   database: DatabaseSync,
   jobId: string,
-  decision: DecisionRequest,
-): DecisionResponse {
+  update: CandidateUpdateRequest,
+): CandidateRecord {
+  const existing = database
+    .prepare("SELECT * FROM candidate_records WHERE job_id = ?")
+    .get(jobId) as CandidateRow | undefined;
+  const decision =
+    update.decision === undefined
+      ? existing?.decision ?? null
+      : update.decision;
+  const note = update.note === undefined ? existing?.note ?? null : update.note;
+  const applicationStatus =
+    update.applicationStatus ?? existing?.application_status ?? "not_applied";
   const row = database
     .prepare(
       `
-        INSERT INTO decisions (job_id, decision, reason, outcome)
-        VALUES (?, ?, ?, ?)
+        INSERT INTO candidate_records (
+          job_id, decision, note, application_status, updated_at
+        )
+        VALUES (?, ?, ?, ?, ?)
         ON CONFLICT (job_id) DO UPDATE SET
           decision = excluded.decision,
-          reason = excluded.reason,
-          outcome = excluded.outcome
+          note = excluded.note,
+          application_status = excluded.application_status,
+          updated_at = excluded.updated_at
         RETURNING *
       `,
     )
     .get(
       jobId,
-      decision.decision,
-      decision.reason ?? null,
-      decision.outcome ?? null,
-    ) as DecisionRow | undefined;
+      decision,
+      note,
+      applicationStatus,
+      new Date().toISOString(),
+    ) as CandidateRow | undefined;
 
   if (row === undefined) {
-    throw new Error("保存决策后未能读取记录。");
+    throw new Error("保存候选池记录后未能读取记录。");
   }
 
-  return DecisionResponseSchema.parse({
-    jobId: row.job_id,
-    decision: row.decision,
-    ...(row.reason === null ? {} : { reason: row.reason }),
-    ...(row.outcome === null ? {} : { outcome: row.outcome }),
-  });
+  return candidateRowToRecord(row);
 }
 
 function diagnosticRowToEvent(row: DiagnosticRow): DiagnosticEvent {

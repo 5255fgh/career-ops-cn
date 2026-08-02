@@ -188,6 +188,27 @@ try {
   );
   assert.deepEqual(evaluation, evaluationFixture);
 
+  const candidateResponse = await fetch(
+    `${bridgeBaseUrl}/jobs/${encodeURIComponent(savedJob.id)}/candidate`,
+    {
+      method: "POST",
+      headers: {
+        ...authorization,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        decision: "apply",
+        note: "smoke 备注",
+        applicationStatus: "not_applied",
+      }),
+    },
+  );
+  assert.equal(candidateResponse.status, 200);
+  const candidate = shared.CandidateRecordSchema.parse(
+    await candidateResponse.json(),
+  );
+  assert.equal(candidate.note, "smoke 备注");
+
   const finishRunResponse = await fetch(
     `${bridgeBaseUrl}/scan-runs/${encodeURIComponent(scanRun.id)}/progress`,
     {
@@ -220,6 +241,9 @@ try {
   );
   assert.equal(latestRun?.run.id, scanRun.id);
   assert.equal(latestRun?.jobs.length, 1);
+  assert.equal(latestRun?.jobs[0]?.latestScreening?.matched, true);
+  assert.equal(latestRun?.jobs[0]?.latestEvaluation?.score, evaluation.score);
+  assert.equal(latestRun?.jobs[0]?.candidate?.note, "smoke 备注");
 
   const tables = database
     .prepare(
@@ -228,11 +252,12 @@ try {
     .all()
     .map((row) => row.name);
   assert.deepEqual(tables, [
-    "decisions",
+    "candidate_records",
     "diagnostics",
     "evaluations",
     "jobs",
     "scan_runs",
+    "screenings",
   ]);
 
   const jobCount = database.prepare("SELECT count(*) AS count FROM jobs").get();
@@ -250,6 +275,10 @@ try {
     recommendation: evaluationFixture.recommendation,
     raw_report: evaluationFixture.rawReport,
   });
+  const savedScreening = database
+    .prepare("SELECT matched, reasons_json FROM screenings WHERE job_id = ?")
+    .get(savedJob.id);
+  assert.deepEqual({ ...savedScreening }, { matched: 1, reasons_json: "[]" });
 } finally {
   if (bridge !== undefined) {
     await bridge.close();
@@ -259,5 +288,5 @@ try {
 }
 
 console.log(
-  "smoke: ok (fixtures, extension manifest, Scan Run -> Job -> Evaluation)",
+  "smoke: ok (fixtures, extension manifest, Scan Run -> Job -> Screening -> Evaluation -> Candidate)",
 );

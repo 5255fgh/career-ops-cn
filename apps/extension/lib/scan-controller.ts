@@ -2,7 +2,7 @@ import {
   JobResponseSchema,
   ScanConfigSchema,
   type BossPageBlockReason,
-  type DecisionResponse,
+  type CandidateRecord,
   type DiagnosticEventRequest,
   type EvaluationResult,
   type JobCard,
@@ -81,10 +81,9 @@ export interface ScannedJob {
   detail?: JobDetail;
   savedJob?: JobResponse;
   evaluation?: EvaluationResult;
-  decision?: DecisionResponse;
+  candidate?: CandidateRecord;
   detailError?: string;
   evaluationError?: string;
-  reused?: boolean;
 }
 
 export interface ScanState {
@@ -257,8 +256,9 @@ function scannedJobFromHistory(
   evaluation: EvaluationResult | null,
 ): ScannedJob {
   const {
+    latestScreening,
     latestEvaluation: _latestEvaluation,
-    decision: _decision,
+    candidate,
     ...jobResponse
   } = job;
   const detail = jobDetailFromHistory(job);
@@ -266,9 +266,9 @@ function scannedJobFromHistory(
     card,
     ...(detail === undefined ? {} : { detail }),
     savedJob: JobResponseSchema.parse(jobResponse),
+    ...(latestScreening === undefined ? {} : { screening: latestScreening }),
     ...(evaluation === null ? {} : { evaluation }),
-    ...(job.decision === undefined ? {} : { decision: job.decision }),
-    reused: true,
+    ...(candidate === undefined ? {} : { candidate }),
   };
 }
 
@@ -728,6 +728,20 @@ export class ScanController {
       return this.currentState;
     }
 
+    let savedJob: JobResponse | undefined;
+    try {
+      savedJob = await this.bridge.saveJob(detail, controller.signal, {
+        scanRunId: this.currentScanId,
+        sourceQuery: this.sourceQuery,
+      });
+      this.updateResult(detail.jobId, { savedJob });
+    } catch (error) {
+      if (controller.signal.aborted || isAbortError(error)) {
+        throw error;
+      }
+      this.appendDetailError(detail.jobId, `保存职位失败：${errorMessage(error)}`);
+    }
+
     let screening: ScreeningResult | undefined;
     try {
       [screening] = await this.bridge.screenJobs(
@@ -748,20 +762,6 @@ export class ScanController {
         detail.jobId,
         `完整筛选失败：${errorMessage(error)}`,
       );
-    }
-
-    let savedJob: JobResponse | undefined;
-    try {
-      savedJob = await this.bridge.saveJob(detail, controller.signal, {
-        scanRunId: this.currentScanId,
-        sourceQuery: this.sourceQuery,
-      });
-      this.updateResult(detail.jobId, { savedJob });
-    } catch (error) {
-      if (controller.signal.aborted || isAbortError(error)) {
-        throw error;
-      }
-      this.appendDetailError(detail.jobId, `保存职位失败：${errorMessage(error)}`);
     }
 
     if (screening?.matched === true && savedJob !== undefined && maxAiJobs > 0) {
@@ -1013,6 +1013,32 @@ export class ScanController {
           pageCards.push(card);
         }
 
+        let reusedScreenedJobs = 0;
+        for (const result of reusedResults) {
+          if (result.screening !== undefined || result.detail === undefined) {
+            continue;
+          }
+          try {
+            const [screening] = await this.bridge.screenJobs(
+              [result.detail],
+              undefined,
+              controller.signal,
+              'detail',
+            );
+            if (screening === undefined) {
+              result.detailError = '完整筛选未返回该职位结果。';
+            } else {
+              result.screening = screening;
+              reusedScreenedJobs += 1;
+            }
+          } catch (error) {
+            if (controller.signal.aborted || isAbortError(error)) {
+              throw error;
+            }
+            result.detailError = `完整筛选失败：${errorMessage(error)}`;
+          }
+        }
+
         if (reusedResults.length > 0) {
           this.update({
             results: [...this.currentState.results, ...reusedResults],
@@ -1020,6 +1046,8 @@ export class ScanController {
         }
         this.updateProgress({
           newJobs: this.currentState.progress.newJobs + pageNewJobs,
+          screenedJobs:
+            this.currentState.progress.screenedJobs + reusedScreenedJobs,
           aiCompleted: this.currentState.progress.aiCompleted + pageCacheHits,
           aiTarget: this.currentState.progress.aiTarget + pageCacheHits,
           aiSuccess: this.currentState.progress.aiSuccess + pageCacheHits,
@@ -1268,7 +1296,7 @@ export class ScanController {
           } =>
             result.savedJob !== undefined &&
             result.evaluation === undefined &&
-            (result.reused === true || result.screening?.matched === true),
+            result.screening?.matched === true,
         )
         .slice(0, Math.max(0, maxAiJobs));
       this.update({ status: 'evaluating' });
@@ -1488,12 +1516,12 @@ export class ScanController {
     ]);
   }
 
-  recordDecision(decision: DecisionResponse): void {
+  recordCandidate(candidate: CandidateRecord): void {
     const result = this.currentState.results.find(
-      (candidate) => candidate.savedJob?.id === decision.jobId,
+      (entry) => entry.savedJob?.id === candidate.jobId,
     );
     if (result !== undefined) {
-      this.updateResult(result.card.job.jobId, { decision });
+      this.updateResult(result.card.job.jobId, { candidate });
     }
   }
 }

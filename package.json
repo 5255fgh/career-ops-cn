@@ -9,6 +9,8 @@
     "pnpm": ">=11 <12"
   },
   "scripts": {
+    "start": "pnpm --filter @career-ops-cn/bridge start",
+    "doctor": "node --env-file-if-exists=.env scripts/doctor.mjs",
     "dev:extension": "pnpm --filter @career-ops-cn/extension dev",
     "dev:bridge": "pnpm --filter @career-ops-cn/bridge dev",
     "typecheck": "pnpm -r --if-present typecheck",
