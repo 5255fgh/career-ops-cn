@@ -2,6 +2,10 @@ import { z } from "zod";
 
 const NonEmptyTextSchema = z.string().trim().min(1);
 
+export const Sha256Schema = z.string().regex(/^[a-f0-9]{64}$/u);
+
+export const SourceQuerySchema = NonEmptyTextSchema.max(2_048);
+
 const ZhipinUrlSchema = z
   .string()
   .url()
@@ -54,6 +58,13 @@ export const CreateJobRequestSchema = z.strictObject({
 
 export type CreateJobRequest = z.infer<typeof CreateJobRequestSchema>;
 
+export const SaveJobRequestSchema = CreateJobRequestSchema.extend({
+  scanRunId: NonEmptyTextSchema.optional(),
+  sourceQuery: SourceQuerySchema.optional(),
+}).strict();
+
+export type SaveJobRequest = z.infer<typeof SaveJobRequestSchema>;
+
 export const PossibleDuplicateSchema = z.strictObject({
   jobId: NonEmptyTextSchema,
   reason: z.literal("same_company_and_title"),
@@ -63,6 +74,11 @@ export type PossibleDuplicate = z.infer<typeof PossibleDuplicateSchema>;
 
 export const JobResponseSchema = CreateJobRequestSchema.extend({
   id: NonEmptyTextSchema,
+  firstSeenAt: z.string().datetime(),
+  lastSeenAt: z.string().datetime(),
+  jdHash: Sha256Schema.optional(),
+  lastScanRunId: NonEmptyTextSchema.optional(),
+  sourceQuery: SourceQuerySchema.optional(),
   possibleDuplicate: PossibleDuplicateSchema.optional(),
 }).strict();
 
@@ -148,6 +164,19 @@ export const EvaluationResultSchema = z.strictObject({
 });
 
 export type EvaluationResult = z.infer<typeof EvaluationResultSchema>;
+
+export const EvaluateJobRequestSchema = z.strictObject({
+  scanRunId: NonEmptyTextSchema.optional(),
+});
+
+export type EvaluateJobRequest = z.infer<typeof EvaluateJobRequestSchema>;
+
+export const EvaluationResponseSchema = z.strictObject({
+  evaluation: EvaluationResultSchema,
+  cacheHit: z.boolean(),
+});
+
+export type EvaluationResponse = z.infer<typeof EvaluationResponseSchema>;
 
 export const DecisionRequestSchema = z.strictObject({
   decision: z.enum(["apply", "review", "skip"]),
@@ -276,6 +305,129 @@ export const ScanConfigSchema = z.strictObject({
 
 export type ScanConfig = z.infer<typeof ScanConfigSchema>;
 
+export const ScanRunStatusSchema = z.enum([
+  "running",
+  "completed",
+  "cancelled",
+  "interrupted",
+  "failed",
+]);
+
+export type ScanRunStatus = z.infer<typeof ScanRunStatusSchema>;
+
+export const ScanRunPhaseSchema = z.enum([
+  "starting",
+  "reading-list",
+  "screening",
+  "reading-details",
+  "evaluating",
+  "finished",
+]);
+
+export type ScanRunPhase = z.infer<typeof ScanRunPhaseSchema>;
+
+export const ScanRunSchema = z.strictObject({
+  id: NonEmptyTextSchema,
+  status: ScanRunStatusSchema,
+  phase: ScanRunPhaseSchema,
+  startedAt: z.string().datetime(),
+  updatedAt: z.string().datetime(),
+  finishedAt: z.string().datetime().nullable(),
+  pageCount: z.number().int().nonnegative(),
+  discoveredCount: z.number().int().nonnegative(),
+  newJobCount: z.number().int().nonnegative(),
+  detailSuccessCount: z.number().int().nonnegative(),
+  detailFailureCount: z.number().int().nonnegative(),
+  aiSuccessCount: z.number().int().nonnegative(),
+  aiFailureCount: z.number().int().nonnegative(),
+  cacheHitCount: z.number().int().nonnegative(),
+  stopReason: NonEmptyTextSchema.nullable(),
+  errorSummary: NonEmptyTextSchema.nullable(),
+  cancelRequested: z.boolean(),
+});
+
+export type ScanRun = z.infer<typeof ScanRunSchema>;
+
+export const CreateScanRunRequestSchema = z.strictObject({});
+
+export const ScanRunIdParamsSchema = z.strictObject({
+  id: NonEmptyTextSchema,
+});
+
+export const UpdateScanRunRequestSchema = z
+  .strictObject({
+    status: ScanRunStatusSchema.optional(),
+    phase: ScanRunPhaseSchema.optional(),
+    pageCount: z.number().int().nonnegative().optional(),
+    discoveredCount: z.number().int().nonnegative().optional(),
+    newJobCount: z.number().int().nonnegative().optional(),
+    detailSuccessCount: z.number().int().nonnegative().optional(),
+    detailFailureCount: z.number().int().nonnegative().optional(),
+    aiSuccessCount: z.number().int().nonnegative().optional(),
+    aiFailureCount: z.number().int().nonnegative().optional(),
+    cacheHitCount: z.number().int().nonnegative().optional(),
+    stopReason: NonEmptyTextSchema.max(256).nullable().optional(),
+    errorSummary: NonEmptyTextSchema.max(2_000).nullable().optional(),
+  })
+  .refine((value) => Object.keys(value).length > 0, {
+    message: "至少需要更新一个 scan run 字段。",
+  });
+
+export type UpdateScanRunRequest = z.infer<
+  typeof UpdateScanRunRequestSchema
+>;
+
+export const RequestScanRunCancelSchema = z.strictObject({});
+
+export const InterruptScanRunRequestSchema = z.strictObject({
+  reason: NonEmptyTextSchema.max(256).optional(),
+  errorSummary: NonEmptyTextSchema.max(2_000).optional(),
+});
+
+export type InterruptScanRunRequest = z.infer<
+  typeof InterruptScanRunRequestSchema
+>;
+
+const ReadDetailObservationSchema = z.strictObject({
+  sourceJobId: NonEmptyTextSchema,
+  action: z.literal("read-detail"),
+  reason: z.enum(["new", "card-changed", "missing-detail"]),
+});
+
+const ReuseObservationSchema = z.strictObject({
+  sourceJobId: NonEmptyTextSchema,
+  action: z.literal("reuse"),
+  job: JobHistoryEntrySchema,
+  evaluation: EvaluationResultSchema.nullable(),
+  cacheHit: z.boolean(),
+});
+
+export const JobObservationSchema = z.discriminatedUnion("action", [
+  ReadDetailObservationSchema,
+  ReuseObservationSchema,
+]);
+
+export type JobObservation = z.infer<typeof JobObservationSchema>;
+
+export const ObserveJobsRequestSchema = z.strictObject({
+  scanRunId: NonEmptyTextSchema,
+  sourceQuery: SourceQuerySchema,
+  jobs: z.array(JobCardSchema).min(1).max(200),
+});
+
+export type ObserveJobsRequest = z.infer<typeof ObserveJobsRequestSchema>;
+
+export const ObserveJobsResponseSchema = z.array(JobObservationSchema);
+
+export const ScanRunSnapshotSchema = z.strictObject({
+  run: ScanRunSchema,
+  jobs: JobListResponseSchema,
+});
+
+export type ScanRunSnapshot = z.infer<typeof ScanRunSnapshotSchema>;
+
+export const LatestScanRunResponseSchema = ScanRunSnapshotSchema.nullable();
+
 export const BossPageTypeSchema = z.enum([
   "search-list",
   "search-detail-panel",
@@ -322,6 +474,7 @@ export const DetectPageResponseSchema = z.strictObject({
   type: z.literal("boss/detect-page/response"),
   pageType: BossPageTypeSchema,
   block: BossPageBlockSchema.nullable(),
+  sourceQuery: SourceQuerySchema.optional(),
 });
 
 export type DetectPageResponse = z.infer<typeof DetectPageResponseSchema>;

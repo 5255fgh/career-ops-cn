@@ -121,13 +121,28 @@ try {
   });
   const authorization = { Authorization: "Bearer smoke-token" };
 
+  const createRunResponse = await fetch(`${bridgeBaseUrl}/scan-runs`, {
+    method: "POST",
+    headers: {
+      ...authorization,
+      "Content-Type": "application/json",
+    },
+    body: "{}",
+  });
+  assert.equal(createRunResponse.status, 200);
+  const scanRun = shared.ScanRunSchema.parse(await createRunResponse.json());
+
   const createJobResponse = await fetch(`${bridgeBaseUrl}/jobs`, {
     method: "POST",
     headers: {
       ...authorization,
       "Content-Type": "application/json",
     },
-    body: JSON.stringify(createJobRequest),
+    body: JSON.stringify({
+      ...createJobRequest,
+      scanRunId: scanRun.id,
+      sourceQuery: "boss:/web/geek/job?query=TypeScript",
+    }),
   });
   assert.equal(createJobResponse.status, 200);
   const savedJob = shared.JobResponseSchema.parse(
@@ -146,12 +161,20 @@ try {
 
   const evaluateResponse = await fetch(
     `${bridgeBaseUrl}/jobs/${encodeURIComponent(savedJob.id)}/evaluate`,
-    { method: "POST", headers: authorization },
+    {
+      method: "POST",
+      headers: {
+        ...authorization,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ scanRunId: scanRun.id }),
+    },
   );
   assert.equal(evaluateResponse.status, 200);
-  const evaluation = shared.EvaluationResultSchema.parse(
+  const evaluationResponse = shared.EvaluationResponseSchema.parse(
     await evaluateResponse.json(),
   );
+  const evaluation = evaluationResponse.evaluation;
   const evaluationFixture = shared.EvaluationResultSchema.parse(
     JSON.parse(
       await readFile(
@@ -165,13 +188,52 @@ try {
   );
   assert.deepEqual(evaluation, evaluationFixture);
 
+  const finishRunResponse = await fetch(
+    `${bridgeBaseUrl}/scan-runs/${encodeURIComponent(scanRun.id)}/progress`,
+    {
+      method: "POST",
+      headers: {
+        ...authorization,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        status: "completed",
+        pageCount: 1,
+        discoveredCount: 1,
+        newJobCount: 1,
+        detailSuccessCount: 1,
+        aiSuccessCount: 1,
+      }),
+    },
+  );
+  assert.equal(finishRunResponse.status, 200);
+  assert.equal(
+    shared.ScanRunSchema.parse(await finishRunResponse.json()).status,
+    "completed",
+  );
+
+  const latestRunResponse = await fetch(`${bridgeBaseUrl}/scan-runs/latest`, {
+    headers: authorization,
+  });
+  const latestRun = shared.LatestScanRunResponseSchema.parse(
+    await latestRunResponse.json(),
+  );
+  assert.equal(latestRun?.run.id, scanRun.id);
+  assert.equal(latestRun?.jobs.length, 1);
+
   const tables = database
     .prepare(
       "SELECT name FROM sqlite_schema WHERE type = 'table' ORDER BY name",
     )
     .all()
     .map((row) => row.name);
-  assert.deepEqual(tables, ["decisions", "diagnostics", "evaluations", "jobs"]);
+  assert.deepEqual(tables, [
+    "decisions",
+    "diagnostics",
+    "evaluations",
+    "jobs",
+    "scan_runs",
+  ]);
 
   const jobCount = database.prepare("SELECT count(*) AS count FROM jobs").get();
   assert.equal(jobCount?.count, 1);
@@ -197,5 +259,5 @@ try {
 }
 
 console.log(
-  "smoke: ok (fixtures, extension manifest, Job -> Bridge -> Evaluation)",
+  "smoke: ok (fixtures, extension manifest, Scan Run -> Job -> Evaluation)",
 );

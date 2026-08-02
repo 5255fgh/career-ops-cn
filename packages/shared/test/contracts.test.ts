@@ -11,6 +11,7 @@ import {
   CreateJobRequestSchema,
   DecisionRequestSchema,
   DecisionResponseSchema,
+  EvaluationResponseSchema,
   EvaluationResultSchema,
   HealthBadRequestResponseSchema,
   HealthRequestSchema,
@@ -20,6 +21,9 @@ import {
   JobIdParamsSchema,
   JobListResponseSchema,
   JobResponseSchema,
+  ObserveJobsRequestSchema,
+  ScanRunSchema,
+  UpdateScanRunRequestSchema,
   MockJobDetailRequestSchema,
   MockJobDetailResponseSchema,
   PageContextRequestSchema,
@@ -167,6 +171,8 @@ const otherStrictContracts: Array<{
       description: "负责招聘产品的前端功能开发与维护。",
       url: "https://www.zhipin.com/job_detail/123456789.html",
       identityVerified: true,
+      firstSeenAt: "2026-08-01T10:00:00.000Z",
+      lastSeenAt: "2026-08-01T10:00:00.000Z",
     },
   },
   {
@@ -227,11 +233,54 @@ describe("其余边界对象", () => {
           title: "前端开发工程师",
           company: "示例科技",
           identityVerified: false,
+          firstSeenAt: "2026-08-01T10:00:00.000Z",
+          lastSeenAt: "2026-08-01T10:00:00.000Z",
         },
       ]),
     ).not.toThrow();
     expect(() => ScreenResponseSchema.parse({})).toThrow();
     expect(() => JobListResponseSchema.parse({})).toThrow();
+  });
+
+  it("scan run、进度更新、观察和评估响应使用严格契约", () => {
+    const run = {
+      id: "scan-1",
+      status: "running",
+      phase: "reading-list",
+      startedAt: "2026-08-01T10:00:00.000Z",
+      updatedAt: "2026-08-01T10:00:01.000Z",
+      finishedAt: null,
+      pageCount: 1,
+      discoveredCount: 10,
+      newJobCount: 3,
+      detailSuccessCount: 1,
+      detailFailureCount: 0,
+      aiSuccessCount: 1,
+      aiFailureCount: 0,
+      cacheHitCount: 1,
+      stopReason: null,
+      errorSummary: null,
+      cancelRequested: false,
+    };
+    expect(() => ScanRunSchema.parse(run)).not.toThrow();
+    expect(() => ScanRunSchema.parse({ ...run, status: "queued" })).toThrow();
+    expect(() =>
+      UpdateScanRunRequestSchema.parse({ phase: "evaluating", aiSuccessCount: 2 }),
+    ).not.toThrow();
+    expect(() => UpdateScanRunRequestSchema.parse({})).toThrow();
+    expect(() =>
+      ObserveJobsRequestSchema.parse({
+        scanRunId: "scan-1",
+        sourceQuery: "boss:/web/geek/job?query=TypeScript",
+        jobs: [readFixture("job-card.json")],
+      }),
+    ).not.toThrow();
+    expect(() =>
+      EvaluationResponseSchema.parse({
+        evaluation: readFixture("evaluation-result.json"),
+        cacheHit: true,
+      }),
+    ).not.toThrow();
   });
 
   it("JobCard 拒绝非 zhipin.com URL", () => {

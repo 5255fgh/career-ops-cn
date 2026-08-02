@@ -2,20 +2,32 @@ import { DatabaseSync } from "node:sqlite";
 
 import {
   BridgeErrorResponseSchema,
-  CreateJobRequestSchema,
+  CreateScanRunRequestSchema,
   DecisionRequestSchema,
   DiagnosticEventRequestSchema,
   DiagnosticListQuerySchema,
   DiagnosticListResponseSchema,
+  EvaluateJobRequestSchema,
+  EvaluationResponseSchema,
   EvaluationResultSchema,
   HealthRequestSchema,
   HealthResponseSchema,
+  InterruptScanRunRequestSchema,
   JobDetailSchema,
   JobIdParamsSchema,
   JobListResponseSchema,
+  LatestScanRunResponseSchema,
+  ObserveJobsRequestSchema,
+  ObserveJobsResponseSchema,
+  RequestScanRunCancelSchema,
+  SaveJobRequestSchema,
+  ScanRunIdParamsSchema,
+  ScanRunSchema,
+  ScanRunSnapshotSchema,
   JobResponseSchema,
   ScreenRequestSchema,
   ScreenResponseSchema,
+  UpdateScanRunRequestSchema,
   type DiagnosticEvent,
   type DiagnosticEventRequest,
 } from "@career-ops-cn/shared";
@@ -42,14 +54,25 @@ import {
 } from "./dependencies.js";
 import {
   findJob,
+  findEvaluationByCacheKey,
+  findLatestScanRun,
+  findScanRun,
   initializeDatabase,
+  interruptRunningScanRuns,
+  interruptScanRun,
   listDiagnostics,
   listJobs,
+  listJobsForScanRun,
+  observeJobs,
+  requestScanRunCancel,
   saveDecision,
   saveDiagnostic,
   saveEvaluation,
   saveJob,
+  createScanRun,
+  updateScanRun,
 } from "./database.js";
+import { buildEvaluationCacheMetadata } from "./evaluation-cache.js";
 import {
   bridgeFailure,
   isBridgeFailure,
@@ -61,7 +84,6 @@ export { BRIDGE_HOST } from "./config.js";
 const PortSchema = z.number().int().min(0).max(65_535);
 const AuthorizationHeaderSchema = z.string().min(1);
 const OriginHeaderSchema = z.string().min(1);
-const EmptyBodySchema = z.undefined();
 const ExtensionOriginSchema = z
   .string()
   .regex(/^chrome-extension:\/\/[a-p]{32}$/u);
@@ -187,6 +209,24 @@ function buildJobDetail(job: ReturnType<typeof findJob>) {
   });
 
   return detail.success ? detail.data : undefined;
+}
+
+function findCurrentEvaluation(
+  database: DatabaseSync,
+  config: BridgeConfig,
+  job: NonNullable<ReturnType<typeof findJob>>,
+) {
+  const detail = buildJobDetail(job);
+  if (detail === undefined || !job.identityVerified) {
+    return undefined;
+  }
+  const metadata = buildEvaluationCacheMetadata(detail, config);
+  const evaluation = findEvaluationByCacheKey(
+    database,
+    job.id,
+    metadata.cacheKey,
+  );
+  return evaluation === undefined ? undefined : { evaluation, metadata };
 }
 
 async function evaluateJob(
@@ -427,6 +467,11 @@ function buildBridge(
 
   try {
     initializeDatabase(database);
+    interruptRunningScanRuns(
+      database,
+      "bridge-restarted",
+      "Bridge 在扫描完成前重启。",
+    );
   } catch (error) {
     if (ownsDatabase) {
       database.close();
@@ -488,6 +533,145 @@ function buildBridge(
   });
 
   bridge.post(
+    "/scan-runs",
+    {
+      preHandler: async (request, reply) =>
+        authenticate(request, reply, config.token),
+    },
+    async (request, reply) => {
+      const query = HealthRequestSchema.safeParse(request.query);
+      const body = CreateScanRunRequestSchema.safeParse(request.body ?? {});
+      if (!query.success || !body.success) {
+        return sendError(reply, "INVALID_REQUEST");
+      }
+      const run = runDatabaseOperation(() => createScanRun(database));
+      return reply.code(200).send(ScanRunSchema.parse(run));
+    },
+  );
+
+  bridge.get(
+    "/scan-runs/latest",
+    {
+      preHandler: async (request, reply) =>
+        authenticate(request, reply, config.token),
+    },
+    async (request, reply) => {
+      const invalidRequest = validateEmptyRequest(request, reply);
+      if (invalidRequest !== undefined) {
+        return invalidRequest;
+      }
+      const snapshot = runDatabaseOperation(() => {
+        const run = findLatestScanRun(database);
+        const jobs =
+          run === undefined
+            ? []
+            : listJobsForScanRun(database, run.id).map((job) => {
+                const {
+                  latestEvaluation: _latestEvaluation,
+                  ...jobWithoutEvaluation
+                } = job;
+                const current = findCurrentEvaluation(database, config, job);
+                return {
+                  ...jobWithoutEvaluation,
+                  ...(current === undefined
+                    ? {}
+                    : { latestEvaluation: current.evaluation }),
+                };
+              });
+        return run === undefined
+          ? null
+          : ScanRunSnapshotSchema.parse({
+              run,
+              jobs,
+            });
+      });
+      return reply
+        .code(200)
+        .send(LatestScanRunResponseSchema.parse(snapshot));
+    },
+  );
+
+  bridge.post(
+    "/scan-runs/:id/progress",
+    {
+      preHandler: async (request, reply) =>
+        authenticate(request, reply, config.token),
+    },
+    async (request, reply) => {
+      const params = ScanRunIdParamsSchema.safeParse(request.params);
+      const query = HealthRequestSchema.safeParse(request.query);
+      const body = UpdateScanRunRequestSchema.safeParse(request.body);
+      if (!params.success || !query.success || !body.success) {
+        return sendError(reply, "INVALID_REQUEST");
+      }
+      const run = runDatabaseOperation(() =>
+        updateScanRun(database, params.data.id, body.data),
+      );
+      if (run === undefined) {
+        return sendError(reply, "INVALID_REQUEST", {
+          message: "scan run 不存在。",
+        });
+      }
+      return reply.code(200).send(ScanRunSchema.parse(run));
+    },
+  );
+
+  bridge.post(
+    "/scan-runs/:id/cancel",
+    {
+      preHandler: async (request, reply) =>
+        authenticate(request, reply, config.token),
+    },
+    async (request, reply) => {
+      const params = ScanRunIdParamsSchema.safeParse(request.params);
+      const query = HealthRequestSchema.safeParse(request.query);
+      const body = RequestScanRunCancelSchema.safeParse(request.body ?? {});
+      if (!params.success || !query.success || !body.success) {
+        return sendError(reply, "INVALID_REQUEST");
+      }
+      const run = runDatabaseOperation(() =>
+        requestScanRunCancel(database, params.data.id),
+      );
+      if (run === undefined) {
+        return sendError(reply, "INVALID_REQUEST", {
+          message: "scan run 不存在。",
+        });
+      }
+      return reply.code(200).send(ScanRunSchema.parse(run));
+    },
+  );
+
+  bridge.post(
+    "/scan-runs/:id/interrupted",
+    {
+      preHandler: async (request, reply) =>
+        authenticate(request, reply, config.token),
+    },
+    async (request, reply) => {
+      const params = ScanRunIdParamsSchema.safeParse(request.params);
+      const query = HealthRequestSchema.safeParse(request.query);
+      const body = InterruptScanRunRequestSchema.safeParse(request.body ?? {});
+      if (!params.success || !query.success || !body.success) {
+        return sendError(reply, "INVALID_REQUEST");
+      }
+      const run = runDatabaseOperation(() =>
+        interruptScanRun(
+          database,
+          params.data.id,
+          body.data.reason ?? "extension-disconnected",
+          body.data.errorSummary,
+        ),
+      );
+      if (run === undefined) {
+        return sendError(reply, "INVALID_REQUEST", {
+          message: "scan run 不存在。",
+        });
+      }
+      return reply.code(200).send(ScanRunSchema.parse(run));
+    },
+  );
+
+  bridge.post(
     "/screen",
     {
       preHandler: async (request, reply) =>
@@ -519,6 +703,55 @@ function buildBridge(
   );
 
   bridge.post(
+    "/jobs/observe",
+    {
+      preHandler: async (request, reply) =>
+        authenticate(request, reply, config.token),
+    },
+    async (request, reply) => {
+      const query = HealthRequestSchema.safeParse(request.query);
+      const body = ObserveJobsRequestSchema.safeParse(request.body);
+      if (!query.success || !body.success) {
+        return sendError(reply, "INVALID_REQUEST");
+      }
+      const scanRun = runDatabaseOperation(() =>
+        findScanRun(database, body.data.scanRunId),
+      );
+      if (scanRun?.status !== "running" || scanRun.cancelRequested) {
+        return sendError(reply, "INVALID_REQUEST", {
+          message: "scan run 不存在、已结束或已请求取消。",
+        });
+      }
+
+      const observations = runDatabaseOperation(() =>
+        observeJobs(
+          database,
+          body.data.scanRunId,
+          body.data.sourceQuery,
+          body.data.jobs,
+        ).map((observation) => {
+          if (observation.action === "read-detail") {
+            return observation;
+          }
+          const current = findCurrentEvaluation(
+            database,
+            config,
+            observation.job,
+          );
+          return {
+            ...observation,
+            evaluation: current?.evaluation ?? null,
+            cacheHit: current !== undefined,
+          };
+        }),
+      );
+      return reply
+        .code(200)
+        .send(ObserveJobsResponseSchema.parse(observations));
+    },
+  );
+
+  bridge.post(
     "/jobs",
     {
       preHandler: async (request, reply) =>
@@ -526,9 +759,24 @@ function buildBridge(
     },
     async (request, reply) => {
       const query = HealthRequestSchema.safeParse(request.query);
-      const body = CreateJobRequestSchema.safeParse(request.body);
+      const body = SaveJobRequestSchema.safeParse(request.body);
       if (!query.success || !body.success) {
         return sendError(reply, "INVALID_REQUEST");
+      }
+
+      if (body.data.scanRunId !== undefined) {
+        const scanRun = runDatabaseOperation(() =>
+          findScanRun(database, body.data.scanRunId!),
+        );
+        if (
+          scanRun?.status !== "running" ||
+          scanRun.cancelRequested ||
+          body.data.sourceQuery === undefined
+        ) {
+          return sendError(reply, "INVALID_REQUEST", {
+            message: "保存扫描职位需要有效的 scan run 和 sourceQuery。",
+          });
+        }
       }
 
       const result = runDatabaseOperation(() => saveJob(database, body.data));
@@ -635,9 +883,20 @@ function buildBridge(
     async (request, reply) => {
       const params = JobIdParamsSchema.safeParse(request.params);
       const query = HealthRequestSchema.safeParse(request.query);
-      const body = EmptyBodySchema.safeParse(request.body);
+      const body = EvaluateJobRequestSchema.safeParse(request.body ?? {});
       if (!params.success || !query.success || !body.success) {
         return sendError(reply, "INVALID_REQUEST");
+      }
+
+      if (body.data.scanRunId !== undefined) {
+        const scanRun = runDatabaseOperation(() =>
+          findScanRun(database, body.data.scanRunId!),
+        );
+        if (scanRun?.status !== "running" || scanRun.cancelRequested) {
+          return sendError(reply, "INVALID_REQUEST", {
+            message: "scan run 不存在、已结束或已请求取消。",
+          });
+        }
       }
 
       const job = runDatabaseOperation(() => findJob(database, params.data.id));
@@ -645,6 +904,37 @@ function buildBridge(
         return sendError(reply, "JOB_NOT_FOUND");
       }
 
+      const detail = buildJobDetail(job);
+      if (detail === undefined) {
+        return sendError(reply, "INVALID_JOB_DETAIL");
+      }
+      if (!job.identityVerified) {
+        return sendError(reply, "DETAIL_IDENTITY_UNVERIFIED");
+      }
+      const metadata = buildEvaluationCacheMetadata(detail, config);
+      const cached = runDatabaseOperation(() =>
+        findEvaluationByCacheKey(database, job.id, metadata.cacheKey),
+      );
+      if (cached !== undefined) {
+        recordDiagnosticBestEffort({
+          source: "bridge",
+          level: "info",
+          event: "evaluation_cache_hit",
+          jobId: job.id,
+          ...(body.data.scanRunId === undefined
+            ? {}
+            : { scanId: body.data.scanRunId }),
+          details: { cacheKey: metadata.cacheKey },
+        });
+        return reply.code(200).send(
+          EvaluationResponseSchema.parse({
+            evaluation: cached,
+            cacheHit: true,
+          }),
+        );
+      }
+
+      const startedAt = performance.now();
       const evaluation = await evaluateJob(
         request,
         reply,
@@ -655,9 +945,17 @@ function buildBridge(
         recordDiagnosticBestEffort,
       );
       runDatabaseOperation(() =>
-        saveEvaluation(database, params.data.id, evaluation),
+        saveEvaluation(
+          database,
+          params.data.id,
+          evaluation,
+          metadata,
+          Math.max(0, Math.round(performance.now() - startedAt)),
+        ),
       );
-      return reply.code(200).send(evaluation);
+      return reply.code(200).send(
+        EvaluationResponseSchema.parse({ evaluation, cacheHit: false }),
+      );
     },
   );
 
@@ -687,11 +985,19 @@ function buildBridge(
     },
   );
 
-  if (ownsDatabase) {
-    bridge.addHook("onClose", async () => {
-      database.close();
-    });
-  }
+  bridge.addHook("onClose", async () => {
+    try {
+      interruptRunningScanRuns(
+        database,
+        "bridge-stopped",
+        "Bridge 在扫描完成前停止。",
+      );
+    } finally {
+      if (ownsDatabase) {
+        database.close();
+      }
+    }
+  });
 
   return bridge;
 }

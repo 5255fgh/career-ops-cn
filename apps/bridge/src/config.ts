@@ -9,6 +9,10 @@ import { z } from "zod";
 export const BRIDGE_HOST = "127.0.0.1";
 export const DEFAULT_BRIDGE_PORT = 3847;
 export const DEFAULT_EVALUATION_TIMEOUT_MS = 120_000;
+export const DEFAULT_PROFILE_VERSION = "default-profile-v1";
+export const DEFAULT_PROMPT_VERSION = "career-ops-prompt-v1";
+export const DEFAULT_MODEL_ID = "career-ops-default";
+export const DEFAULT_EVALUATION_SCHEMA_VERSION = "1";
 export const DEFAULT_DATABASE_PATH = fileURLToPath(
   new URL("../career-ops-cn.sqlite", import.meta.url),
 );
@@ -32,6 +36,27 @@ const EnvironmentSchema = z.object({
     z.coerce.number().int().positive(),
   ),
   CAREER_OPS_CN_PREFERENCES: z.string().trim().min(1).optional(),
+  CAREER_OPS_CN_PROFILE_VERSION: z
+    .string()
+    .trim()
+    .min(1)
+    .default(DEFAULT_PROFILE_VERSION),
+  CAREER_OPS_CN_PROMPT_VERSION: z
+    .string()
+    .trim()
+    .min(1)
+    .default(DEFAULT_PROMPT_VERSION),
+  CAREER_OPS_CN_MODEL_ID: z
+    .string()
+    .trim()
+    .min(1)
+    .optional(),
+  OPENAI_MODEL: z.string().trim().min(1).optional(),
+  CAREER_OPS_CN_EVALUATION_SCHEMA_VERSION: z
+    .string()
+    .trim()
+    .min(1)
+    .default(DEFAULT_EVALUATION_SCHEMA_VERSION),
 });
 
 export interface BridgeConfig {
@@ -42,6 +67,10 @@ export interface BridgeConfig {
   careerOpsRoot: string;
   evaluationTimeoutMs: number;
   preferences: Preferences;
+  profileVersion: string;
+  promptVersion: string;
+  modelId: string;
+  evaluationSchemaVersion: string;
 }
 
 function parsePreferences(value: string | undefined): Preferences {
@@ -88,5 +117,13 @@ export function readBridgeConfig(
     evaluationTimeoutMs:
       result.data.CAREER_OPS_CN_EVALUATION_TIMEOUT_MS,
     preferences: parsePreferences(result.data.CAREER_OPS_CN_PREFERENCES),
+    profileVersion: result.data.CAREER_OPS_CN_PROFILE_VERSION,
+    promptVersion: result.data.CAREER_OPS_CN_PROMPT_VERSION,
+    modelId:
+      result.data.CAREER_OPS_CN_MODEL_ID ??
+      result.data.OPENAI_MODEL ??
+      DEFAULT_MODEL_ID,
+    evaluationSchemaVersion:
+      result.data.CAREER_OPS_CN_EVALUATION_SCHEMA_VERSION,
   };
 }

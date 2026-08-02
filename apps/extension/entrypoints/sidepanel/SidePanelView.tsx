@@ -60,6 +60,7 @@ const STATUS_LABELS: Record<ScanState['status'], string> = {
   evaluating: 'AI 评估',
   completed: '已完成',
   cancelled: '已取消',
+  interrupted: '已中断',
   failed: '已停止',
 };
 
@@ -197,7 +198,7 @@ export function SidePanelView(props: SidePanelViewProps) {
             disabled={isScanning || props.connectionState !== 'online'}
             onClick={props.onStartScan}
           >
-            开始扫描
+            {props.scanState.status === 'interrupted' ? '重新开始' : '开始扫描'}
           </button>
           <button
             className="button button-danger"
@@ -250,8 +251,20 @@ export function SidePanelView(props: SidePanelViewProps) {
             <dd>{props.scanState.progress.detailCompleted}/{props.scanState.progress.detailTarget}</dd>
           </div>
           <div>
+            <dt>详情成功 / 失败</dt>
+            <dd>{props.scanState.progress.detailSuccess} / {props.scanState.progress.detailFailure}</dd>
+          </div>
+          <div>
             <dt>AI 进度</dt>
             <dd>{props.scanState.progress.aiCompleted}/{props.scanState.progress.aiTarget}</dd>
+          </div>
+          <div>
+            <dt>AI 成功 / 失败</dt>
+            <dd>{props.scanState.progress.aiSuccess} / {props.scanState.progress.aiFailure}</dd>
+          </div>
+          <div>
+            <dt>评估缓存命中</dt>
+            <dd>{props.scanState.progress.cacheHits}</dd>
           </div>
         </dl>
       </section>

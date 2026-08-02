@@ -46,6 +46,8 @@ const savedJob = {
   description: fixtureJob.description,
   url: fixtureJob.detailUrl,
   identityVerified: fixtureJob.identityVerified,
+  firstSeenAt: '2026-08-01T10:00:00.000Z',
+  lastSeenAt: '2026-08-01T10:00:00.000Z',
 };
 
 const evaluation = {
@@ -89,11 +91,54 @@ describe('Bridge client', () => {
     expect(toCreateJobRequest(unverifiedJob).identityVerified).toBe(false);
   });
 
+  it('通过 shared 契约创建、更新并恢复最近 scan run', async () => {
+    const run = {
+      id: 'scan-1',
+      status: 'running' as const,
+      phase: 'reading-list' as const,
+      startedAt: '2026-08-01T10:00:00.000Z',
+      updatedAt: '2026-08-01T10:00:01.000Z',
+      finishedAt: null,
+      pageCount: 1,
+      discoveredCount: 10,
+      newJobCount: 3,
+      detailSuccessCount: 1,
+      detailFailureCount: 0,
+      aiSuccessCount: 0,
+      aiFailureCount: 0,
+      cacheHitCount: 0,
+      stopReason: null,
+      errorSummary: null,
+      cancelRequested: false,
+    };
+    const fetchMock = vi
+      .fn<FetchLike>()
+      .mockResolvedValueOnce(jsonResponse({ ...run, phase: 'starting' }))
+      .mockResolvedValueOnce(jsonResponse(run))
+      .mockResolvedValueOnce(jsonResponse({ run, jobs: [] }));
+    const client = createBridgeClient({ token: 'test-token', fetchImpl: fetchMock });
+
+    await expect(client.createScanRun()).resolves.toMatchObject({ id: 'scan-1' });
+    await expect(
+      client.updateScanRun('scan-1', {
+        phase: 'reading-list',
+        pageCount: 1,
+        discoveredCount: 10,
+      }),
+    ).resolves.toEqual(run);
+    await expect(client.latestScanRun()).resolves.toEqual({ run, jobs: [] });
+    expect(fetchMock.mock.calls.map(([url]) => String(url))).toEqual([
+      'http://127.0.0.1:3847/scan-runs',
+      'http://127.0.0.1:3847/scan-runs/scan-1/progress',
+      'http://127.0.0.1:3847/scan-runs/latest',
+    ]);
+  });
+
   it('携带 token 顺序调用保存和评估接口，并校验响应', async () => {
     const fetchMock = vi
       .fn<FetchLike>()
       .mockResolvedValueOnce(jsonResponse(savedJob))
-      .mockResolvedValueOnce(jsonResponse(evaluation));
+      .mockResolvedValueOnce(jsonResponse({ evaluation, cacheHit: false }));
     const client = createBridgeClient({
       token: 'test-token',
       baseUrl: 'http://127.0.0.1:9876/',
@@ -104,7 +149,7 @@ describe('Bridge client', () => {
     const result = await client.evaluateJob(job.id);
 
     expect(job).toEqual(savedJob);
-    expect(result).toEqual(evaluation);
+    expect(result).toEqual({ evaluation, cacheHit: false });
     expect(fetchMock).toHaveBeenNthCalledWith(
       1,
       'http://127.0.0.1:9876/jobs',
@@ -122,7 +167,11 @@ describe('Bridge client', () => {
       'http://127.0.0.1:9876/jobs/job-1/evaluate',
       expect.objectContaining({
         method: 'POST',
-        headers: { Authorization: 'Bearer test-token' },
+        headers: {
+          Authorization: 'Bearer test-token',
+          'Content-Type': 'application/json',
+        },
+        body: '{}',
       }),
     );
   });

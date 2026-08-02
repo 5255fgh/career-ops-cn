@@ -8,10 +8,14 @@ import {
   DecisionResponseSchema,
   DiagnosticEventSchema,
   DiagnosticListResponseSchema,
+  EvaluationResponseSchema,
   EvaluationResultSchema,
   HealthResponseSchema,
   JobListResponseSchema,
   JobResponseSchema,
+  LatestScanRunResponseSchema,
+  ObserveJobsResponseSchema,
+  ScanRunSchema,
   ScreenResponseSchema,
   type CreateJobRequest,
   type JobCard,
@@ -21,6 +25,11 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { BRIDGE_HOST, createBridge, startBridge } from "../src/app.js";
 import { DEFAULT_BRIDGE_PORT, readBridgeConfig } from "../src/config.js";
+import {
+  createScanRun,
+  initializeDatabase,
+  updateScanRun,
+} from "../src/database.js";
 import type { Evaluator, ScreenJob } from "../src/dependencies.js";
 
 const PREFERENCES: Preferences = {
@@ -142,6 +151,7 @@ describe("Bridge 健康、认证与 CORS", () => {
         "diagnostics",
         "evaluations",
         "jobs",
+        "scan_runs",
       ]);
     } finally {
       await bridge.close();
@@ -192,6 +202,202 @@ describe("Bridge 健康、认证与 CORS", () => {
         },
       });
       expect(websiteRequest.statusCode).toBe(401);
+    } finally {
+      await bridge.close();
+    }
+  });
+});
+
+describe("scan run 持久化", () => {
+  it("创建、更新、查询并请求取消同一个 scan run", async () => {
+    const { database } = await createTempDatabase();
+    const bridge = createBridge({ environment: TEST_ENVIRONMENT, database });
+
+    try {
+      const createdResponse = await bridge.inject({
+        method: "POST",
+        url: "/scan-runs",
+        headers: AUTHORIZATION,
+        payload: {},
+      });
+      expect(createdResponse.statusCode).toBe(200);
+      const created = ScanRunSchema.parse(createdResponse.json());
+      expect(created).toMatchObject({
+        status: "running",
+        phase: "starting",
+        pageCount: 0,
+      });
+
+      const updatedResponse = await bridge.inject({
+        method: "POST",
+        url: `/scan-runs/${created.id}/progress`,
+        headers: AUTHORIZATION,
+        payload: {
+          phase: "reading-details",
+          pageCount: 2,
+          discoveredCount: 18,
+          newJobCount: 5,
+          detailSuccessCount: 3,
+          detailFailureCount: 1,
+        },
+      });
+      expect(ScanRunSchema.parse(updatedResponse.json())).toMatchObject({
+        id: created.id,
+        status: "running",
+        phase: "reading-details",
+        pageCount: 2,
+        discoveredCount: 18,
+        newJobCount: 5,
+        detailSuccessCount: 3,
+        detailFailureCount: 1,
+      });
+
+      const latestResponse = await bridge.inject({
+        method: "GET",
+        url: "/scan-runs/latest",
+        headers: AUTHORIZATION,
+      });
+      const latest = LatestScanRunResponseSchema.parse(latestResponse.json());
+      expect(latest?.run).toMatchObject({
+        id: created.id,
+        pageCount: 2,
+        discoveredCount: 18,
+      });
+      expect(latest?.jobs).toEqual([]);
+
+      const cancelResponse = await bridge.inject({
+        method: "POST",
+        url: `/scan-runs/${created.id}/cancel`,
+        headers: AUTHORIZATION,
+        payload: {},
+      });
+      expect(ScanRunSchema.parse(cancelResponse.json()).cancelRequested).toBe(
+        true,
+      );
+
+      const rejectedWork = await bridge.inject({
+        method: "POST",
+        url: "/jobs/observe",
+        headers: AUTHORIZATION,
+        payload: {
+          scanRunId: created.id,
+          sourceQuery: "boss:/web/geek/job?query=TypeScript",
+          jobs: [JOB_CARD],
+        },
+      });
+      expect(rejectedWork.statusCode).toBe(400);
+
+      const finishedResponse = await bridge.inject({
+        method: "POST",
+        url: `/scan-runs/${created.id}/progress`,
+        headers: AUTHORIZATION,
+        payload: { status: "cancelled", stopReason: "user-requested" },
+      });
+      expect(ScanRunSchema.parse(finishedResponse.json())).toMatchObject({
+        status: "cancelled",
+        phase: "finished",
+        finishedAt: expect.any(String),
+      });
+    } finally {
+      await bridge.close();
+    }
+  });
+
+  it("异常重启时把未完成任务标记为 interrupted 并保留进度", async () => {
+    const databasePath = await createTempDatabasePath();
+    const crashedDatabase = new DatabaseSync(databasePath);
+    initializeDatabase(crashedDatabase);
+    const running = createScanRun(crashedDatabase);
+    updateScanRun(crashedDatabase, running.id, {
+      phase: "reading-details",
+      pageCount: 2,
+      discoveredCount: 14,
+      detailSuccessCount: 4,
+      detailFailureCount: 2,
+      errorSummary: "2 个职位详情失败。",
+    });
+    crashedDatabase.close();
+
+    const restarted = createBridge({
+      environment: TEST_ENVIRONMENT,
+      databasePath,
+    });
+    try {
+      const response = await restarted.inject({
+        method: "GET",
+        url: "/scan-runs/latest",
+        headers: AUTHORIZATION,
+      });
+      const snapshot = LatestScanRunResponseSchema.parse(response.json());
+      expect(snapshot?.run).toMatchObject({
+        id: running.id,
+        status: "interrupted",
+        phase: "finished",
+        pageCount: 2,
+        discoveredCount: 14,
+        detailSuccessCount: 4,
+        detailFailureCount: 2,
+        stopReason: "bridge-restarted",
+      });
+    } finally {
+      await restarted.close();
+    }
+  });
+
+  it("interrupted 终态仍合并浏览器侧最后完成的单调计数", async () => {
+    const { database } = await createTempDatabase();
+    const bridge = createBridge({ environment: TEST_ENVIRONMENT, database });
+
+    try {
+      const created = ScanRunSchema.parse(
+        (
+          await bridge.inject({
+            method: "POST",
+            url: "/scan-runs",
+            headers: AUTHORIZATION,
+            payload: {},
+          })
+        ).json(),
+      );
+      const interrupted = ScanRunSchema.parse(
+        (
+          await bridge.inject({
+            method: "POST",
+            url: `/scan-runs/${created.id}/interrupted`,
+            headers: AUTHORIZATION,
+            payload: {
+              reason: "side-panel-closed",
+              errorSummary: "浏览器上下文已关闭。",
+            },
+          })
+        ).json(),
+      );
+
+      const merged = ScanRunSchema.parse(
+        (
+          await bridge.inject({
+            method: "POST",
+            url: `/scan-runs/${created.id}/progress`,
+            headers: AUTHORIZATION,
+            payload: {
+              status: "interrupted",
+              pageCount: 2,
+              discoveredCount: 14,
+              detailSuccessCount: 4,
+              stopReason: null,
+            },
+          })
+        ).json(),
+      );
+
+      expect(merged).toMatchObject({
+        status: "interrupted",
+        pageCount: 2,
+        discoveredCount: 14,
+        detailSuccessCount: 4,
+        stopReason: "side-panel-closed",
+      });
+      expect(merged.finishedAt).toBe(interrupted.finishedAt);
     } finally {
       await bridge.close();
     }
@@ -462,9 +668,225 @@ describe("diagnostics", () => {
       await bridge.close();
     }
   });
+
+  it("重复出现时更新 last_seen/source_query，并在 run 快照中返回复用结果", async () => {
+    const { database } = await createTempDatabase();
+    const evaluator = vi.fn<Evaluator>(async () => ({
+      score: 91,
+      recommendation: "apply",
+      rawReport: "可复用评估。",
+    }));
+    const bridge = createBridge({
+      environment: TEST_ENVIRONMENT,
+      database,
+      evaluator,
+      screenJob: PASS_SCREEN_JOB,
+    });
+
+    try {
+      const run = ScanRunSchema.parse(
+        (
+          await bridge.inject({
+            method: "POST",
+            url: "/scan-runs",
+            headers: AUTHORIZATION,
+            payload: {},
+          })
+        ).json(),
+      );
+      const savedResponse = await bridge.inject({
+        method: "POST",
+        url: "/jobs",
+        headers: AUTHORIZATION,
+        payload: {
+          ...JOB,
+          scanRunId: run.id,
+          sourceQuery: "boss:/web/geek/job?query=TypeScript",
+        },
+      });
+      const saved = JobResponseSchema.parse(savedResponse.json());
+      const evaluated = await bridge.inject({
+        method: "POST",
+        url: `/jobs/${saved.id}/evaluate`,
+        headers: AUTHORIZATION,
+        payload: { scanRunId: run.id },
+      });
+      expect(EvaluationResponseSchema.parse(evaluated.json()).cacheHit).toBe(
+        false,
+      );
+
+      const observedResponse = await bridge.inject({
+        method: "POST",
+        url: "/jobs/observe",
+        headers: AUTHORIZATION,
+        payload: {
+          scanRunId: run.id,
+          sourceQuery: "boss:/web/geek/job?query=TypeScript&city=101020100",
+          jobs: [JOB_CARD],
+        },
+      });
+      const [observed] = ObserveJobsResponseSchema.parse(
+        observedResponse.json(),
+      );
+      expect(observed).toMatchObject({
+        sourceJobId: JOB_CARD.jobId,
+        action: "reuse",
+        cacheHit: true,
+        evaluation: { score: 91 },
+      });
+
+      const snapshot = LatestScanRunResponseSchema.parse(
+        (
+          await bridge.inject({
+            method: "GET",
+            url: "/scan-runs/latest",
+            headers: AUTHORIZATION,
+          })
+        ).json(),
+      );
+      expect(snapshot?.jobs).toHaveLength(1);
+      expect(snapshot?.jobs[0]).toMatchObject({
+        id: saved.id,
+        lastScanRunId: run.id,
+        sourceQuery:
+          "boss:/web/geek/job?query=TypeScript&city=101020100",
+        latestEvaluation: { score: 91 },
+      });
+      const restoredJob = snapshot?.jobs[0];
+      if (restoredJob === undefined) {
+        throw new Error("scan run 快照缺少已观察职位。");
+      }
+      expect(restoredJob.lastSeenAt >= saved.lastSeenAt).toBe(true);
+      expect(evaluator).toHaveBeenCalledOnce();
+    } finally {
+      await bridge.close();
+    }
+  });
+
 });
 
 describe("evaluate", () => {
+  it("相同 cache_key 直接复用，JD 变化后重新评估并保存元数据", async () => {
+    const { database } = await createTempDatabase();
+    const evaluator = vi.fn<Evaluator>(async (job) => ({
+      score: job.description.includes("新版") ? 93 : 88,
+      recommendation: "apply",
+      rawReport: `评估：${job.description}`,
+    }));
+    const screenJob = vi.fn<ScreenJob>(PASS_SCREEN_JOB);
+    const bridge = createBridge({
+      environment: TEST_ENVIRONMENT,
+      database,
+      evaluator,
+      screenJob,
+    });
+
+    try {
+      const normalizedDescription = `${JOB.description}\n补充一行。`;
+      const job = await postJob(bridge, {
+        ...JOB,
+        description: normalizedDescription.replace(/\n/gu, "\r\n"),
+        url: `${JOB.url}?securityId=volatile-first`,
+      });
+      const first = EvaluationResponseSchema.parse(
+        (
+          await bridge.inject({
+            method: "POST",
+            url: `/jobs/${job.id}/evaluate`,
+            headers: AUTHORIZATION,
+            payload: {},
+          })
+        ).json(),
+      );
+      const second = EvaluationResponseSchema.parse(
+        (
+          await bridge.inject({
+            method: "POST",
+            url: `/jobs/${job.id}/evaluate`,
+            headers: AUTHORIZATION,
+            payload: {},
+          })
+        ).json(),
+      );
+      expect(first.cacheHit).toBe(false);
+      expect(second).toEqual({ ...first, cacheHit: true });
+      expect(evaluator).toHaveBeenCalledOnce();
+      expect(screenJob).toHaveBeenCalledOnce();
+
+      const formattingOnly = await postJob(bridge, {
+        ...JOB,
+        description: normalizedDescription,
+        url: `${JOB.url}?securityId=volatile-second`,
+      });
+      expect(formattingOnly.jdHash).toBe(job.jdHash);
+      const formattingOnlyEvaluation = EvaluationResponseSchema.parse(
+        (
+          await bridge.inject({
+            method: "POST",
+            url: `/jobs/${job.id}/evaluate`,
+            headers: AUTHORIZATION,
+            payload: {},
+          })
+        ).json(),
+      );
+      expect(formattingOnlyEvaluation.cacheHit).toBe(true);
+      expect(evaluator).toHaveBeenCalledOnce();
+      expect(screenJob).toHaveBeenCalledOnce();
+
+      const beforeHash = job.jdHash;
+      const changed = await postJob(bridge, {
+        ...JOB,
+        description:
+          "新版职位描述：负责 TypeScript、React、性能治理和工程平台建设。",
+      });
+      expect(changed.id).toBe(job.id);
+      expect(changed.jdHash).not.toBe(beforeHash);
+
+      const changedEvaluation = EvaluationResponseSchema.parse(
+        (
+          await bridge.inject({
+            method: "POST",
+            url: `/jobs/${job.id}/evaluate`,
+            headers: AUTHORIZATION,
+            payload: {},
+          })
+        ).json(),
+      );
+      expect(changedEvaluation).toMatchObject({
+        cacheHit: false,
+        evaluation: { score: 93 },
+      });
+      expect(evaluator).toHaveBeenCalledTimes(2);
+      expect(screenJob).toHaveBeenCalledTimes(2);
+
+      const metadata = database
+        .prepare(
+          `SELECT jd_hash, profile_hash, rules_hash, prompt_version, model_id,
+                  evaluation_schema_version, input_hash, cache_key,
+                  created_at, latency_ms
+           FROM evaluations
+           WHERE job_id = ?
+           ORDER BY rowid DESC`,
+        )
+        .all(job.id) as Array<Record<string, unknown>>;
+      expect(metadata).toHaveLength(2);
+      expect(metadata[0]).toMatchObject({
+        jd_hash: changed.jdHash,
+        profile_hash: expect.stringMatching(/^[a-f0-9]{64}$/u),
+        rules_hash: expect.stringMatching(/^[a-f0-9]{64}$/u),
+        prompt_version: "career-ops-prompt-v1",
+        model_id: "career-ops-default",
+        evaluation_schema_version: "1",
+        input_hash: expect.stringMatching(/^[a-f0-9]{64}$/u),
+        cache_key: expect.stringMatching(/^[a-f0-9]{64}$/u),
+        created_at: expect.any(String),
+        latency_ms: expect.any(Number),
+      });
+    } finally {
+      await bridge.close();
+    }
+  });
+
   it("完整硬规则 block 时拒绝 AI 调用且不伪造评估", async () => {
     const { database } = await createTempDatabase();
     const evaluator = vi.fn<Evaluator>(async (_job, _options) => ({
@@ -540,9 +962,9 @@ describe("evaluate", () => {
       });
 
       expect(response.statusCode).toBe(200);
-      expect(EvaluationResultSchema.parse(response.json())).toMatchObject({
-        score: 90,
-        recommendation: "apply",
+      expect(EvaluationResponseSchema.parse(response.json())).toMatchObject({
+        evaluation: { score: 90, recommendation: "apply" },
+        cacheHit: false,
       });
       expect(evaluator).toHaveBeenCalledOnce();
       expect(
@@ -887,6 +1309,17 @@ describe("Bridge 配置与监听", () => {
     expect(readBridgeConfig(TEST_ENVIRONMENT).port).toBe(
       DEFAULT_BRIDGE_PORT,
     );
+    expect(
+      readBridgeConfig({ ...TEST_ENVIRONMENT, OPENAI_MODEL: "model-from-openai" })
+        .modelId,
+    ).toBe("model-from-openai");
+    expect(
+      readBridgeConfig({
+        ...TEST_ENVIRONMENT,
+        OPENAI_MODEL: "model-from-openai",
+        CAREER_OPS_CN_MODEL_ID: "model-from-bridge",
+      }).modelId,
+    ).toBe("model-from-bridge");
   });
 
   it("固定监听 IPv4 回环地址", async () => {

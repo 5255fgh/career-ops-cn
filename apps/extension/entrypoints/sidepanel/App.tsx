@@ -31,6 +31,7 @@ const extensionStorage: ExtensionStorageArea = {
 };
 
 const IDLE_SCAN_STATE: ScanState = {
+  runId: null,
   status: 'idle',
   progress: {
     pagesVisited: 0,
@@ -39,8 +40,13 @@ const IDLE_SCAN_STATE: ScanState = {
     screenedJobs: 0,
     detailCompleted: 0,
     detailTarget: 0,
+    detailSuccess: 0,
+    detailFailure: 0,
     aiCompleted: 0,
     aiTarget: 0,
+    aiSuccess: 0,
+    aiFailure: 0,
+    cacheHits: 0,
   },
   results: [],
   stopReason: null,
@@ -126,6 +132,20 @@ export function App() {
     }
   }, [bridge]);
 
+  const refreshLatestScanRun = useCallback(async () => {
+    if (bridge === null || controller === null) {
+      return;
+    }
+    try {
+      const snapshot = await bridge.latestScanRun();
+      if (snapshot !== null) {
+        controller.restore(snapshot);
+      }
+    } catch (error) {
+      setConnectionMessage(`最近扫描状态读取失败：${messageFromError(error)}`);
+    }
+  }, [bridge, controller]);
+
   useEffect(() => {
     let disposed = false;
     void loadExtensionSettings(extensionStorage)
@@ -154,7 +174,16 @@ export function App() {
       setScanState(IDLE_SCAN_STATE);
       return;
     }
-    return controller.subscribe(setScanState);
+    const unsubscribe = controller.subscribe(setScanState);
+    const interruptOnPageHide = () => {
+      void controller.interrupt('side-panel-closed');
+    };
+    window.addEventListener('pagehide', interruptOnPageHide);
+    return () => {
+      window.removeEventListener('pagehide', interruptOnPageHide);
+      unsubscribe();
+      void controller.interrupt('side-panel-closed');
+    };
   }, [controller]);
 
   useEffect(() => {
@@ -181,11 +210,15 @@ export function App() {
           setConnectionMessage(messageFromError(error));
         }
       });
-    void Promise.all([refreshHistory(), refreshDiagnostics()]);
+    void Promise.all([
+      refreshHistory(),
+      refreshDiagnostics(),
+      refreshLatestScanRun(),
+    ]);
     return () => {
       disposed = true;
     };
-  }, [bridge, refreshDiagnostics, refreshHistory]);
+  }, [bridge, refreshDiagnostics, refreshHistory, refreshLatestScanRun]);
 
   useEffect(() => {
     if (

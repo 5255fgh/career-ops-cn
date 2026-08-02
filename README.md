@@ -16,7 +16,9 @@
 - 在单职位详情页完成 JobDetail 提取、职位身份校验、Bridge 保存和 `career-ops` 评估。
 - 在保存或评估前校验职位身份，避免把职位 B 的详情保存或分析为职位 A。
 - Bridge 只监听 `127.0.0.1`，业务接口要求 Bearer token。
-- 用 SQLite 保存职位、评估原文和用户主动记录的判断，Bridge 重启后仍可读取。
+- 用 SQLite 保存权威 scan run、职位、评估原文和用户主动记录的判断；关闭后重开 Side Panel 仍可读取本轮阶段、计数和已保存结果。
+- 已处理且职位卡片输入未变化的职位复用已保存详情；相同 JD、用户资料版本、规则、Prompt、模型和输出结构生成相同 cache key，不重复调用 evaluator。
+- 职位再次出现会更新 `last_seen_at`、本轮 run 和搜索来源；JD 变化后生成新的 `jd_hash` 并重新执行详情筛选和 AI 评估，不因暂时未出现而删除职位。
 - 展示 `career-ops` score、recommendation、结构化摘要字段和完整 raw report。
 - 支持用户取消当前扫描，并在登录失效、challenge、账号风险或不支持布局时停止。
 - 扫描过程、翻页、职位/JD 映射、取消和错误会尽力写入 SQLite diagnostics；diagnostics 失败只显示警告，不会反转已完成的扫描结果。
@@ -27,7 +29,7 @@
 当前版本明确不提供：
 
 - 自动投递、自动打招呼、自动聊天或任何联系方式操作
-- 定时、后台无人值守扫描或持久任务队列
+- 定时、后台无人值守扫描或通用持久任务队列
 - Tracker、快照、简历定制或新评分 Prompt
 - BOSS 以外的招聘平台
 - Plugin、公开 API 版本或远程 Bridge
@@ -56,7 +58,7 @@ CAREER_OPS_CN_TOKEN=使用一个仅本机保存的随机长 token
 CAREER_OPS_CN_CAREER_OPS_ROOT=D:\Projects\career-ops
 ```
 
-可选配置包括 Bridge 端口、SQLite 路径、评估超时和 JSON 格式的规则偏好；可用变量见 [.env.example](./.env.example)。
+可选配置包括 Bridge 端口、SQLite 路径、评估超时、JSON 格式的规则偏好，以及写入评估缓存键的 profile/Prompt/model/schema 版本；模型标识优先读取 `CAREER_OPS_CN_MODEL_ID`，未设置时沿用 `OPENAI_MODEL`，可用变量见 [.env.example](./.env.example)。
 
 ## career-ops 配置
 
@@ -81,7 +83,7 @@ pnpm build
 pnpm --filter @career-ops-cn/bridge start
 ```
 
-默认地址是 `http://127.0.0.1:3847`。Bridge 提供 `/health`、`/screen`、`/jobs`、`/jobs/:id/evaluate`、`/jobs/:id/decision` 和 `/diagnostics`；除 `GET /health` 外都要求与 `CAREER_OPS_CN_TOKEN` 一致的 Bearer token。Bridge 不支持绑定 `0.0.0.0`。
+默认地址是 `http://127.0.0.1:3847`。Bridge 提供 `/health`、`/scan-runs`、`/scan-runs/latest`、scan run 进度/取消/中断接口、`/screen`、`/jobs/observe`、`/jobs`、`/jobs/:id/evaluate`、`/jobs/:id/decision` 和 `/diagnostics`；除 `GET /health` 外都要求与 `CAREER_OPS_CN_TOKEN` 一致的 Bearer token。Bridge 不支持绑定 `0.0.0.0`。
 
 ## Extension 加载
 
@@ -109,16 +111,20 @@ pnpm build
 7. 在结果列表查看硬规则原因、score、recommendation 和 raw report。需要时可由用户主动记录 Apply、Review 或 Skip 判断。
 8. 随时点击“取消”停止当前扫描。
 
+关闭 Side Panel 会停止浏览器侧执行并把未完成 run 标记为 `interrupted`，不会把长任务移入 MV3 Background。重新打开后会主动读取最近 run，展示已完成页数、职位数、失败摘要和已保存结果；点击“重新开始”会新建一轮，并由 Bridge 增量复用已有详情和评估。
+
 ## 数据位置
 
 - SQLite 默认路径：`apps/bridge/career-ops-cn.sqlite`
 - 可用 `CAREER_OPS_CN_DATABASE_PATH` 指定其他本机路径
-- 表：`jobs`、`evaluations`、`decisions`、`diagnostics`
+- 表：`scan_runs`、`jobs`、`evaluations`、`decisions`、`diagnostics`
 - Bridge token：扩展的 `chrome.storage.local`
 - 扫描配置：扩展的 `chrome.storage.local`
 - 传给 `career-ops` 的临时 JobDetail：系统临时目录，子进程结束后删除
 
 SQLite 中会保存职位描述和完整 raw report。不要把真实数据库、`.env` 或任何模型凭据提交到仓库。
+
+固定清理规则：diagnostics 只保留最近 5000 条；成功 run 只保留最近 100 次；失败、取消或中断 run 约 30 天后清理；同一职位只保留最近 3 个评估版本。系统不保存整页原始 HTML。
 
 ## 故障排查
 
@@ -129,6 +135,7 @@ SQLite 中会保存职位描述和完整 raw report。不要把真实数据库�
 - **provider HTTP 502/503/504**：适配器会进行 2 次有限重试（共 3 次尝试）。持续失败不会生成伪造 score/raw report；脱敏后的状态、尝试次数和响应摘要会写入 diagnostics，并在 Bridge 错误中返回诊断 ID。
 - **evaluator timeout**：检查 provider 连通性，并按需要调整 `CAREER_OPS_CN_EVALUATION_TIMEOUT_MS`。
 - **用户取消**：Side Panel 显示“已取消”是预期结果，当前子进程会收到取消信号。
+- **任务 interrupted**：标签页刷新、Content Script/Side Panel 断开或 Bridge 重启会保留已完成计数并把未完成 run 标记为 `interrupted`；刷新 BOSS 页面后可重新开始。
 - **登录失效**：在 BOSS 页面重新登录，刷新页面后再次检测。
 - **challenge 或账号风险**：立即停止扫描，在浏览器中由用户自行完成站点要求；工具不会绕过验证。
 - **unsupported layout**：先刷新页面和扩展；若仍失败，需要用真实页面证据更新 `packages/boss-adapter` 的 fixture、Selector 和测试。
@@ -139,7 +146,8 @@ SQLite 中会保存职位描述和完整 raw report。不要把真实数据库�
 
 - 第一阶段只支持 BOSS 直聘网页版。
 - 自动翻页依赖 BOSS 当前页面仍能识别出“下一页”控件；站点改版后可能需要更新 Selector fixture。
-- 扫描状态只存在于当前 Side Panel 会话，不是后台持久任务；关闭页面或重新加载扩展会结束当前轮次。
+- 扫描执行仍只存在于用户主动打开的前台 Extension 上下文；Bridge/SQLite 持久化状态和结果，但关闭 Side Panel 不会在后台继续操纵 BOSS 页面。
+- BOSS 列表不提供完整 JD。卡片字段未变化时会按要求跳过重复详情读取；远端仅修改 JD、但列表字段完全不变的情况，要等后续显式读取到新详情后才能发现并生成新 `jd_hash`。
 - BOSS 页面结构变化可能导致 Selector 暂时失效。
 - 真实评估依赖本机 `career-ops`、provider 配置和可用模型额度。
 - Side Panel 必须在受支持的 BOSS 页面打开，重新加载扩展后需要刷新已有标签页。
@@ -149,7 +157,7 @@ SQLite 中会保存职位描述和完整 raw report。不要把真实数据库�
 - `pnpm typecheck`：检查全部 workspace 的 TypeScript 类型。
 - `pnpm test`：运行全部 Vitest 测试。
 - `pnpm build`：构建 workspace 和 Chromium MV3 扩展。
-- `pnpm smoke`：用临时数据库跑通 fixture Job → Bridge → Evaluation → SQLite，并校验扩展产物。
+- `pnpm smoke`：用临时数据库跑通 fixture Scan Run → Job → Evaluation → SQLite，并校验扩展产物。
 - `pnpm check`：依次运行 typecheck、test、build 和 smoke。
 
 ## 许可证

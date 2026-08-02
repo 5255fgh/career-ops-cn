@@ -5,6 +5,7 @@ import type { ScanState } from '../../lib/scan-controller';
 import { SidePanelView, type SidePanelViewProps } from './SidePanelView';
 
 const completedState: ScanState = {
+  runId: 'scan-1',
   status: 'completed',
   progress: {
     pagesVisited: 2,
@@ -13,8 +14,13 @@ const completedState: ScanState = {
     screenedJobs: 12,
     detailCompleted: 2,
     detailTarget: 2,
+    detailSuccess: 2,
+    detailFailure: 0,
     aiCompleted: 1,
     aiTarget: 1,
+    aiSuccess: 1,
+    aiFailure: 0,
+    cacheHits: 0,
   },
   stopReason: null,
   error: null,
@@ -58,6 +64,8 @@ const completedState: ScanState = {
         title: '高级前端开发工程师',
         company: '示例科技',
         identityVerified: true,
+        firstSeenAt: '2026-08-01T10:00:00.000Z',
+        lastSeenAt: '2026-08-01T10:00:00.000Z',
       },
       evaluation: {
         score: 91,
@@ -93,6 +101,8 @@ function props(overrides: Partial<SidePanelViewProps> = {}): SidePanelViewProps 
         title: '高级前端开发工程师',
         company: '示例科技',
         identityVerified: true,
+        firstSeenAt: '2026-08-01T10:00:00.000Z',
+        lastSeenAt: '2026-08-01T10:00:00.000Z',
         latestEvaluation: completedState.results[0]!.evaluation,
         decision: { jobId: 'saved-1', decision: 'apply' },
       },
@@ -183,5 +193,24 @@ describe('SidePanelView', () => {
 
     expect(html).toContain('停止原因：challenge');
     expect(html).toContain('页面已停止扫描：challenge');
+  });
+
+  it('interrupted 状态显示持久化进度、失败摘要和重新开始入口', () => {
+    const html = renderToStaticMarkup(
+      <SidePanelView
+        {...props({
+          scanState: {
+            ...completedState,
+            status: 'interrupted',
+            error: '1 个详情失败；已完成结果仍可复用。',
+          },
+        })}
+      />,
+    );
+
+    expect(html).toContain('已中断');
+    expect(html).toContain('重新开始');
+    expect(html).toContain('1 个详情失败；已完成结果仍可复用。');
+    expect(html).toContain('评估缓存命中');
   });
 });

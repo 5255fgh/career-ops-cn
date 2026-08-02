@@ -1,31 +1,44 @@
 import {
   BridgeErrorResponseSchema,
   BridgeSettingsSchema,
-  CreateJobRequestSchema,
+  CreateScanRunRequestSchema,
   DecisionRequestSchema,
   DecisionResponseSchema,
   DiagnosticEventRequestSchema,
   DiagnosticEventSchema,
   DiagnosticListResponseSchema,
-  EvaluationResultSchema,
+  EvaluateJobRequestSchema,
+  EvaluationResponseSchema,
   HealthResponseSchema,
+  InterruptScanRunRequestSchema,
   JobListResponseSchema,
   JobResponseSchema,
+  LatestScanRunResponseSchema,
+  ObserveJobsRequestSchema,
+  ObserveJobsResponseSchema,
+  RequestScanRunCancelSchema,
+  SaveJobRequestSchema,
+  ScanRunSchema,
   ScreenRequestSchema,
   ScreenResponseSchema,
-  type CreateJobRequest,
+  UpdateScanRunRequestSchema,
   type DecisionRequest,
   type DecisionResponse,
   type DiagnosticEvent,
   type DiagnosticEventRequest,
-  type EvaluationResult,
+  type EvaluationResponse,
+  type InterruptScanRunRequest,
   type JobCard,
   type JobDetail,
   type JobHistoryEntry,
+  type JobObservation,
   type JobResponse,
   type Preferences,
+  type ScanRun,
+  type ScanRunSnapshot,
   type ScreeningPhase,
   type ScreeningResult,
+  type UpdateScanRunRequest,
 } from '@career-ops-cn/shared';
 
 export const DEFAULT_BRIDGE_BASE_URL = 'http://127.0.0.1:3847';
@@ -40,12 +53,23 @@ export interface BridgeClient {
     signal?: AbortSignal,
     phase?: ScreeningPhase,
   ): Promise<ScreeningResult[]>;
-  saveJob(job: JobDetail, signal?: AbortSignal): Promise<JobResponse>;
-  evaluateJob(jobId: string, signal?: AbortSignal): Promise<EvaluationResult>;
+  createScanRun(signal?: AbortSignal): Promise<ScanRun>;
+  updateScanRun(runId: string, update: UpdateScanRunRequest, signal?: AbortSignal): Promise<ScanRun>;
+  latestScanRun(signal?: AbortSignal): Promise<ScanRunSnapshot | null>;
+  requestScanRunCancel(runId: string, signal?: AbortSignal): Promise<ScanRun>;
+  interruptScanRun(runId: string, request?: InterruptScanRunRequest, signal?: AbortSignal): Promise<ScanRun>;
+  observeJobs(runId: string, sourceQuery: string, jobs: readonly JobCard[], signal?: AbortSignal): Promise<JobObservation[]>;
+  saveJob(job: JobDetail, signal?: AbortSignal, context?: ScanJobContext): Promise<JobResponse>;
+  evaluateJob(jobId: string, signal?: AbortSignal, scanRunId?: string): Promise<EvaluationResponse>;
   listJobs(signal?: AbortSignal): Promise<JobHistoryEntry[]>;
   saveDecision(jobId: string, decision: DecisionRequest, signal?: AbortSignal): Promise<DecisionResponse>;
   recordDiagnostic(event: DiagnosticEventRequest, signal?: AbortSignal): Promise<DiagnosticEvent>;
   listDiagnostics(limit?: number, signal?: AbortSignal): Promise<DiagnosticEvent[]>;
+}
+
+export interface ScanJobContext {
+  scanRunId: string;
+  sourceQuery: string;
 }
 
 export interface CreateBridgeClientOptions {
@@ -82,8 +106,11 @@ export function isAbortError(error: unknown): boolean {
   return error instanceof Error && error.name === 'AbortError';
 }
 
-export function toCreateJobRequest(job: JobDetail): CreateJobRequest {
-  return CreateJobRequestSchema.parse({
+export function toCreateJobRequest(
+  job: JobDetail,
+  context?: ScanJobContext,
+) {
+  return SaveJobRequestSchema.parse({
     source: 'boss',
     sourceJobId: job.jobId,
     title: job.title,
@@ -95,6 +122,7 @@ export function toCreateJobRequest(job: JobDetail): CreateJobRequest {
     description: job.description,
     url: job.detailUrl,
     identityVerified: job.identityVerified,
+    ...(context === undefined ? {} : context),
   });
 }
 
@@ -191,6 +219,132 @@ export function createBridgeClient({
       ).status === 'ok';
     },
 
+    async createScanRun(signal) {
+      const request = CreateScanRunRequestSchema.parse({});
+      const response = await fetchBridge(
+        fetchImpl,
+        normalizedBaseUrl,
+        settings.bridgeToken,
+        '/scan-runs',
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(request),
+        },
+        signal,
+      );
+      return parseBridgePayload(
+        ScanRunSchema,
+        await readResponse(response),
+        'Scan run',
+      );
+    },
+
+    async updateScanRun(runId, update, signal) {
+      const request = UpdateScanRunRequestSchema.parse(update);
+      const response = await fetchBridge(
+        fetchImpl,
+        normalizedBaseUrl,
+        settings.bridgeToken,
+        `/scan-runs/${encodeURIComponent(runId)}/progress`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(request),
+        },
+        signal,
+      );
+      return parseBridgePayload(
+        ScanRunSchema,
+        await readResponse(response),
+        'Scan run',
+      );
+    },
+
+    async latestScanRun(signal) {
+      const response = await fetchBridge(
+        fetchImpl,
+        normalizedBaseUrl,
+        settings.bridgeToken,
+        '/scan-runs/latest',
+        { method: 'GET' },
+        signal,
+      );
+      return parseBridgePayload(
+        LatestScanRunResponseSchema,
+        await readResponse(response),
+        'Scan run snapshot',
+      );
+    },
+
+    async requestScanRunCancel(runId, signal) {
+      const request = RequestScanRunCancelSchema.parse({});
+      const response = await fetchBridge(
+        fetchImpl,
+        normalizedBaseUrl,
+        settings.bridgeToken,
+        `/scan-runs/${encodeURIComponent(runId)}/cancel`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(request),
+        },
+        signal,
+      );
+      return parseBridgePayload(
+        ScanRunSchema,
+        await readResponse(response),
+        'Scan run',
+      );
+    },
+
+    async interruptScanRun(runId, interrupt = {}, signal) {
+      const request = InterruptScanRunRequestSchema.parse(interrupt);
+      const response = await fetchBridge(
+        fetchImpl,
+        normalizedBaseUrl,
+        settings.bridgeToken,
+        `/scan-runs/${encodeURIComponent(runId)}/interrupted`,
+        {
+          method: 'POST',
+          keepalive: true,
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(request),
+        },
+        signal,
+      );
+      return parseBridgePayload(
+        ScanRunSchema,
+        await readResponse(response),
+        'Scan run',
+      );
+    },
+
+    async observeJobs(runId, sourceQuery, jobs, signal) {
+      const request = ObserveJobsRequestSchema.parse({
+        scanRunId: runId,
+        sourceQuery,
+        jobs: [...jobs],
+      });
+      const response = await fetchBridge(
+        fetchImpl,
+        normalizedBaseUrl,
+        settings.bridgeToken,
+        '/jobs/observe',
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(request),
+        },
+        signal,
+      );
+      return parseBridgePayload(
+        ObserveJobsResponseSchema,
+        await readResponse(response),
+        'Job observations',
+      );
+    },
+
     async screenJobs(jobs, preferences, signal, phase = 'list') {
       const request = ScreenRequestSchema.parse({
         jobs: [...jobs],
@@ -216,8 +370,8 @@ export function createBridgeClient({
       );
     },
 
-    async saveJob(job, signal) {
-      const request = toCreateJobRequest(job);
+    async saveJob(job, signal, context) {
+      const request = toCreateJobRequest(job, context);
       const response = await fetchBridge(
         fetchImpl,
         normalizedBaseUrl,
@@ -234,17 +388,24 @@ export function createBridgeClient({
       return parseBridgePayload(JobResponseSchema, await readResponse(response), 'Job');
     },
 
-    async evaluateJob(jobId, signal) {
+    async evaluateJob(jobId, signal, scanRunId) {
+      const request = EvaluateJobRequestSchema.parse({
+        ...(scanRunId === undefined ? {} : { scanRunId }),
+      });
       const response = await fetchBridge(
         fetchImpl,
         normalizedBaseUrl,
         settings.bridgeToken,
         `/jobs/${encodeURIComponent(jobId)}/evaluate`,
-        { method: 'POST' },
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(request),
+        },
         signal,
       );
       return parseBridgePayload(
-        EvaluationResultSchema,
+        EvaluationResponseSchema,
         await readResponse(response),
         'Evaluation',
       );

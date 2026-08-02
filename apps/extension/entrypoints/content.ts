@@ -56,6 +56,15 @@ function visibleCardSignature(): string {
     .join('\u001e');
 }
 
+function currentSourceQuery(): string {
+  const url = new URL(window.location.href);
+  for (const key of ['ka', 'lid', 'securityId', 'sessionId']) {
+    url.searchParams.delete(key);
+  }
+  url.searchParams.sort();
+  return `boss:${url.pathname}${url.search}`.slice(0, 2_048);
+}
+
 function isDisabled(element: Element): boolean {
   return (
     element.matches(bossSelectors.pagination.disabled) ||
@@ -196,6 +205,7 @@ export default defineContentScript({
           type: 'boss/detect-page/response',
           pageType: detectBossPage(document, window.location.href),
           block: detectBossPageBlock(document, window.location.href),
+          sourceQuery: currentSourceQuery(),
         });
       }
 

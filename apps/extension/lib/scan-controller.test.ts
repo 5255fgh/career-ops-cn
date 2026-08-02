@@ -3,6 +3,7 @@ import {
   JobResponseSchema,
   type JobCard,
   type JobDetail,
+  type ScanRunSnapshot,
   type ScreeningPhase,
   type VisibleJobCard,
 } from '@career-ops-cn/shared';
@@ -14,7 +15,11 @@ import {
   type ContentClient,
   type TabsClient,
 } from './content-client';
-import { DEFAULT_SCAN_CONFIG, ScanController } from './scan-controller';
+import {
+  DEFAULT_SCAN_CONFIG,
+  ScanController,
+  scanStateFromSnapshot,
+} from './scan-controller';
 
 function visibleCard(index: number, page = 0): VisibleJobCard {
   const suffix = page * 100 + index;
@@ -53,7 +58,31 @@ function savedFor(detail: JobDetail) {
     description: detail.description,
     url: detail.detailUrl,
     identityVerified: true,
+    firstSeenAt: '2026-08-01T10:00:00.000Z',
+    lastSeenAt: '2026-08-01T10:00:00.000Z',
   });
+}
+
+function scanRun(status: 'running' | 'cancelled' | 'interrupted' = 'running') {
+  return {
+    id: 'scan-1',
+    status,
+    phase: status === 'running' ? ('starting' as const) : ('finished' as const),
+    startedAt: '2026-08-01T10:00:00.000Z',
+    updatedAt: '2026-08-01T10:00:00.000Z',
+    finishedAt: status === 'running' ? null : '2026-08-01T10:00:01.000Z',
+    pageCount: 0,
+    discoveredCount: 0,
+    newJobCount: 0,
+    detailSuccessCount: 0,
+    detailFailureCount: 0,
+    aiSuccessCount: 0,
+    aiFailureCount: 0,
+    cacheHitCount: 0,
+    stopReason: null,
+    errorSummary: null,
+    cancelRequested: false,
+  };
 }
 
 function contentMock(pages: VisibleJobCard[][]): ContentClient {
@@ -99,6 +128,25 @@ function contentMock(pages: VisibleJobCard[][]): ContentClient {
 function bridgeMock(): BridgeClient {
   return {
     health: vi.fn(async () => true),
+    createScanRun: vi.fn(async () => scanRun()),
+    updateScanRun: vi.fn(async () => scanRun()),
+    latestScanRun: vi.fn(async () => null),
+    requestScanRunCancel: vi.fn(async () => ({
+      ...scanRun(),
+      cancelRequested: true,
+    })),
+    interruptScanRun: vi.fn(async () => scanRun('interrupted')),
+    observeJobs: vi.fn(async (
+      _runId: string,
+      _sourceQuery: string,
+      jobs: readonly JobCard[],
+    ) =>
+      jobs.map((job) => ({
+        sourceJobId: job.jobId,
+        action: 'read-detail' as const,
+        reason: 'new' as const,
+      })),
+    ),
     screenJobs: vi.fn(
       async (jobs: readonly (JobCard | JobDetail)[]) =>
         jobs.map((job) => ({
@@ -109,11 +157,14 @@ function bridgeMock(): BridgeClient {
     ),
     saveJob: vi.fn(async (detail) => savedFor(detail)),
     evaluateJob: vi.fn(async () => ({
-      score: 88,
-      recommendation: 'apply',
-      archetype: 'Builder',
-      legitimacy: 'high',
-      rawReport: '完整 career-ops 原始报告。',
+      evaluation: {
+        score: 88,
+        recommendation: 'apply',
+        archetype: 'Builder',
+        legitimacy: 'high',
+        rawReport: '完整 career-ops 原始报告。',
+      },
+      cacheHit: false,
     })),
     listJobs: vi.fn(async () => []),
     saveDecision: vi.fn(async (jobId, decision) => ({ jobId, ...decision })),
@@ -140,6 +191,54 @@ function controller(
 }
 
 describe('ScanController', () => {
+  it('Side Panel 重建后从 Bridge 快照恢复 interrupted 进度和结果', () => {
+    const card = visibleCard(0);
+    const saved = savedFor(detailFor(card));
+    const snapshot: ScanRunSnapshot = {
+      run: {
+        ...scanRun('interrupted'),
+        pageCount: 2,
+        discoveredCount: 12,
+        newJobCount: 4,
+        detailSuccessCount: 3,
+        detailFailureCount: 1,
+        aiSuccessCount: 2,
+        aiFailureCount: 1,
+        cacheHitCount: 1,
+        stopReason: 'bridge-restarted',
+        errorSummary: '1 个详情失败；1 个评估失败。',
+      },
+      jobs: [
+        {
+          ...saved,
+          latestEvaluation: {
+            score: 90,
+            recommendation: 'apply',
+            rawReport: '已持久化评估。',
+          },
+        },
+      ],
+    };
+
+    const restored = scanStateFromSnapshot(snapshot);
+
+    expect(restored).toMatchObject({
+      runId: 'scan-1',
+      status: 'interrupted',
+      progress: {
+        pagesVisited: 2,
+        listJobs: 12,
+        detailCompleted: 4,
+        aiCompleted: 3,
+        cacheHits: 1,
+      },
+      error: '1 个详情失败；1 个评估失败。',
+    });
+    expect(restored.results).toHaveLength(1);
+    expect(restored.results[0]?.evaluation?.score).toBe(90);
+    expect(restored.warnings[0]).toContain('可重新开始');
+  });
+
   it('固定默认预算支持 3 页、60 个新职位和至少 30 次 AI', () => {
     expect(DEFAULT_SCAN_CONFIG).toMatchObject({
       maxPages: 3,
@@ -368,9 +467,12 @@ describe('ScanController', () => {
     vi.mocked(bridge.evaluateJob)
       .mockRejectedValueOnce(new Error('AI provider unavailable'))
       .mockResolvedValueOnce({
-        score: 92,
-        recommendation: 'apply',
-        rawReport: '第二个职位评估成功。',
+        evaluation: {
+          score: 92,
+          recommendation: 'apply',
+          rawReport: '第二个职位评估成功。',
+        },
+        cacheHit: false,
       });
 
     const state = await controller(content, bridge).run({ maxPages: 1 });
@@ -440,17 +542,21 @@ describe('ScanController', () => {
     const duplicate = visibleCard(0);
     const content = contentMock([[duplicate], [duplicate], [visibleCard(1, 2)]]);
     const bridge = bridgeMock();
-    vi.mocked(bridge.listJobs).mockResolvedValue([
-      JobResponseSchema.parse({
-        id: 'saved-existing',
-        source: 'boss',
-        sourceJobId: duplicate.job.jobId,
-        title: duplicate.job.title,
-        company: duplicate.job.companyName,
-        url: duplicate.job.detailUrl,
-        identityVerified: true,
-      }),
-    ]);
+    const existing = savedFor(detailFor(duplicate));
+    vi.mocked(bridge.observeJobs).mockImplementation(
+      async (_runId, _sourceQuery, jobs) =>
+        jobs.map((job) => ({
+          sourceJobId: job.jobId,
+          action: 'reuse' as const,
+          job: existing,
+          evaluation: {
+            score: 88,
+            recommendation: 'apply',
+            rawReport: '缓存评估。',
+          },
+          cacheHit: true,
+        })),
+    );
 
     const state = await controller(content, bridge).run();
 
@@ -458,7 +564,10 @@ describe('ScanController', () => {
     expect(state.stopReason).toBe('no_new_jobs');
     expect(state.progress.pagesVisited).toBe(2);
     expect(content.advanceSearchPage).toHaveBeenCalledOnce();
-    expect(state.results).toHaveLength(0);
+    expect(state.results).toHaveLength(1);
+    expect(state.progress.cacheHits).toBe(1);
+    expect(content.startDetailScan).not.toHaveBeenCalled();
+    expect(bridge.evaluateJob).not.toHaveBeenCalled();
   });
 
   it('单轮达到最长时间后以正常预算停止，不进入失控循环', async () => {
@@ -547,5 +656,29 @@ describe('ScanController', () => {
     expect(content.cancelDetailScan).toHaveBeenCalledOnce();
     expect(state.results[0]?.savedJob).toBeDefined();
     expect(state.results[1]?.savedJob).toBeUndefined();
+  });
+
+  it('Side Panel 关闭时不等待 Content Script 即发出 keepalive 中断写入', async () => {
+    const content = contentMock([[]]);
+    let finishContentCancellation: (() => void) | undefined;
+    vi.mocked(content.cancelDetailScan).mockImplementation(
+      async () =>
+        await new Promise<boolean>((resolve) => {
+          finishContentCancellation = () => resolve(true);
+        }),
+    );
+    const bridge = bridgeMock();
+    const scan = controller(content, bridge);
+    scan.restore({ run: scanRun(), jobs: [] });
+
+    const interrupted = scan.interrupt('side-panel-closed');
+
+    expect(bridge.interruptScanRun).toHaveBeenCalledWith('scan-1', {
+      reason: 'side-panel-closed',
+      errorSummary: '扫描上下文已关闭，可重新开始并复用已完成结果。',
+    });
+    finishContentCancellation?.();
+    await interrupted;
+    expect(scan.state.status).toBe('interrupted');
   });
 });

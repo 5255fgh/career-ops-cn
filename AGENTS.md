@@ -17,3 +17,7 @@
 15. `packages/shared` 可以根据真实证据调整，但不能在多个并行分支同时随意修改。
 16. 单职位错误默认隔离并继续；只有登录失效、challenge、账号风险、搜索页整体解析失败或连续同类 Parser 错误可以停止整轮。
 17. diagnostics 必须 best-effort，写入失败不得改变职位保存、筛选、评估或整轮扫描的业务结果。
+18. scan run、职位增量字段、评估缓存和取消标志的权威状态必须保存在 Bridge/SQLite；Side Panel 与 ScanController 的内存状态只是当前执行投影，Background 仍不得持有长任务业务状态。
+19. Content Script 只负责 BOSS DOM 读取、详情抓取和翻页；ScanController 负责浏览器侧顺序；Bridge 不得直接操作浏览器 DOM，并负责职位增量判断和基于完整输入版本的评估缓存。
+20. 相同评估 cache key 不得重复调用 evaluator；JD、规则、profile、Prompt、模型或评估结构版本变化时必须允许重新评估，且只保留单轮 AI 防失控上限，不增加每日上限。
+21. 数据清理保持固定简单规则：diagnostics 约 5000 条、成功 run 约 100 次、失败/取消/中断 run 约 30 天、每职位少量评估版本，不引入通用清理框架或保存整页原始 HTML。
