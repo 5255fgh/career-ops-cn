@@ -313,7 +313,6 @@ async function evaluateJob(
         : { details: { sourceJobId: job.sourceJobId } }),
     });
     const output = await evaluator(detail, {
-      careerOpsRoot: config.careerOpsRoot,
       timeoutMs: config.evaluationTimeoutMs,
       signal: controller.signal,
     });
@@ -407,13 +406,6 @@ async function evaluateJob(
     }
 
     if (error instanceof Error && "code" in error) {
-      if (error.code === "SCRIPT_NOT_FOUND") {
-        throw bridgeFailure(
-          "CAREER_OPS_NOT_FOUND",
-          "未找到 career-ops evaluator。",
-          { cause: error },
-        );
-      }
       if (error.code === "TIMEOUT") {
         throw bridgeFailure("EVALUATION_TIMEOUT", "career-ops 评估超时。", {
           cause: error,

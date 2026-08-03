@@ -43,7 +43,6 @@ const PREFERENCES: Preferences = {
 
 const TEST_ENVIRONMENT = {
   CAREER_OPS_CN_TOKEN: "test-token",
-  CAREER_OPS_CN_CAREER_OPS_ROOT: "D:\\career-ops-test",
   CAREER_OPS_CN_PREFERENCES: JSON.stringify(PREFERENCES),
   CAREER_OPS_CN_EVALUATION_TIMEOUT_MS: "5000",
 } satisfies NodeJS.ProcessEnv;
@@ -875,8 +874,8 @@ describe("evaluate", () => {
         jd_hash: changed.jdHash,
         profile_hash: expect.stringMatching(/^[a-f0-9]{64}$/u),
         rules_hash: expect.stringMatching(/^[a-f0-9]{64}$/u),
-        prompt_version: "career-ops-prompt-v1",
-        model_id: "career-ops-default",
+        prompt_version: "career-ops-cn-openai-v1",
+        model_id: "gpt-4o-mini",
         evaluation_schema_version: "1",
         input_hash: expect.stringMatching(/^[a-f0-9]{64}$/u),
         cache_key: expect.stringMatching(/^[a-f0-9]{64}$/u),
@@ -1329,11 +1328,8 @@ describe("候选池与持久化", () => {
 });
 
 describe("Bridge 配置与监听", () => {
-  it("缺少 token 或 careerOpsRoot 时拒绝，并使用默认端口 3847", () => {
+  it("缺少 token 时拒绝，并使用默认端口 3847", () => {
     expect(() => readBridgeConfig({})).toThrow(/CAREER_OPS_CN_TOKEN/);
-    expect(() =>
-      readBridgeConfig({ CAREER_OPS_CN_TOKEN: "token" }),
-    ).toThrow(/CAREER_OPS_CN_CAREER_OPS_ROOT/);
     expect(readBridgeConfig(TEST_ENVIRONMENT).port).toBe(
       DEFAULT_BRIDGE_PORT,
     );

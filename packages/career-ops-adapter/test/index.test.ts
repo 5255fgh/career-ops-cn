@@ -1,9 +1,7 @@
-import { access, cp, mkdtemp, readFile, rm } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { readFile } from "node:fs/promises";
 
 import { JobDetailSchema, type JobDetail } from "@career-ops-cn/shared";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
   CareerOpsAdapterError,
@@ -15,32 +13,9 @@ const fixtureDirectory = new URL(
   "../../../fixtures/career-ops-output/",
   import.meta.url,
 );
-const fakeCliUrl = new URL("./fake-cli.mjs", import.meta.url);
-const temporaryRoots: string[] = [];
 
 const readOutputFixture = (filename: string): Promise<string> =>
   readFile(new URL(filename, fixtureDirectory), "utf8");
-
-async function createFakeCareerOpsRoot(): Promise<string> {
-  const root = await mkdtemp(join(tmpdir(), "career-ops-fake-"));
-  temporaryRoots.push(root);
-  await cp(fakeCliUrl, join(root, "openai-eval.mjs"));
-  await cp(fixtureDirectory, join(root, "fixtures"), { recursive: true });
-  return root;
-}
-
-async function waitForFile(path: string, timeoutMs = 1_000): Promise<void> {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    try {
-      await access(path);
-      return;
-    } catch {
-      await new Promise((resolvePromise) => setTimeout(resolvePromise, 10));
-    }
-  }
-  throw new Error(`等待文件超时：${path}`);
-}
 
 function jobDetail(jobId: string): JobDetail {
   return JobDetailSchema.parse({
@@ -57,6 +32,25 @@ function jobDetail(jobId: string): JobDetail {
   });
 }
 
+function useRemoteOpenAIEnvironment(): void {
+  vi.stubEnv("OPENAI_API_KEY", "sk-SYNTHETIC_TEST_KEY_NOT_VALID_000000");
+  vi.stubEnv("OPENAI_BASE_URL", "https://api.example.test/v1");
+  vi.stubEnv("OPENAI_MODEL", "example-model");
+}
+
+function completionResponse(content: string): Response {
+  return new Response(
+    JSON.stringify({
+      id: "chatcmpl-test",
+      choices: [{ message: { role: "assistant", content } }],
+    }),
+    {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    },
+  );
+}
+
 async function expectAdapterError(
   promise: Promise<unknown>,
   code: CareerOpsAdapterError["code"],
@@ -71,31 +65,29 @@ async function expectAdapterError(
   throw new Error(`预期 ${code} 错误，但 Promise 成功完成。`);
 }
 
-afterEach(async () => {
-  await Promise.all(
-    temporaryRoots.splice(0).map((root) =>
-      rm(root, { recursive: true, force: true }),
-    ),
-  );
+afterEach(() => {
+  vi.useRealTimers();
+  vi.unstubAllEnvs();
+  vi.unstubAllGlobals();
 });
 
 describe("parseCareerOpsOutput", () => {
   it("解析中文输出并保留完整 rawReport", async () => {
-    const stdout = await readOutputFixture("normal-zh.txt");
-    expect(parseCareerOpsOutput(stdout)).toEqual({
+    const output = await readOutputFixture("normal-zh.txt");
+    expect(parseCareerOpsOutput(output)).toEqual({
       company: "星河科技",
       role: "高级前端工程师",
       score: 4.2,
       archetype: "Builder",
       legitimacy: "high",
       recommendation: "apply",
-      rawReport: stdout,
+      rawReport: output,
     });
   });
 
   it("解析英文输出", async () => {
-    const stdout = await readOutputFixture("normal-en.txt");
-    expect(parseCareerOpsOutput(stdout)).toMatchObject({
+    const output = await readOutputFixture("normal-en.txt");
+    expect(parseCareerOpsOutput(output)).toMatchObject({
       company: "Northstar Labs",
       role: "Product Engineer",
       score: 3.6,
@@ -117,22 +109,22 @@ describe("parseCareerOpsOutput", () => {
   });
 
   it("summary 缺失时失败", async () => {
-    const stdout = await readOutputFixture("summary-missing.txt");
-    expect(() => parseCareerOpsOutput(stdout)).toThrowError(
+    const output = await readOutputFixture("summary-missing.txt");
+    expect(() => parseCareerOpsOutput(output)).toThrowError(
       expect.objectContaining({ code: "SUMMARY_MISSING" }),
     );
   });
 
   it("score 损坏时失败", async () => {
-    const stdout = await readOutputFixture("score-corrupt.txt");
-    expect(() => parseCareerOpsOutput(stdout)).toThrowError(
+    const output = await readOutputFixture("score-corrupt.txt");
+    expect(() => parseCareerOpsOutput(output)).toThrowError(
       expect.objectContaining({ code: "SCORE_INVALID" }),
     );
   });
 
   it("score 越界时失败", async () => {
-    const stdout = await readOutputFixture("score-out-of-range.txt");
-    expect(() => parseCareerOpsOutput(stdout)).toThrowError(
+    const output = await readOutputFixture("score-out-of-range.txt");
+    expect(() => parseCareerOpsOutput(output)).toThrowError(
       expect.objectContaining({ code: "SCORE_OUT_OF_RANGE" }),
     );
   });
@@ -155,7 +147,7 @@ describe("parseCareerOpsOutput", () => {
     ).toThrowError(expect.objectContaining({ code: "SCORE_MISSING" }));
   });
 
-  it("按阈值生成初始 recommendation", () => {
+  it("按阈值生成 recommendation", () => {
     const report = (score: number): string =>
       `---SCORE_SUMMARY---\nSCORE: ${score}\n---END_SUMMARY---\n`;
     expect(parseCareerOpsOutput(report(4)).recommendation).toBe("apply");
@@ -165,143 +157,225 @@ describe("parseCareerOpsOutput", () => {
 });
 
 describe("evaluateWithCareerOps", () => {
-  it("使用固定命令结构、传临时文件并清理", async () => {
-    const careerOpsRoot = await createFakeCareerOpsRoot();
-    const result = await evaluateWithCareerOps(jobDetail("normal-zh"), {
-      careerOpsRoot,
-    });
+  it("直接调用 OpenAI-compatible API 并保持现有评估字段", async () => {
+    useRemoteOpenAIEnvironment();
+    const output = (await readOutputFixture("normal-zh.txt")).trim();
+    const fetchMock = vi.fn<typeof fetch>();
+    fetchMock.mockResolvedValue(completionResponse(output));
+    vi.stubGlobal("fetch", fetchMock);
 
-    expect(result).toMatchObject({
+    const input = jobDetail("normal-zh");
+    const result = await evaluateWithCareerOps(input, { timeoutMs: 5_000 });
+
+    expect(result).toEqual({
       score: 84,
       recommendation: "apply",
+      rawReport: output,
       company: "星河科技",
       role: "高级前端工程师",
       archetype: "Builder",
       legitimacy: "high",
     });
-
-    const invocation = JSON.parse(
-      await readFile(join(careerOpsRoot, "last-invocation.json"), "utf8"),
-    ) as {
-      execPath: string;
-      scriptPath: string;
-      args: string[];
-      cwd: string;
-      inputPath: string;
-      input: JobDetail;
-    };
-    expect(invocation.execPath).toBe(process.execPath);
-    expect(invocation.scriptPath).toBe(
-      join(careerOpsRoot, "openai-eval.mjs"),
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const [url, init] = fetchMock.mock.calls[0] ?? [];
+    expect(url).toBe("https://api.example.test/v1/chat/completions");
+    const headers = new Headers(init?.headers);
+    expect(headers.get("Authorization")).toBe(
+      "Bearer sk-SYNTHETIC_TEST_KEY_NOT_VALID_000000",
     );
-    expect(invocation.args).toEqual([
-      "--file",
-      invocation.inputPath,
-      "--no-save",
-    ]);
-    expect(invocation.cwd).toBe(careerOpsRoot);
-    expect(invocation.input).toEqual(jobDetail("normal-zh"));
-    await expect(access(invocation.inputPath)).rejects.toThrow();
-    await expect(access(join(careerOpsRoot, "reports"))).rejects.toThrow();
+    const request = JSON.parse(String(init?.body)) as {
+      model: string;
+      messages: Array<{ role: string; content: string }>;
+      stream: boolean;
+      temperature: number;
+    };
+    expect(request.model).toBe("example-model");
+    expect(request.stream).toBe(false);
+    expect(request.temperature).toBe(0.4);
+    expect(request.messages[0]?.content).toContain("A) Role Summary");
+    expect(request.messages[0]?.content).toContain(
+      "Do not generate or rewrite a resume",
+    );
+    expect(request.messages[1]?.content).toContain(
+      JSON.stringify(input, null, 2),
+    );
   });
 
-  it("openai-eval.mjs 不存在时失败", async () => {
-    const careerOpsRoot = await mkdtemp(join(tmpdir(), "career-ops-empty-"));
-    temporaryRoots.push(careerOpsRoot);
+  it("回环 HTTP endpoint 不要求 API Key", async () => {
+    vi.stubEnv("OPENAI_API_KEY", "");
+    vi.stubEnv("OPENAI_BASE_URL", "http://127.0.0.1:45678/v1/");
+    vi.stubEnv("OPENAI_MODEL", "local-model");
+    const output = (await readOutputFixture("normal-en.txt")).trim();
+    const fetchMock = vi.fn<typeof fetch>();
+    fetchMock.mockResolvedValue(completionResponse(output));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(
+      evaluateWithCareerOps(jobDetail("local")),
+    ).resolves.toMatchObject({ score: 72, recommendation: "review" });
+    const [, init] = fetchMock.mock.calls[0] ?? [];
+    expect(new Headers(init?.headers).has("Authorization")).toBe(false);
+  });
+
+  it("远程 endpoint 缺少 API Key 时明确失败", async () => {
+    vi.stubEnv("OPENAI_API_KEY", "");
+    vi.stubEnv("OPENAI_BASE_URL", "https://api.example.test/v1");
+    const fetchMock = vi.fn<typeof fetch>();
+    vi.stubGlobal("fetch", fetchMock);
+
     await expectAdapterError(
-      evaluateWithCareerOps(jobDetail("normal-zh"), { careerOpsRoot }),
-      "SCRIPT_NOT_FOUND",
+      evaluateWithCareerOps(jobDetail("missing-key")),
+      "AUTHENTICATION_ERROR",
     );
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 
   it("API 认证错误不泄漏 API Key", async () => {
-    const careerOpsRoot = await createFakeCareerOpsRoot();
+    useRemoteOpenAIEnvironment();
+    const fetchMock = vi.fn<typeof fetch>();
+    fetchMock.mockResolvedValue(
+      new Response(
+        "incorrect api key sk-SYNTHETIC_TEST_KEY_NOT_VALID_000000",
+        { status: 401 },
+      ),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
     const error = await expectAdapterError(
-      evaluateWithCareerOps(jobDetail("api-auth-error"), { careerOpsRoot }),
+      evaluateWithCareerOps(jobDetail("api-auth-error")),
       "AUTHENTICATION_ERROR",
     );
-    expect(error.message).not.toContain("sk-THIS_IS_A_SYNTHETIC_TEST_KEY_NOT_VALID_000000");
-  });
-
-  it("非零退出返回明确错误", async () => {
-    const careerOpsRoot = await createFakeCareerOpsRoot();
-    const error = await expectAdapterError(
-      evaluateWithCareerOps(jobDetail("non-zero-exit"), { careerOpsRoot }),
-      "NON_ZERO_EXIT",
+    expect(error.message).not.toContain(
+      "sk-SYNTHETIC_TEST_KEY_NOT_VALID_000000",
     );
-    expect(error.exitCode).toBe(2);
   });
 
   it("502/503/504 网关错误有限重试后可以恢复", async () => {
-    const careerOpsRoot = await createFakeCareerOpsRoot();
-    const result = await evaluateWithCareerOps(
-      jobDetail("gateway-retry-success"),
-      { careerOpsRoot },
-    );
+    vi.useFakeTimers();
+    useRemoteOpenAIEnvironment();
+    const output = (await readOutputFixture("normal-zh.txt")).trim();
+    const fetchMock = vi.fn<typeof fetch>();
+    fetchMock
+      .mockResolvedValueOnce(new Response("bad gateway", { status: 502 }))
+      .mockResolvedValueOnce(new Response("unavailable", { status: 503 }))
+      .mockResolvedValueOnce(completionResponse(output));
+    vi.stubGlobal("fetch", fetchMock);
 
-    expect(result.score).toBe(84);
-    await expect(
-      readFile(join(careerOpsRoot, "gateway-attempt.txt"), "utf8"),
-    ).resolves.toBe("3");
+    const evaluation = evaluateWithCareerOps(jobDetail("gateway-retry"));
+    await vi.runAllTimersAsync();
+
+    await expect(evaluation).resolves.toMatchObject({ score: 84 });
+    expect(fetchMock).toHaveBeenCalledTimes(3);
   });
 
   it("网关持续失败时保留状态、次数和脱敏诊断", async () => {
-    const careerOpsRoot = await createFakeCareerOpsRoot();
-    const error = await expectAdapterError(
-      evaluateWithCareerOps(jobDetail("gateway-always-fail"), {
-        careerOpsRoot,
-      }),
-      "UPSTREAM_UNAVAILABLE",
+    vi.useFakeTimers();
+    useRemoteOpenAIEnvironment();
+    const fetchMock = vi.fn<typeof fetch>();
+    fetchMock.mockResolvedValue(
+      new Response(
+        "upstream overloaded; api key: sk-SYNTHETIC_TEST_KEY_NOT_VALID_000000",
+        { status: 503 },
+      ),
     );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const evaluation = evaluateWithCareerOps(jobDetail("gateway-failure"));
+    const rejection = expectAdapterError(evaluation, "UPSTREAM_UNAVAILABLE");
+    await vi.runAllTimersAsync();
+    const error = await rejection;
 
     expect(error).toMatchObject({ httpStatus: 503, attempts: 3 });
     expect(error.diagnostic).toContain("upstream overloaded");
     expect(error.diagnostic).not.toMatch(/\bsk-[A-Za-z0-9_-]+\b/u);
+    expect(fetchMock).toHaveBeenCalledTimes(3);
   });
 
-  it("stdout 超限时终止子进程", async () => {
-    const careerOpsRoot = await createFakeCareerOpsRoot();
+  it("超出响应大小限制时失败", async () => {
+    useRemoteOpenAIEnvironment();
+    const fetchMock = vi.fn<typeof fetch>();
+    fetchMock.mockResolvedValue(completionResponse("x".repeat(1_000)));
+    vi.stubGlobal("fetch", fetchMock);
+
     const error = await expectAdapterError(
-      evaluateWithCareerOps(jobDetail("stdout-over-limit"), {
-        careerOpsRoot,
+      evaluateWithCareerOps(jobDetail("over-limit"), {
         maxOutputBytes: 64,
       }),
       "OUTPUT_LIMIT_EXCEEDED",
     );
-    expect(error.stream).toBe("stdout");
+    expect(error.httpStatus).toBe(200);
   });
 
-  it("timeout 先终止当前子进程并返回 TIMEOUT", async () => {
-    const careerOpsRoot = await createFakeCareerOpsRoot();
-    const fixture = JSON.parse(
-      await readOutputFixture("timeout.json"),
-    ) as { expectedError: CareerOpsAdapterError["code"] };
+  it("timeout 会中止 HTTP 请求并返回 TIMEOUT", async () => {
+    useRemoteOpenAIEnvironment();
+    const fetchMock = vi.fn<typeof fetch>();
+    fetchMock.mockImplementation(
+      async (_input, init) =>
+        await new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener(
+            "abort",
+            () => reject(new DOMException("aborted", "AbortError")),
+            { once: true },
+          );
+        }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
     await expectAdapterError(
-      evaluateWithCareerOps(jobDetail("timeout"), {
-        careerOpsRoot,
-        timeoutMs: 50,
-      }),
-      fixture.expectedError,
+      evaluateWithCareerOps(jobDetail("timeout"), { timeoutMs: 10 }),
+      "TIMEOUT",
     );
   });
 
-  it("AbortSignal 终止当前子进程并返回 CANCELLED", async () => {
-    const careerOpsRoot = await createFakeCareerOpsRoot();
-    const fixture = JSON.parse(
-      await readOutputFixture("cancel.json"),
-    ) as { expectedError: CareerOpsAdapterError["code"] };
+  it("AbortSignal 会中止 HTTP 请求并返回 CANCELLED", async () => {
+    useRemoteOpenAIEnvironment();
+    const fetchMock = vi.fn<typeof fetch>();
+    fetchMock.mockImplementation(
+      async (_input, init) =>
+        await new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener(
+            "abort",
+            () => reject(new DOMException("aborted", "AbortError")),
+            { once: true },
+          );
+        }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
     const controller = new AbortController();
+
     const evaluation = evaluateWithCareerOps(jobDetail("cancel"), {
-      careerOpsRoot,
       signal: controller.signal,
     });
-    const invocationPath = join(careerOpsRoot, "last-invocation.json");
-    await waitForFile(invocationPath);
-    const invocation = JSON.parse(
-      await readFile(invocationPath, "utf8"),
-    ) as { inputPath: string };
     controller.abort();
-    await expectAdapterError(evaluation, fixture.expectedError);
-    await expect(access(invocation.inputPath)).rejects.toThrow();
+
+    await expectAdapterError(evaluation, "CANCELLED");
+  });
+
+  it("无效 API JSON、空结果和缺少 summary 都会失败", async () => {
+    useRemoteOpenAIEnvironment();
+    const fetchMock = vi.fn<typeof fetch>();
+    vi.stubGlobal("fetch", fetchMock);
+
+    fetchMock.mockResolvedValueOnce(new Response("not json", { status: 200 }));
+    await expectAdapterError(
+      evaluateWithCareerOps(jobDetail("invalid-json")),
+      "INVALID_MODEL_OUTPUT",
+    );
+
+    fetchMock.mockResolvedValueOnce(
+      new Response(JSON.stringify({ choices: [] }), { status: 200 }),
+    );
+    await expectAdapterError(
+      evaluateWithCareerOps(jobDetail("empty-choices")),
+      "INVALID_MODEL_OUTPUT",
+    );
+
+    fetchMock.mockResolvedValueOnce(
+      completionResponse("只有分析正文，没有机器摘要。"),
+    );
+    await expectAdapterError(
+      evaluateWithCareerOps(jobDetail("missing-summary")),
+      "SUMMARY_MISSING",
+    );
   });
 });

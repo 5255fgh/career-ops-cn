@@ -1,2 +1,0 @@
-❌  API error: HTTP 503
-    {"error":{"message":"upstream overloaded","type":"server_error"}}

@@ -1,8 +1,3 @@
-import { spawn } from "node:child_process";
-import { mkdtemp, rm, stat, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
-
 import {
   EvaluationResultSchema,
   JobDetailSchema,
@@ -13,12 +8,67 @@ import { z } from "zod";
 
 const DEFAULT_TIMEOUT_MS = 30_000;
 const DEFAULT_MAX_OUTPUT_BYTES = 1024 * 1024;
-const TERMINATION_GRACE_MS = 250;
-const SUMMARY_START = "---SCORE_SUMMARY---";
-const SUMMARY_END = "---END_SUMMARY---";
+const DEFAULT_OPENAI_BASE_URL = "https://api.openai.com/v1";
+const DEFAULT_OPENAI_MODEL = "gpt-4o-mini";
 const ERROR_EXCERPT_LENGTH = 500;
 const MAX_DIAGNOSTIC_LENGTH = 16 * 1024;
 const GATEWAY_RETRY_DELAYS_MS = [250, 1_000] as const;
+const SUMMARY_START = "---SCORE_SUMMARY---";
+const SUMMARY_END = "---END_SUMMARY---";
+
+const SYSTEM_PROMPT = `You are career-ops, an AI-powered job evaluator.
+
+Evaluate only the evidence in the supplied BOSS JobDetail. There is no candidate
+resume or external company research in this request. Never invent candidate
+experience, company facts, benefits, salary details, or posting signals that are
+not present in the input. Clearly label uncertainty and missing information.
+
+Write all human-facing output in Simplified Chinese. Produce these sections:
+
+A) Role Summary
+- Company, role, location, compensation, seniority, education, and core duties.
+- State which details are explicit and which are missing.
+
+B) Requirements and Transferability
+- Separate must-have skills, preferred skills, and responsibilities.
+- Assess how specific, coherent, and realistically transferable the requirements are.
+- Do not claim a personal CV match.
+
+C) Level and Career Value
+- Assess seniority consistency, ownership, growth potential, and likely trade-offs.
+
+D) Compensation and Working Conditions
+- Interpret only compensation and working-condition evidence in the JobDetail.
+- Do not invent market benchmarks; list questions for missing terms.
+
+E) Application Focus
+- Give concise points the user could verify or emphasize before applying.
+- Do not generate or rewrite a resume, cover letter, or application message.
+
+F) Interview Plan
+- Give focused verification questions about scope, team, expectations, and risks.
+
+G) Posting Legitimacy
+- Judge only the supplied text and identityVerified flag.
+- Check specificity, internal consistency, unrealistic claims, discriminatory or
+  coercive language, suspicious contact/payment requests, and missing essentials.
+- Use exactly one label: High Confidence, Proceed with Caution, or Suspicious.
+
+Scoring rules:
+- Score the opportunity from 0.0 to 5.0 using role clarity, requirement coherence,
+  compensation transparency, career value, and legitimacy.
+- Missing evidence lowers confidence; serious fraud or safety signals lower the score.
+- Use one decimal place and explain the main reasons. Do not manufacture precision.
+
+At the very end, output exactly one machine-readable block with ASCII colons:
+
+---SCORE_SUMMARY---
+COMPANY: <company name from the input>
+ROLE: <role title from the input>
+SCORE: <decimal from 0.0 to 5.0>
+ARCHETYPE: <Builder | Operator | Specialist | Leader | Generalist | Unknown>
+LEGITIMACY: <High Confidence | Proceed with Caution | Suspicious>
+---END_SUMMARY---`;
 
 const AbortSignalSchema = z.custom<AbortSignal>(
   (value) =>
@@ -30,21 +80,7 @@ const AbortSignalSchema = z.custom<AbortSignal>(
   "必须是 AbortSignal",
 );
 
-const RunProcessOptionsSchema = z.strictObject({
-  command: z.string().trim().min(1),
-  args: z.array(z.string()).default([]),
-  cwd: z.string().trim().min(1).optional(),
-  timeoutMs: z.number().int().positive().default(DEFAULT_TIMEOUT_MS),
-  signal: AbortSignalSchema.optional(),
-  maxOutputBytes: z
-    .number()
-    .int()
-    .positive()
-    .default(DEFAULT_MAX_OUTPUT_BYTES),
-});
-
 const EvaluateWithCareerOpsOptionsSchema = z.strictObject({
-  careerOpsRoot: z.string().trim().min(1),
   timeoutMs: z.number().int().positive().default(DEFAULT_TIMEOUT_MS),
   signal: AbortSignalSchema.optional(),
   maxOutputBytes: z
@@ -67,16 +103,28 @@ const ParsedCareerOpsOutputSchema = z.strictObject({
     .refine((value) => value.trim().length > 0, "rawReport 不能为空"),
 });
 
+const ChatCompletionSchema = z.object({
+  choices: z
+    .array(
+      z.object({
+        message: z.object({
+          content: z.string(),
+        }),
+      }),
+    )
+    .min(1),
+});
+
 export type CareerOpsAdapterErrorCode =
   | "INVALID_INPUT"
-  | "SCRIPT_NOT_FOUND"
-  | "PROCESS_START_FAILED"
+  | "INVALID_CONFIGURATION"
   | "AUTHENTICATION_ERROR"
   | "UPSTREAM_UNAVAILABLE"
-  | "NON_ZERO_EXIT"
+  | "API_ERROR"
   | "OUTPUT_LIMIT_EXCEEDED"
   | "TIMEOUT"
   | "CANCELLED"
+  | "INVALID_MODEL_OUTPUT"
   | "SUMMARY_MISSING"
   | "SCORE_MISSING"
   | "SCORE_INVALID"
@@ -84,24 +132,7 @@ export type CareerOpsAdapterErrorCode =
 
 export type CareerOpsRecommendation = "apply" | "review" | "skip";
 
-export interface RunProcessOptions {
-  command: string;
-  args?: readonly string[];
-  cwd?: string;
-  timeoutMs?: number;
-  signal?: AbortSignal;
-  maxOutputBytes?: number;
-}
-
-export interface RunProcessResult {
-  stdout: string;
-  stderr: string;
-  exitCode: 0;
-  signal: null;
-}
-
 export interface EvaluateWithCareerOpsOptions {
-  careerOpsRoot: string;
   timeoutMs?: number;
   signal?: AbortSignal;
   maxOutputBytes?: number;
@@ -127,19 +158,20 @@ export interface CareerOpsEvaluationResult extends EvaluationResult {
 
 interface CareerOpsAdapterErrorOptions {
   cause?: unknown;
-  exitCode?: number | null;
-  signal?: NodeJS.Signals | null;
-  stream?: "stdout" | "stderr" | null;
   httpStatus?: number | null;
   attempts?: number;
   diagnostic?: string | null;
 }
 
+interface OpenAIConfig {
+  endpoint: string;
+  endpointHost: string;
+  model: string;
+  apiKey: string;
+}
+
 export class CareerOpsAdapterError extends Error {
   readonly code: CareerOpsAdapterErrorCode;
-  readonly exitCode: number | null;
-  readonly signal: NodeJS.Signals | null;
-  readonly stream: "stdout" | "stderr" | null;
   readonly httpStatus: number | null;
   readonly attempts: number;
   readonly diagnostic: string | null;
@@ -155,9 +187,6 @@ export class CareerOpsAdapterError extends Error {
     );
     this.name = "CareerOpsAdapterError";
     this.code = code;
-    this.exitCode = options.exitCode ?? null;
-    this.signal = options.signal ?? null;
-    this.stream = options.stream ?? null;
     this.httpStatus = options.httpStatus ?? null;
     this.attempts = options.attempts ?? 1;
     this.diagnostic = options.diagnostic ?? null;
@@ -186,32 +215,14 @@ function redactSensitiveText(value: string): string {
     .replace(/(api[_ -]?key\s*(?:is|=|:)\s*)\S+/gi, "$1[REDACTED]");
 }
 
-function errorExcerpt(stderr: string): string {
-  return redactSensitiveText(stripAnsi(stderr))
-    .trim()
-    .slice(0, ERROR_EXCERPT_LENGTH);
-}
-
-function diagnosticText(stderr: string): string {
-  return redactSensitiveText(stripAnsi(stderr))
+function diagnosticText(value: string): string {
+  return redactSensitiveText(stripAnsi(value))
     .trim()
     .slice(0, MAX_DIAGNOSTIC_LENGTH);
 }
 
-function gatewayStatus(stderr: string): 502 | 503 | 504 | null {
-  const match = stripAnsi(stderr).match(
-    /(?:API error:\s*)?HTTP\s+(502|503|504)\b/iu,
-  );
-  if (match?.[1] === "502") return 502;
-  if (match?.[1] === "503") return 503;
-  if (match?.[1] === "504") return 504;
-  return null;
-}
-
-function isAuthenticationError(stderr: string): boolean {
-  return /(?:\b401\b|authentication|unauthorized|incorrect api key|invalid api key)/i.test(
-    stripAnsi(stderr),
-  );
+function errorExcerpt(value: string): string {
+  return diagnosticText(value).slice(0, ERROR_EXCERPT_LENGTH);
 }
 
 function recommendationForScore(score: number): CareerOpsRecommendation {
@@ -224,205 +235,258 @@ function recommendationForScore(score: number): CareerOpsRecommendation {
   return "skip";
 }
 
-export function runProcess(options: RunProcessOptions): Promise<RunProcessResult> {
-  const parsedOptions = RunProcessOptionsSchema.safeParse(options);
-  if (!parsedOptions.success) {
-    return Promise.reject(
-      asInvalidInputError("子进程参数无效。", parsedOptions.error),
+function isLoopback(hostname: string): boolean {
+  return (
+    hostname === "localhost" ||
+    hostname === "127.0.0.1" ||
+    hostname === "::1"
+  );
+}
+
+function isAborted(signal: AbortSignal | undefined): boolean {
+  return signal?.aborted ?? false;
+}
+
+function readOpenAIConfig(
+  environment: NodeJS.ProcessEnv = process.env,
+): OpenAIConfig {
+  const baseUrl = (
+    environment.OPENAI_BASE_URL?.trim() || DEFAULT_OPENAI_BASE_URL
+  ).replace(/\/+$/u, "");
+  const model = environment.OPENAI_MODEL?.trim() || DEFAULT_OPENAI_MODEL;
+  const apiKey = environment.OPENAI_API_KEY?.trim() ?? "";
+
+  let parsedUrl: URL;
+  try {
+    parsedUrl = new URL(baseUrl);
+  } catch (cause) {
+    throw new CareerOpsAdapterError(
+      "INVALID_CONFIGURATION",
+      "OPENAI_BASE_URL 不是有效 URL。",
+      { cause },
     );
   }
 
-  const {
-    command,
-    args,
-    cwd,
-    timeoutMs,
-    signal: abortSignal,
-    maxOutputBytes,
-  } = parsedOptions.data;
-
-  if (abortSignal?.aborted === true) {
-    return Promise.reject(
-      new CareerOpsAdapterError("CANCELLED", "career-ops 执行已取消。"),
+  const loopback = isLoopback(parsedUrl.hostname);
+  if (parsedUrl.protocol !== "https:" && !(loopback && parsedUrl.protocol === "http:")) {
+    throw new CareerOpsAdapterError(
+      "INVALID_CONFIGURATION",
+      "远程 OPENAI_BASE_URL 必须使用 HTTPS；HTTP 只允许回环地址。",
+    );
+  }
+  if (!loopback && apiKey.length === 0) {
+    throw new CareerOpsAdapterError(
+      "AUTHENTICATION_ERROR",
+      `缺少 ${parsedUrl.hostname} 所需的 OPENAI_API_KEY。`,
     );
   }
 
-  return new Promise((resolvePromise, rejectPromise) => {
-    const child = spawn(command, args, {
-      cwd,
-      shell: false,
-      stdio: ["ignore", "pipe", "pipe"],
-      windowsHide: true,
-    });
-    const stdoutChunks: Buffer[] = [];
-    const stderrChunks: Buffer[] = [];
-    let stdoutBytes = 0;
-    let stderrBytes = 0;
-    let terminalError: CareerOpsAdapterError | undefined;
-    let terminationTimer: NodeJS.Timeout | undefined;
+  return {
+    endpoint: `${baseUrl}/chat/completions`,
+    endpointHost: parsedUrl.hostname,
+    model,
+    apiKey,
+  };
+}
 
-    const terminate = (error: CareerOpsAdapterError): void => {
-      if (terminalError !== undefined) {
-        return;
+async function readResponseText(
+  response: Response,
+  maxOutputBytes: number,
+): Promise<string> {
+  const declaredLength = Number(response.headers.get("content-length"));
+  if (Number.isFinite(declaredLength) && declaredLength > maxOutputBytes) {
+    throw new CareerOpsAdapterError(
+      "OUTPUT_LIMIT_EXCEEDED",
+      `OpenAI-compatible 响应超过 ${maxOutputBytes} 字节限制。`,
+      { httpStatus: response.status },
+    );
+  }
+
+  if (response.body === null) {
+    return "";
+  }
+
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let bytes = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) {
+        break;
       }
-      terminalError = error;
-
-      if (child.exitCode !== null || child.signalCode !== null) {
-        return;
-      }
-
-      child.kill("SIGTERM");
-      terminationTimer = setTimeout(() => {
-        if (child.exitCode === null && child.signalCode === null) {
-          child.kill("SIGKILL");
-        }
-      }, TERMINATION_GRACE_MS);
-      terminationTimer.unref();
-    };
-
-    const handleChunk = (
-      stream: "stdout" | "stderr",
-      chunk: Buffer,
-    ): void => {
-      if (terminalError !== undefined) {
-        return;
-      }
-
-      if (stream === "stdout") {
-        stdoutBytes += chunk.byteLength;
-        if (stdoutBytes > maxOutputBytes) {
-          terminate(
-            new CareerOpsAdapterError(
-              "OUTPUT_LIMIT_EXCEEDED",
-              `career-ops stdout 超过 ${maxOutputBytes} 字节限制。`,
-              { stream },
-            ),
-          );
-          return;
-        }
-        stdoutChunks.push(chunk);
-        return;
-      }
-
-      stderrBytes += chunk.byteLength;
-      if (stderrBytes > maxOutputBytes) {
-        terminate(
-          new CareerOpsAdapterError(
-            "OUTPUT_LIMIT_EXCEEDED",
-            `career-ops stderr 超过 ${maxOutputBytes} 字节限制。`,
-            { stream },
-          ),
+      bytes += value.byteLength;
+      if (bytes > maxOutputBytes) {
+        await reader.cancel();
+        throw new CareerOpsAdapterError(
+          "OUTPUT_LIMIT_EXCEEDED",
+          `OpenAI-compatible 响应超过 ${maxOutputBytes} 字节限制。`,
+          { httpStatus: response.status },
         );
-        return;
       }
-      stderrChunks.push(chunk);
+      chunks.push(value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+
+  return Buffer.concat(chunks.map((chunk) => Buffer.from(chunk))).toString(
+    "utf8",
+  );
+}
+
+async function requestEvaluation(
+  input: JobDetail,
+  config: OpenAIConfig,
+  options: z.infer<typeof EvaluateWithCareerOpsOptionsSchema>,
+): Promise<string> {
+  if (isAborted(options.signal)) {
+    throw new CareerOpsAdapterError("CANCELLED", "career-ops 评估已取消。");
+  }
+
+  const controller = new AbortController();
+  let timedOut = false;
+  const timeout = setTimeout(() => {
+    timedOut = true;
+    controller.abort();
+  }, options.timeoutMs);
+  timeout.unref();
+
+  const cancel = (): void => {
+    controller.abort(options.signal?.reason);
+  };
+  options.signal?.addEventListener("abort", cancel, { once: true });
+
+  try {
+    const headers: Record<string, string> = {
+      "Content-Type": "application/json",
     };
+    if (config.apiKey.length > 0) {
+      headers.Authorization = `Bearer ${config.apiKey}`;
+    }
 
-    child.stdout.on("data", (chunk: Buffer) => {
-      handleChunk("stdout", chunk);
+    const response = await fetch(config.endpoint, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        model: config.model,
+        messages: [
+          { role: "system", content: SYSTEM_PROMPT },
+          {
+            role: "user",
+            content: `JOB DESCRIPTION TO EVALUATE:\n\n${JSON.stringify(input, null, 2)}`,
+          },
+        ],
+        stream: false,
+        temperature: 0.4,
+      }),
+      signal: controller.signal,
     });
-    child.stderr.on("data", (chunk: Buffer) => {
-      handleChunk("stderr", chunk);
-    });
+    const responseText = await readResponseText(
+      response,
+      options.maxOutputBytes,
+    );
 
-    const timeoutTimer = setTimeout(() => {
-      terminate(
-        new CareerOpsAdapterError(
-          "TIMEOUT",
-          `career-ops 执行超过 ${timeoutMs} 毫秒。`,
-        ),
+    if (response.status === 401 || response.status === 403) {
+      throw new CareerOpsAdapterError(
+        "AUTHENTICATION_ERROR",
+        `OpenAI-compatible API 认证失败（HTTP ${response.status}）。`,
+        { httpStatus: response.status },
       );
-    }, timeoutMs);
-    timeoutTimer.unref();
-
-    const abortListener = (): void => {
-      terminate(
-        new CareerOpsAdapterError("CANCELLED", "career-ops 执行已取消。"),
+    }
+    if (
+      response.status === 502 ||
+      response.status === 503 ||
+      response.status === 504
+    ) {
+      throw new CareerOpsAdapterError(
+        "UPSTREAM_UNAVAILABLE",
+        `OpenAI-compatible provider 返回 HTTP ${response.status}。`,
+        {
+          httpStatus: response.status,
+          diagnostic: diagnosticText(responseText),
+        },
       );
-    };
-    abortSignal?.addEventListener("abort", abortListener, { once: true });
+    }
+    if (!response.ok) {
+      const excerpt = errorExcerpt(responseText);
+      const suffix = excerpt.length === 0 ? "" : `：${excerpt}`;
+      throw new CareerOpsAdapterError(
+        "API_ERROR",
+        `OpenAI-compatible API 返回 HTTP ${response.status}${suffix}`,
+        {
+          httpStatus: response.status,
+          diagnostic: diagnosticText(responseText),
+        },
+      );
+    }
 
-    child.once("error", (cause) => {
-      if (terminalError === undefined) {
-        terminalError = new CareerOpsAdapterError(
-          "PROCESS_START_FAILED",
-          "无法启动 career-ops 子进程。",
-          { cause },
-        );
-      }
-    });
+    let decoded: unknown;
+    try {
+      decoded = JSON.parse(responseText);
+    } catch (cause) {
+      throw new CareerOpsAdapterError(
+        "INVALID_MODEL_OUTPUT",
+        "OpenAI-compatible API 返回了无效 JSON。",
+        { cause },
+      );
+    }
 
-    child.once("close", (exitCode, exitSignal) => {
-      clearTimeout(timeoutTimer);
-      if (terminationTimer !== undefined) {
-        clearTimeout(terminationTimer);
-      }
-      abortSignal?.removeEventListener("abort", abortListener);
-
-      if (terminalError !== undefined) {
-        rejectPromise(terminalError);
-        return;
-      }
-
-      const stdout = Buffer.concat(stdoutChunks).toString("utf8");
-      const stderr = Buffer.concat(stderrChunks).toString("utf8");
-
-      if (exitCode !== 0) {
-        if (isAuthenticationError(stderr)) {
-          rejectPromise(
-            new CareerOpsAdapterError(
-              "AUTHENTICATION_ERROR",
-              "career-ops API 认证失败。",
-              { exitCode, signal: exitSignal },
-            ),
-          );
-          return;
-        }
-
-        const upstreamStatus = gatewayStatus(stderr);
-        if (upstreamStatus !== null) {
-          rejectPromise(
-            new CareerOpsAdapterError(
-              "UPSTREAM_UNAVAILABLE",
-              `career-ops provider 返回 HTTP ${upstreamStatus}。`,
-              {
-                exitCode,
-                signal: exitSignal,
-                httpStatus: upstreamStatus,
-                diagnostic: diagnosticText(stderr),
-              },
-            ),
-          );
-          return;
-        }
-
-        const excerpt = errorExcerpt(stderr);
-        const suffix = excerpt.length === 0 ? "" : `：${excerpt}`;
-        rejectPromise(
-          new CareerOpsAdapterError(
-            "NON_ZERO_EXIT",
-            `career-ops 以非零状态 ${exitCode ?? "unknown"} 退出${suffix}`,
-            { exitCode, signal: exitSignal },
-          ),
-        );
-        return;
-      }
-
-      resolvePromise({ stdout, stderr, exitCode: 0, signal: null });
-    });
-  });
+    const completion = ChatCompletionSchema.safeParse(decoded);
+    if (!completion.success) {
+      throw new CareerOpsAdapterError(
+        "INVALID_MODEL_OUTPUT",
+        "OpenAI-compatible API 响应缺少文本结果。",
+        { cause: completion.error },
+      );
+    }
+    const content = completion.data.choices[0]?.message.content.trim() ?? "";
+    if (content.length === 0) {
+      throw new CareerOpsAdapterError(
+        "INVALID_MODEL_OUTPUT",
+        "OpenAI-compatible API 返回了空评估。",
+      );
+    }
+    return content;
+  } catch (error) {
+    if (error instanceof CareerOpsAdapterError) {
+      throw error;
+    }
+    if (timedOut) {
+      throw new CareerOpsAdapterError(
+        "TIMEOUT",
+        `career-ops 评估超过 ${options.timeoutMs} 毫秒。`,
+        { cause: error },
+      );
+    }
+    if (isAborted(options.signal)) {
+      throw new CareerOpsAdapterError(
+        "CANCELLED",
+        "career-ops 评估已取消。",
+        { cause: error },
+      );
+    }
+    const message = error instanceof Error ? error.message : String(error);
+    throw new CareerOpsAdapterError(
+      "API_ERROR",
+      `OpenAI-compatible API 调用失败：${errorExcerpt(message)}`,
+      { cause: error, diagnostic: diagnosticText(message) },
+    );
+  } finally {
+    clearTimeout(timeout);
+    options.signal?.removeEventListener("abort", cancel);
+  }
 }
 
 async function waitForRetry(
   milliseconds: number,
   signal: AbortSignal | undefined,
 ): Promise<void> {
-  if (signal?.aborted === true) {
-    throw new CareerOpsAdapterError("CANCELLED", "career-ops 执行已取消。");
+  if (isAborted(signal)) {
+    throw new CareerOpsAdapterError("CANCELLED", "career-ops 评估已取消。");
   }
   await new Promise<void>((resolvePromise, rejectPromise) => {
-    const cleanup = (): void =>
-      signal?.removeEventListener("abort", onAbort);
+    const cleanup = (): void => signal?.removeEventListener("abort", onAbort);
     const timer = setTimeout(() => {
       cleanup();
       resolvePromise();
@@ -431,15 +495,15 @@ async function waitForRetry(
       clearTimeout(timer);
       cleanup();
       rejectPromise(
-        new CareerOpsAdapterError("CANCELLED", "career-ops 执行已取消。"),
+        new CareerOpsAdapterError("CANCELLED", "career-ops 评估已取消。"),
       );
     };
     signal?.addEventListener("abort", onAbort, { once: true });
   });
 }
 
-export function parseCareerOpsOutput(stdout: string): ParsedCareerOpsOutput {
-  const strippedOutput = stripAnsi(stdout);
+export function parseCareerOpsOutput(output: string): ParsedCareerOpsOutput {
+  const strippedOutput = stripAnsi(output);
   const summaryStart = strippedOutput.indexOf(SUMMARY_START);
   if (summaryStart === -1) {
     throw new CareerOpsAdapterError(
@@ -476,7 +540,6 @@ export function parseCareerOpsOutput(stdout: string): ParsedCareerOpsOutput {
       "career-ops summary 缺少 SCORE。",
     );
   }
-
   if (!/^[+-]?(?:\d+(?:\.\d*)?|\.\d+)$/.test(scoreText)) {
     throw new CareerOpsAdapterError(
       "SCORE_INVALID",
@@ -502,7 +565,6 @@ export function parseCareerOpsOutput(stdout: string): ParsedCareerOpsOutput {
     const value = fields.get(name)?.trim();
     return value === undefined || value.length === 0 ? null : value;
   };
-
   const parsed = ParsedCareerOpsOutputSchema.safeParse({
     company: nullableField("COMPANY"),
     role: nullableField("ROLE"),
@@ -520,7 +582,7 @@ export function parseCareerOpsOutput(stdout: string): ParsedCareerOpsOutput {
 
 export async function evaluateWithCareerOps(
   input: JobDetail,
-  options: EvaluateWithCareerOpsOptions,
+  options: EvaluateWithCareerOpsOptions = {},
 ): Promise<CareerOpsEvaluationResult> {
   const parsedInput = JobDetailSchema.safeParse(input);
   if (!parsedInput.success) {
@@ -532,107 +594,75 @@ export async function evaluateWithCareerOps(
     throw asInvalidInputError("career-ops 适配器参数无效。", parsedOptions.error);
   }
 
-  const careerOpsRoot = resolve(parsedOptions.data.careerOpsRoot);
-  const scriptPath = join(careerOpsRoot, "openai-eval.mjs");
-  try {
-    const scriptStats = await stat(scriptPath);
-    if (!scriptStats.isFile()) {
-      throw new Error("不是文件");
-    }
-  } catch (cause) {
-    throw new CareerOpsAdapterError(
-      "SCRIPT_NOT_FOUND",
-      `未找到 career-ops evaluator：${scriptPath}`,
-      { cause },
-    );
-  }
-
-  const temporaryDirectory = await mkdtemp(join(tmpdir(), "career-ops-cn-"));
-  const jobDetailPath = join(temporaryDirectory, "job-detail.json");
-
-  try {
-    await writeFile(
-      jobDetailPath,
-      `${JSON.stringify(parsedInput.data, null, 2)}\n`,
-      { encoding: "utf8", mode: 0o600 },
-    );
-
-    let result: RunProcessResult | undefined;
-    const gatewayDiagnostics: string[] = [];
-    for (
-      let attempt = 1;
-      attempt <= GATEWAY_RETRY_DELAYS_MS.length + 1;
-      attempt += 1
-    ) {
-      try {
-        result = await runProcess({
-          command: process.execPath,
-          args: [scriptPath, "--file", jobDetailPath, "--no-save"],
-          cwd: careerOpsRoot,
-          timeoutMs: parsedOptions.data.timeoutMs,
-          maxOutputBytes: parsedOptions.data.maxOutputBytes,
-          ...(parsedOptions.data.signal === undefined
-            ? {}
-            : { signal: parsedOptions.data.signal }),
-        });
-        break;
-      } catch (error) {
-        if (
-          !(error instanceof CareerOpsAdapterError) ||
-          error.code !== "UPSTREAM_UNAVAILABLE"
-        ) {
-          throw error;
-        }
-        gatewayDiagnostics.push(
-          `attempt ${attempt}: ${error.diagnostic ?? error.message}`,
-        );
-        const retryDelay = GATEWAY_RETRY_DELAYS_MS[attempt - 1];
-        if (retryDelay === undefined) {
-          throw new CareerOpsAdapterError(
-            "UPSTREAM_UNAVAILABLE",
-            `career-ops provider HTTP ${error.httpStatus ?? "unknown"}，${attempt} 次尝试均失败。`,
-            {
-              cause: error,
-              exitCode: error.exitCode,
-              signal: error.signal,
-              httpStatus: error.httpStatus,
-              attempts: attempt,
-              diagnostic: gatewayDiagnostics
-                .join("\n\n")
-                .slice(0, MAX_DIAGNOSTIC_LENGTH),
-            },
-          );
-        }
-        await waitForRetry(retryDelay, parsedOptions.data.signal);
-      }
-    }
-    if (result === undefined) {
-      throw new CareerOpsAdapterError(
-        "UPSTREAM_UNAVAILABLE",
-        "career-ops provider 重试未返回结果。",
-        { attempts: GATEWAY_RETRY_DELAYS_MS.length + 1 },
+  const config = readOpenAIConfig();
+  const gatewayDiagnostics: string[] = [];
+  let evaluationText: string | undefined;
+  for (
+    let attempt = 1;
+    attempt <= GATEWAY_RETRY_DELAYS_MS.length + 1;
+    attempt += 1
+  ) {
+    try {
+      evaluationText = await requestEvaluation(
+        parsedInput.data,
+        config,
+        parsedOptions.data,
       );
+      break;
+    } catch (error) {
+      if (
+        !(error instanceof CareerOpsAdapterError) ||
+        error.code !== "UPSTREAM_UNAVAILABLE"
+      ) {
+        throw error;
+      }
+      gatewayDiagnostics.push(
+        `attempt ${attempt}: ${error.diagnostic ?? error.message}`,
+      );
+      const retryDelay = GATEWAY_RETRY_DELAYS_MS[attempt - 1];
+      if (retryDelay === undefined) {
+        throw new CareerOpsAdapterError(
+          "UPSTREAM_UNAVAILABLE",
+          `OpenAI-compatible provider HTTP ${error.httpStatus ?? "unknown"}，${attempt} 次尝试均失败。`,
+          {
+            cause: error,
+            httpStatus: error.httpStatus,
+            attempts: attempt,
+            diagnostic: gatewayDiagnostics
+              .join("\n\n")
+              .slice(0, MAX_DIAGNOSTIC_LENGTH),
+          },
+        );
+      }
+      await waitForRetry(retryDelay, parsedOptions.data.signal);
     }
-    const parsedOutput = parseCareerOpsOutput(result.stdout);
-    const evaluation = EvaluationResultSchema.parse({
-      score: Math.round(parsedOutput.score * 20),
-      recommendation: parsedOutput.recommendation,
-      rawReport: parsedOutput.rawReport,
-      company: parsedOutput.company,
-      role: parsedOutput.role,
-      archetype: parsedOutput.archetype,
-      legitimacy: parsedOutput.legitimacy,
-    });
-
-    return {
-      ...evaluation,
-      company: evaluation.company ?? null,
-      role: evaluation.role ?? null,
-      archetype: evaluation.archetype ?? null,
-      legitimacy: evaluation.legitimacy ?? null,
-      recommendation: parsedOutput.recommendation,
-    };
-  } finally {
-    await rm(temporaryDirectory, { recursive: true, force: true });
   }
+
+  if (evaluationText === undefined) {
+    throw new CareerOpsAdapterError(
+      "UPSTREAM_UNAVAILABLE",
+      "OpenAI-compatible provider 重试未返回结果。",
+      { attempts: GATEWAY_RETRY_DELAYS_MS.length + 1 },
+    );
+  }
+
+  const parsedOutput = parseCareerOpsOutput(evaluationText);
+  const evaluation = EvaluationResultSchema.parse({
+    score: Math.round(parsedOutput.score * 20),
+    recommendation: parsedOutput.recommendation,
+    rawReport: parsedOutput.rawReport,
+    company: parsedOutput.company,
+    role: parsedOutput.role,
+    archetype: parsedOutput.archetype,
+    legitimacy: parsedOutput.legitimacy,
+  });
+
+  return {
+    ...evaluation,
+    company: evaluation.company ?? null,
+    role: evaluation.role ?? null,
+    archetype: evaluation.archetype ?? null,
+    legitimacy: evaluation.legitimacy ?? null,
+    recommendation: parsedOutput.recommendation,
+  };
 }

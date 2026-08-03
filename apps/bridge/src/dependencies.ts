@@ -10,7 +10,6 @@ import type {
 import { bridgeFailure } from "./errors.js";
 
 export interface EvaluationOptions {
-  careerOpsRoot: string;
   timeoutMs: number;
   signal: AbortSignal;
 }

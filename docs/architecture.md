@@ -1,6 +1,6 @@
 # 主体边界
 
-当前实现由 Extension、Bridge、SQLite 和本机 `career-ops` 适配器组成。用户在 Side Panel 点击一次“开始扫描”后，Extension 在当前 BOSS 搜索条件内执行一个前台扫描轮次；不会定时启动，也不会在关闭 Side Panel 后继续操作浏览器。轮次的权威状态和已保存结果位于 Bridge/SQLite，Side Panel 只是可重建的展示与执行投影。
+当前实现由 Extension、Bridge、SQLite 和仓库内置的 OpenAI-compatible evaluator 组成。用户在 Side Panel 点击一次“开始扫描”后，Extension 在当前 BOSS 搜索条件内执行一个前台扫描轮次；不会定时启动，也不会在关闭 Side Panel 后继续操作浏览器。轮次的权威状态和已保存结果位于 Bridge/SQLite，Side Panel 只是可重建的展示与执行投影。
 
 ## Extension
 
@@ -67,7 +67,9 @@ Bridge 只绑定 `127.0.0.1`，启动时读取 `CAREER_OPS_CN_TOKEN`。`GET /hea
 - 每个职位最多保留最近 3 个评估版本。
 - 不保存整页原始 HTML，也不引入清理框架、Redis、队列、Cron 或通用调度器。
 
-`packages/career-ops-adapter` 是唯一允许启动 `career-ops` 子进程的位置，使用 `spawn`、`shell: false`、显式超时和取消信号。
+`packages/career-ops-adapter` 内置唯一的 evaluator 实现。它在 Bridge 进程内使用 `fetch` 调用 `OPENAI_BASE_URL/chat/completions`，读取 `OPENAI_API_KEY`、`OPENAI_BASE_URL` 和 `OPENAI_MODEL`，不启动子进程、不读取外部仓库，也不落地临时 JobDetail。远程 endpoint 强制 HTTPS，回环地址允许 HTTP；认证失败直接返回，502/503/504 最多共尝试 3 次，超时和用户取消都会中止当前请求，无效 JSON、空内容、缺失 summary 或越界 score 不会写入评估。
+
+Prompt 只使用已经通过 shared Schema 的 BOSS JobDetail，要求模型生成 A–G 中文分析和固定 `SCORE_SUMMARY`。模型没有候选人简历或浏览器研究能力，因此 Prompt 明确禁止臆造候选人/公司事实，也不生成简历、求职信或投递内容。summary 经本地解析后保持 `score`、`recommendation`、`rawReport`、`company`、`role`、`archetype`、`legitimacy` 对外字段不变。
 
 ## 边界与非目标
 

@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -64,27 +65,65 @@ const temporaryDirectory = await mkdtemp(
 const database = new DatabaseSync(
   path.join(temporaryDirectory, "bridge.sqlite"),
 );
+const evaluatorOutput = (
+  await readFile(
+    path.join(repositoryRoot, "fixtures/career-ops-output/normal-zh.txt"),
+    "utf8",
+  )
+).trim();
+let evaluatorRequest;
+const evaluatorServer = createServer(async (request, response) => {
+  try {
+    const chunks = [];
+    for await (const chunk of request) {
+      chunks.push(Buffer.from(chunk));
+    }
+    evaluatorRequest = {
+      method: request.method,
+      url: request.url,
+      headers: request.headers,
+      body: JSON.parse(Buffer.concat(chunks).toString("utf8")),
+    };
+    response.writeHead(200, { "Content-Type": "application/json" });
+    response.end(
+      JSON.stringify({
+        id: "chatcmpl-smoke",
+        choices: [
+          { message: { role: "assistant", content: evaluatorOutput } },
+        ],
+      }),
+    );
+  } catch (error) {
+    response.writeHead(500, { "Content-Type": "application/json" });
+    response.end(JSON.stringify({ error: String(error) }));
+  }
+});
+await new Promise((resolve, reject) => {
+  evaluatorServer.once("error", reject);
+  evaluatorServer.listen(0, "127.0.0.1", resolve);
+});
+const evaluatorAddress = evaluatorServer.address();
+assert.ok(
+  evaluatorAddress && typeof evaluatorAddress !== "string",
+  "测试 evaluator 未监听 TCP 地址",
+);
+const previousOpenAIEnvironment = {
+  baseUrl: process.env.OPENAI_BASE_URL,
+  model: process.env.OPENAI_MODEL,
+  apiKey: process.env.OPENAI_API_KEY,
+};
+process.env.OPENAI_BASE_URL = `http://127.0.0.1:${evaluatorAddress.port}/v1`;
+process.env.OPENAI_MODEL = "smoke-model";
+delete process.env.OPENAI_API_KEY;
 let bridge;
 
 try {
   bridge = await startBridge({
     environment: {
       CAREER_OPS_CN_TOKEN: "smoke-token",
-      CAREER_OPS_CN_CAREER_OPS_ROOT: repositoryRoot,
+      OPENAI_MODEL: "smoke-model",
     },
     database,
-    evaluator: async () =>
-      shared.EvaluationResultSchema.parse(
-        JSON.parse(
-          await readFile(
-            path.join(
-              repositoryRoot,
-              "fixtures/contracts/evaluation-result.json",
-            ),
-            "utf8",
-          ),
-        ),
-      ),
     screenJob: () => ({ decision: "pass", rules: [] }),
     port: 0,
   });
@@ -176,17 +215,26 @@ try {
   );
   const evaluation = evaluationResponse.evaluation;
   const evaluationFixture = shared.EvaluationResultSchema.parse(
-    JSON.parse(
-      await readFile(
-        path.join(
-          repositoryRoot,
-          "fixtures/contracts/evaluation-result.json",
-        ),
-        "utf8",
-      ),
-    ),
+    {
+      score: 84,
+      recommendation: "apply",
+      rawReport: evaluatorOutput,
+      company: "星河科技",
+      role: "高级前端工程师",
+      archetype: "Builder",
+      legitimacy: "high",
+    },
   );
   assert.deepEqual(evaluation, evaluationFixture);
+  assert.equal(evaluatorRequest?.method, "POST");
+  assert.equal(evaluatorRequest?.url, "/v1/chat/completions");
+  assert.equal(evaluatorRequest?.headers.authorization, undefined);
+  assert.equal(evaluatorRequest?.body.model, "smoke-model");
+  assert.equal(evaluatorRequest?.body.stream, false);
+  assert.match(
+    evaluatorRequest?.body.messages?.[1]?.content ?? "",
+    /123456789/u,
+  );
 
   const candidateResponse = await fetch(
     `${bridgeBaseUrl}/jobs/${encodeURIComponent(savedJob.id)}/candidate`,
@@ -283,10 +331,25 @@ try {
   if (bridge !== undefined) {
     await bridge.close();
   }
+  evaluatorServer.closeAllConnections();
+  await new Promise((resolve, reject) => {
+    evaluatorServer.close((error) => {
+      if (error) reject(error);
+      else resolve();
+    });
+  });
+  for (const [name, value] of [
+    ["OPENAI_BASE_URL", previousOpenAIEnvironment.baseUrl],
+    ["OPENAI_MODEL", previousOpenAIEnvironment.model],
+    ["OPENAI_API_KEY", previousOpenAIEnvironment.apiKey],
+  ]) {
+    if (value === undefined) delete process.env[name];
+    else process.env[name] = value;
+  }
   database.close();
   await rm(temporaryDirectory, { recursive: true, force: true });
 }
 
 console.log(
-  "smoke: ok (fixtures, extension manifest, Scan Run -> Job -> Screening -> Evaluation -> Candidate)",
+  "smoke: ok (fixtures, extension manifest, Bridge -> built-in OpenAI-compatible evaluator -> SQLite)",
 );

@@ -40,18 +40,28 @@ record(
   token.length > 0 ? '已配置（值未显示）' : '缺少 CAREER_OPS_CN_TOKEN',
 );
 
-const careerOpsRoot = process.env.CAREER_OPS_CN_CAREER_OPS_ROOT?.trim() ?? '';
-const evaluatorPath =
-  careerOpsRoot === '' ? '' : join(careerOpsRoot, 'openai-eval.mjs');
-record(
-  evaluatorPath !== '' && (await canAccess(evaluatorPath)) ? 'ok' : 'fail',
-  'career-ops evaluator',
-  evaluatorPath === ''
-    ? '缺少 CAREER_OPS_CN_CAREER_OPS_ROOT'
-    : await canAccess(evaluatorPath)
-      ? evaluatorPath
-      : `${evaluatorPath} 不存在或不可读`,
-);
+const evaluatorBaseUrl =
+  process.env.OPENAI_BASE_URL?.trim() || 'https://api.openai.com/v1';
+let evaluatorUrl;
+try {
+  evaluatorUrl = new URL(evaluatorBaseUrl);
+  const loopback =
+    evaluatorUrl.hostname === 'localhost' ||
+    evaluatorUrl.hostname === '127.0.0.1' ||
+    evaluatorUrl.hostname === '::1';
+  const secure =
+    evaluatorUrl.protocol === 'https:' ||
+    (loopback && evaluatorUrl.protocol === 'http:');
+  record(
+    secure ? 'ok' : 'fail',
+    'Evaluator endpoint',
+    secure
+      ? `${evaluatorUrl.origin}（模型 ${process.env.OPENAI_MODEL?.trim() || 'gpt-4o-mini'}）`
+      : '远程 OPENAI_BASE_URL 必须使用 HTTPS；HTTP 只允许回环地址',
+  );
+} catch {
+  record('fail', 'Evaluator endpoint', 'OPENAI_BASE_URL 不是有效 URL');
+}
 
 const configuredDatabasePath =
   process.env.CAREER_OPS_CN_DATABASE_PATH?.trim() ??
@@ -87,7 +97,7 @@ if ((process.env.OPENAI_API_KEY?.trim() ?? '') === '') {
   record(
     'warn',
     'Evaluator 凭据',
-    '当前环境未发现 OPENAI_API_KEY；若 career-ops 使用其他认证方式可忽略',
+    '当前环境未发现 OPENAI_API_KEY；仅本机回环 endpoint 可不使用 Key',
   );
 } else {
   record('ok', 'Evaluator 凭据', '已配置（值未显示）');

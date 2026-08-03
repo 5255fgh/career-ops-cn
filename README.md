@@ -2,7 +2,7 @@
 
 ## 项目定位
 
-`career-ops-cn` 是一个本机运行、只读、由用户主动触发的 BOSS 直聘职位筛选与评估工具。浏览器扩展负责读取当前页面和展示结果，本地 Bridge 负责鉴权、规则筛选、SQLite 持久化，并通过本机 `career-ops` 的 `openai-eval.mjs` 生成评估。
+`career-ops-cn` 是一个本机运行、只读、由用户主动触发的 BOSS 直聘职位筛选与评估工具。浏览器扩展负责读取当前页面和展示结果，本地 Bridge 负责鉴权、规则筛选、SQLite 持久化，并通过仓库内置的 OpenAI-compatible evaluator 生成评估。
 
 每轮扫描必须由用户主动点击触发；启动后会在当前 BOSS 搜索条件下按固定预算自动处理后续页。项目不会代表用户投递职位、发送消息或操作联系方式；用户判断、备注和投递状态都由用户手动记录。
 
@@ -13,13 +13,13 @@
 - 列表阶段只根据标题、公司、已有地点/薪资和去重信息预筛；读取完整 JD 后再做详情硬规则筛选。
 - BOSS 详情读取固定并发为 1；请求间隔以 1800ms 为基础加入不超过 ±20% 抖动，临时网络失败最多重试 1 次。
 - 单轮最长约 10 分钟；单轮 AI 调用防失控上限为 30，没有每日 AI 调用上限。
-- 在单职位详情页完成 JobDetail 提取、职位身份校验、Bridge 保存和 `career-ops` 评估。
+- 在单职位详情页完成 JobDetail 提取、职位身份校验、Bridge 保存和 AI 评估。
 - 在保存或评估前校验职位身份，避免把职位 B 的详情保存或分析为职位 A。
 - Bridge 只监听 `127.0.0.1`，业务接口要求 Bearer token。
 - 用 SQLite 分开保存权威 scan run、职位、完整硬规则结果、AI 评估原文和用户主动记录的候选池信息；关闭后重开 Side Panel 仍可读取本轮阶段、计数和已保存结果。
 - 已处理且职位卡片输入未变化的职位复用已保存详情；相同 JD、用户资料版本、规则、Prompt、模型和输出结构生成相同 cache key，不重复调用 evaluator。
 - 职位再次出现会更新 `last_seen_at`、本轮 run 和搜索来源；JD 变化后生成新的 `jd_hash` 并重新执行详情筛选和 AI 评估，不因暂时未出现而删除职位。
-- 候选池分开展示硬规则结果与 `career-ops` score、recommendation、结构化摘要字段和完整 raw report。
+- 候选池分开展示硬规则结果与 AI score、recommendation、结构化摘要字段和完整 raw report。
 - 候选池支持用户判断、备注、投递状态、筛选和排序；当前筛选结果可导出为带 UTF-8 BOM 的 CSV 或完整 JSON。
 - 支持用户取消当前扫描，并在登录失效、challenge、账号风险或不支持布局时停止。
 - 扫描过程、翻页、职位/JD 映射、取消和错误会尽力写入 SQLite diagnostics；diagnostics 失败只显示警告，不会反转已完成的扫描结果。
@@ -31,7 +31,7 @@
 
 - 自动投递、自动打招呼、自动聊天或任何联系方式操作
 - 定时、后台无人值守扫描或通用持久任务队列
-- Tracker、快照、简历定制或新评分 Prompt
+- Tracker、快照、简历定制或用户可编辑评分 Prompt
 - BOSS 以外的招聘平台
 - Plugin、公开 API 版本或远程 Bridge
 
@@ -42,7 +42,6 @@
 - Node.js 24
 - pnpm 11
 - Chromium 浏览器（Chrome 或 Edge）
-- 本机已配置的 `career-ops`
 
 ```powershell
 git clone https://github.com/5255fgh/career-ops-cn.git
@@ -56,24 +55,26 @@ pnpm check
 
 ```dotenv
 CAREER_OPS_CN_TOKEN=使用一个仅本机保存的随机长 token
-CAREER_OPS_CN_CAREER_OPS_ROOT=D:\Projects\career-ops
+OPENAI_API_KEY=使用你的 provider key
+OPENAI_BASE_URL=https://api.openai.com/v1
+OPENAI_MODEL=gpt-4o-mini
 ```
 
-可选配置包括 Bridge 端口、SQLite 路径、评估超时、JSON 格式的规则偏好，以及写入评估缓存键的 profile/Prompt/model/schema 版本；模型标识优先读取 `CAREER_OPS_CN_MODEL_ID`，未设置时沿用 `OPENAI_MODEL`，可用变量见 [.env.example](./.env.example)。配置完成后运行：
+`OPENAI_BASE_URL` 必须是包含版本路径的 OpenAI-compatible base URL，内置 evaluator 会请求其 `/chat/completions`；远程地址必须使用 HTTPS，本机回环 HTTP endpoint 可以不配置 Key。可选配置还包括 Bridge 端口、SQLite 路径、评估超时、JSON 格式的规则偏好，以及写入评估缓存键的 profile/Prompt/model/schema 版本；模型标识优先读取 `CAREER_OPS_CN_MODEL_ID`，未设置时沿用 `OPENAI_MODEL`，可用变量见 [.env.example](./.env.example)。配置完成后运行：
 
 ```powershell
 pnpm doctor
 ```
 
-`doctor` 会检查 Node/pnpm、Bridge token、`career-ops` evaluator、SQLite 目录、扩展构建和当前 Bridge 连接；Bridge 尚未启动只会显示警告。
+`doctor` 会检查 Node/pnpm、Bridge token、OpenAI-compatible endpoint、凭据、SQLite 目录、扩展构建和当前 Bridge 连接；Bridge 尚未启动只会显示警告。
 
-## career-ops 配置
+## AI evaluator 配置
 
-`CAREER_OPS_CN_CAREER_OPS_ROOT` 必须指向包含 `openai-eval.mjs` 的 `career-ops` 根目录。Bridge 不修改该仓库，也不会向其 `reports` 目录写报告；适配器固定传入 `--no-save`。
+AI 评估实现位于 `packages/career-ops-adapter`，随本仓库安装和构建，不需要同级 `career-ops` 目录、第二套依赖或外部脚本。它把经过 shared Schema 校验的 JobDetail 直接发送给配置的 OpenAI-compatible endpoint，不写外部报告文件。
 
-首次使用该本机 `career-ops` 副本时，需在其根目录安装 package.json 已声明的运行依赖；无需执行浏览器安装脚本时可使用 `npm install --ignore-scripts`。
+内置 Prompt 只依据 BOSS JobDetail，明确不臆造候选人简历或外部公司研究，并生成 A–G 中文评估以及固定的 `SCORE_SUMMARY`。适配器保留 `score`、`recommendation`、`rawReport`、`company`、`role`、`archetype` 和 `legitimacy` 字段；score 仍由 0–5 转为 0–100，recommendation 阈值仍为 apply ≥ 4、review ≥ 3.2、其余 skip。
 
-真实模型评估需要在启动 Bridge 的环境中提供 `OPENAI_API_KEY`。`OPENAI_BASE_URL`、`OPENAI_MODEL` 和其他 provider 配置沿用 `career-ops` 自身约定。模型密钥只留在本机 Bridge/career-ops 进程环境中，不要输入扩展，也不会进入 Extension bundle。
+真实模型评估需要在启动 Bridge 的环境中提供 `OPENAI_API_KEY`、`OPENAI_BASE_URL` 和 `OPENAI_MODEL`；后两项未设置时分别默认 `https://api.openai.com/v1` 和 `gpt-4o-mini`。模型密钥只留在本机 Bridge 进程环境中，不要输入扩展，也不会进入 Extension bundle。
 
 ## Bridge 启动
 
@@ -129,7 +130,7 @@ pnpm build
 - 表：`scan_runs`、`jobs`、`screenings`、`evaluations`、`candidate_records`、`diagnostics`
 - Bridge token：扩展的 `chrome.storage.local`
 - 扫描配置：扩展的 `chrome.storage.local`
-- 传给 `career-ops` 的临时 JobDetail：系统临时目录，子进程结束后删除
+- AI 请求：由 Bridge 内置 evaluator 直接发往配置的 OpenAI-compatible endpoint，不落地临时 JobDetail 文件
 
 SQLite 中会保存职位描述和完整 raw report。不要把真实数据库、`.env` 或任何模型凭据提交到仓库。
 
@@ -141,11 +142,11 @@ SQLite 中会保存职位描述和完整 raw report。不要把真实数据库�
 
 - **Bridge 离线**：确认 `pnpm dev:bridge` 正在运行，并检查端口是否被占用。
 - **Token 无效**：确保 Side Panel 中保存的 token 与 `CAREER_OPS_CN_TOKEN` 完全一致。
-- **career-ops 路径错误**：确认根目录存在且包含 `openai-eval.mjs`；该错误会返回 `CAREER_OPS_NOT_FOUND`。
 - **真实 evaluator 无法认证**：在启动 Bridge 的同一环境提供有效 `OPENAI_API_KEY`，然后重启 Bridge。不要把 Key 填入扩展。
 - **provider HTTP 502/503/504**：适配器会进行 2 次有限重试（共 3 次尝试）。持续失败不会生成伪造 score/raw report；脱敏后的状态、尝试次数和响应摘要会写入 diagnostics，并在 Bridge 错误中返回诊断 ID。
 - **evaluator timeout**：检查 provider 连通性，并按需要调整 `CAREER_OPS_CN_EVALUATION_TIMEOUT_MS`。
-- **用户取消**：Side Panel 显示“已取消”是预期结果，当前子进程会收到取消信号。
+- **用户取消**：Side Panel 显示“已取消”是预期结果，当前 HTTP 请求会被中止。
+- **无效模型输出**：模型必须返回完整 `SCORE_SUMMARY` 和 0–5 的有限数值 score；缺失、损坏或越界结果会按单职位 AI 失败隔离，不会写入伪造结果。
 - **任务 interrupted**：标签页刷新、Content Script/Side Panel 断开或 Bridge 重启会保留已完成计数并把未完成 run 标记为 `interrupted`；刷新 BOSS 页面后可重新开始。
 - **登录失效**：在 BOSS 页面重新登录，刷新页面后再次检测。
 - **challenge 或账号风险**：立即停止扫描，在浏览器中由用户自行完成站点要求；工具不会绕过验证。
@@ -160,19 +161,19 @@ SQLite 中会保存职位描述和完整 raw report。不要把真实数据库�
 - 扫描执行仍只存在于用户主动打开的前台 Extension 上下文；Bridge/SQLite 持久化状态和结果，但关闭 Side Panel 不会在后台继续操纵 BOSS 页面。
 - BOSS 列表不提供完整 JD。卡片字段未变化时会按要求跳过重复详情读取；远端仅修改 JD、但列表字段完全不变的情况，要等后续显式读取到新详情后才能发现并生成新 `jd_hash`。
 - BOSS 页面结构变化可能导致 Selector 暂时失效。
-- 真实评估依赖本机 `career-ops`、provider 配置和可用模型额度。
+- 真实评估依赖可用的 OpenAI-compatible provider 配置和模型额度。
 - Side Panel 必须在受支持的 BOSS 页面打开，重新加载扩展后需要刷新已有标签页。
 
 ## 常用命令
 
-- `pnpm doctor`：检查本机配置、evaluator、扩展构建和 Bridge 连接。
+- `pnpm doctor`：检查本机配置、OpenAI-compatible endpoint、扩展构建和 Bridge 连接。
 - `pnpm start`：启动已经构建的本机 Bridge。
 - `pnpm typecheck`：检查全部 workspace 的 TypeScript 类型。
 - `pnpm test`：运行全部 Vitest 测试。
 - `pnpm build`：构建 workspace 和 Chromium MV3 扩展。
-- `pnpm smoke`：用临时数据库跑通 fixture Scan Run → Job → Evaluation → SQLite，并校验扩展产物。
+- `pnpm smoke`：用临时数据库和回环 OpenAI-compatible endpoint 跑通 Scan Run → Job → 内置 Evaluation → SQLite，并校验扩展产物。
 - `pnpm check`：依次运行 typecheck、test、build 和 smoke。
 
 ## 许可证
 
-当前仓库未提供开源许可证。除非版权持有人另行书面授权，不授予复制、修改或分发本项目的许可。
+当前仓库未提供开源许可证。除非版权持有人另行书面授权，不授予复制、修改或分发本项目的许可。内置 evaluator 参考的 MIT 许可来源与完整声明见 [packages/career-ops-adapter/THIRD_PARTY_NOTICES.md](./packages/career-ops-adapter/THIRD_PARTY_NOTICES.md)。
