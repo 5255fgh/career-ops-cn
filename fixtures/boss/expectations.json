@@ -10,6 +10,7 @@
   "challenge.html": { "pageType": "challenge", "block": "challenge" },
   "account-risk.html": { "pageType": "unsupported", "block": "account_risk" },
   "empty-page.html": { "pageType": "unsupported", "block": "empty_page" },
+  "fetch-detail-shell.html": { "pageType": "unsupported", "block": "unsupported_layout" },
   "unknown-layout.html": { "pageType": "unsupported", "block": "unsupported_layout" },
   "stale-detail-b.html": { "pageType": "search-detail-panel", "block": null },
   "detail-unchanged.html": { "pageType": "search-detail-panel", "block": null },

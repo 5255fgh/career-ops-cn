@@ -16,15 +16,15 @@
 
 ### Content Script
 
-- 只识别 BOSS 页面、解析当前页卡片、读取当前或目标职位详情、滚动/点击下一页，并返回经过 shared Zod 契约校验的结果。
+- 只识别 BOSS 页面、解析当前页卡片、读取当前或目标职位详情、滚动/点击下一页，并返回经过 shared Zod 契约校验的结果。目标详情先同源 fetch；动态壳、缺详情容器或缺 description 时，按 Job ID、标准化 URL、标题与公司定位卡片，点击后等待右侧面板身份或内容变化并再次校验。
 - BOSS Selector 全部位于 `packages/boss-adapter`；Bridge 不读取或操作 DOM。
 - 相邻 BOSS 请求以 1800ms 为基础加入不超过 ±20% 抖动；单职位临时网络失败最多重试 1 次。
-- `detailTimeoutMs` 控制详情 `fetch` 和正文读取。用户取消、超时、普通网络错误、身份失败和页面阻断是不同契约结果。
+- `detailTimeoutMs` 分别控制详情 `fetch` 和实时面板等待。每次尝试只回传脱敏 URL、HTTP 状态、页面类型、详情容器、缺失字段、读取来源和有限身份信号；不保存整页 HTML。用户取消、超时、普通网络错误、身份失败和页面阻断是不同契约结果。
 
 ## 扫描流程
 
 1. ScanController 在 Bridge 创建 `running` scan run，再识别当前页面和搜索来源摘要。
-2. 登录失效、challenge、账号风险和搜索页整体无法识别会立即停止；其他单职位错误隔离后继续。
+2. 登录失效、challenge、账号风险和搜索页整体无法识别会立即停止；其他单职位错误隔离后继续。详情 Parser 至少尝试 8 个样本且同类错误比例达到 75% 才判定整体失效；停止前已成功保存且通过完整硬规则的职位仍执行 AI 评估。
 3. Content Script 读取卡片，ScanController 仅做本轮页内去重；Bridge 的 `/jobs/observe` 根据 SQLite 判断职位是新职位、卡片变化/详情缺失需要重读，还是输入未变化可直接复用。
 4. Bridge 对已存在职位更新 `last_seen_at`、`last_scan_run_id` 和 `source_query`。可复用职位不重复读取详情；当前完整硬规则记录与 cache key 命中时直接返回已保存结果。
 5. 新职位或需要更新的职位先做列表预筛，再由 Content Script 串行读取详情并校验身份。Bridge 保存详情时维护 `first_seen_at`、`last_seen_at` 和 `jd_hash`。

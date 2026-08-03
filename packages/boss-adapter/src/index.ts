@@ -1,6 +1,7 @@
 export {
   detectBossPage,
   detectBossPageBlock,
+  findBossJobCardElement,
   normalizeBossDetailUrl,
   parseBossDetail,
   parseVisibleBossCards,
@@ -16,6 +17,8 @@ export type {
   BossDetailScanEntry,
   BossDetailScanResult,
   BossDetailSelection,
+  BossCardElementMatch,
+  BossCardMatchMethod,
   BossIdentitySignal,
   BossIdentitySignals,
   BossIdentityVerification,

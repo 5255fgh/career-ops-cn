@@ -28,6 +28,8 @@ import { defineContentScript } from 'wxt/utils/define-content-script';
 
 import {
   fetchBossDetail,
+  readBossDetailFromLivePanel,
+  shouldUseLivePanelFallback,
   toJobCard,
   toJobDetail,
   type JobCardField,
@@ -246,10 +248,23 @@ export default defineContentScript({
         activeOperationController = controller;
 
         try {
-          return await fetchBossDetail({
+          const fetched = await fetchBossDetail({
             card: startRequest.data.card,
             timeoutMs: startRequest.data.timeoutMs,
             signal: controller.signal,
+          });
+          if (!shouldUseLivePanelFallback(fetched)) {
+            return fetched;
+          }
+          return await readBossDetailFromLivePanel({
+            document,
+            url: window.location.href,
+            card: startRequest.data.card,
+            timeoutMs: startRequest.data.timeoutMs,
+            signal: controller.signal,
+            ...(fetched.diagnostics === undefined
+              ? {}
+              : { previousDiagnostics: fetched.diagnostics }),
           });
         } catch (error) {
           return StartDetailScanResponseSchema.parse({

@@ -1,15 +1,22 @@
 import {
+  bossSelectors,
+  detectBossPage,
   detectBossPageBlock,
+  findBossJobCardElement,
   parseBossDetail,
+  scanSelectedBossDetails,
   verifyDetailIdentity,
+  type BossCardMatchMethod,
   type BossIdentityVerification,
   type BossJobCard,
   type BossJobDetail,
 } from '@career-ops-cn/boss-adapter';
 import {
+  DetailReadDiagnosticSchema,
   JobCardSchema,
   JobDetailSchema,
   StartDetailScanResponseSchema,
+  type DetailReadDiagnostic,
   type JobCard,
   type JobDetail,
   type StartDetailScanResponse,
@@ -111,6 +118,7 @@ function failed(
   message: string,
   failureKind: 'network' | 'http' | 'missing_fields' | 'layout' | 'unknown',
   retryable: boolean,
+  diagnostics?: readonly DetailReadDiagnostic[],
 ): StartDetailScanResponse {
   return StartDetailScanResponseSchema.parse({
     type: 'boss/start-detail-scan/response',
@@ -118,7 +126,80 @@ function failed(
     message,
     failureKind,
     retryable,
+    ...(diagnostics === undefined ? {} : { diagnostics }),
   });
+}
+
+function sanitizeDiagnosticUrl(value: string | null): string | null {
+  if (value === null || value === '') {
+    return null;
+  }
+  try {
+    const url = new URL(value);
+    url.username = '';
+    url.password = '';
+    url.search = '';
+    url.hash = '';
+    return url.toString();
+  } catch {
+    return null;
+  }
+}
+
+function hasDetailContainer(document: Document): boolean {
+  return bossSelectors.page.detailContainers.some(
+    (selector) => document.querySelector(selector) !== null,
+  );
+}
+
+function missingDetailFields(
+  document: Document,
+  detail: BossJobDetail | null,
+): string[] {
+  if (!hasDetailContainer(document)) {
+    return ['detail_container'];
+  }
+  if (detail === null) {
+    return ['detail'];
+  }
+  return detail.warnings.map((warning) =>
+    warning.startsWith('missing_') ? warning.slice('missing_'.length) : warning,
+  );
+}
+
+function createDiagnostic(input: {
+  source: 'fetch' | 'live-panel';
+  card: VisibleJobCard;
+  responseUrl: string | null;
+  httpStatus: number | null;
+  detectedPageType: ReturnType<typeof detectBossPage> | null;
+  hasDetailContainer: boolean;
+  missingFields: readonly string[];
+  outcome: string;
+  matchedBy?: BossCardMatchMethod;
+}): DetailReadDiagnostic {
+  const detailUrl =
+    sanitizeDiagnosticUrl(input.card.job.detailUrl) ??
+    input.card.job.detailUrl;
+  return DetailReadDiagnosticSchema.parse({
+    source: input.source,
+    sourceJobId: input.card.job.jobId,
+    detailUrl,
+    responseUrl: sanitizeDiagnosticUrl(input.responseUrl),
+    httpStatus: input.httpStatus,
+    detectedPageType: input.detectedPageType,
+    hasDetailContainer: input.hasDetailContainer,
+    missingFields: [...input.missingFields],
+    outcome: input.outcome,
+    ...(input.matchedBy === undefined ? {} : { matchedBy: input.matchedBy }),
+  });
+}
+
+function diagnosticTrail(
+  previous: readonly DetailReadDiagnostic[] | undefined,
+  diagnostic: DetailReadDiagnostic,
+): DetailReadDiagnostic[] {
+  return [...(previous ?? []), diagnostic].slice(-4);
 }
 
 function timeoutError(): DOMException {
@@ -145,9 +226,20 @@ export async function fetchBossDetail({
   parseDocument = (html) => new DOMParser().parseFromString(html, 'text/html'),
 }: FetchBossDetailOptions): Promise<StartDetailScanResponse> {
   if (signal.aborted) {
+    const diagnostic = createDiagnostic({
+      source: 'fetch',
+      card,
+      responseUrl: null,
+      httpStatus: null,
+      detectedPageType: null,
+      hasDetailContainer: false,
+      missingFields: [],
+      outcome: 'cancelled',
+    });
     return StartDetailScanResponseSchema.parse({
       type: 'boss/start-detail-scan/response',
       outcome: 'cancelled',
+      diagnostics: [diagnostic],
     });
   }
 
@@ -184,13 +276,27 @@ export async function fetchBossDetail({
     const html = await Promise.race([response.text(), interrupted]);
     const responseUrl = response.url === '' ? card.job.detailUrl : response.url;
     const detailDocument = parseDocument(html);
+    const pageType = detectBossPage(detailDocument, responseUrl);
     const block = detectBossPageBlock(detailDocument, responseUrl);
+    const detail = parseBossDetail(detailDocument, responseUrl);
+    const diagnosticFor = (outcome: string): DetailReadDiagnostic =>
+      createDiagnostic({
+        source: 'fetch',
+        card,
+        responseUrl,
+        httpStatus: response.status,
+        detectedPageType: pageType,
+        hasDetailContainer: hasDetailContainer(detailDocument),
+        missingFields: missingDetailFields(detailDocument, detail),
+        outcome,
+      });
 
     if (block !== null && FATAL_DETAIL_BLOCKS.has(block.reason)) {
       return StartDetailScanResponseSchema.parse({
         type: 'boss/start-detail-scan/response',
         outcome: 'blocked',
         reason: block.reason,
+        diagnostics: [diagnosticFor(block.reason)],
       });
     }
     if (!response.ok) {
@@ -198,15 +304,22 @@ export async function fetchBossDetail({
         `职位详情请求失败（HTTP ${response.status}）。`,
         'http',
         TRANSIENT_HTTP_STATUSES.has(response.status),
+        [diagnosticFor(`http_${response.status}`)],
       );
     }
     if (block !== null) {
-      return failed(`单个职位详情布局异常：${block.reason}。`, 'layout', false);
+      return failed(
+        `单个职位详情布局异常：${block.reason}。`,
+        'layout',
+        false,
+        [diagnosticFor(block.reason)],
+      );
     }
 
-    const detail = parseBossDetail(detailDocument, responseUrl);
     if (detail === null) {
-      return failed('单个职位详情布局无法识别。', 'layout', false);
+      return failed('单个职位详情布局无法识别。', 'layout', false, [
+        diagnosticFor('layout'),
+      ]);
     }
     const identity = verifyDetailIdentity({
       expected: {
@@ -222,34 +335,51 @@ export async function fetchBossDetail({
         type: 'boss/start-detail-scan/response',
         outcome: 'identity_failure',
         evidence: detailEvidence(detail, identity),
+        diagnostics: [diagnosticFor('identity_failure')],
       });
     }
 
     const job = toJobDetail(detail, true, card.job);
     return job === null
-      ? failed('职位详情缺少必要字段。', 'missing_fields', false)
+      ? failed('职位详情缺少必要字段。', 'missing_fields', false, [
+          diagnosticFor('missing_fields'),
+        ])
       : StartDetailScanResponseSchema.parse({
           type: 'boss/start-detail-scan/response',
           outcome: 'success',
           job,
+          diagnostics: [diagnosticFor('success')],
         });
   } catch (error) {
+    const diagnostic = createDiagnostic({
+      source: 'fetch',
+      card,
+      responseUrl: null,
+      httpStatus: null,
+      detectedPageType: null,
+      hasDetailContainer: false,
+      missingFields: [],
+      outcome: timedOut ? 'timeout' : signal.aborted ? 'cancelled' : 'network',
+    });
     if (timedOut) {
       return StartDetailScanResponseSchema.parse({
         type: 'boss/start-detail-scan/response',
         outcome: 'timeout',
+        diagnostics: [diagnostic],
       });
     }
     if (signal.aborted) {
       return StartDetailScanResponseSchema.parse({
         type: 'boss/start-detail-scan/response',
         outcome: 'cancelled',
+        diagnostics: [diagnostic],
       });
     }
     return failed(
       `职位详情网络请求失败：${error instanceof Error ? error.message : '未知网络错误。'}`,
       'network',
       true,
+      [diagnostic],
     );
   } finally {
     if (timer !== undefined) {
@@ -258,4 +388,244 @@ export async function fetchBossDetail({
     signal.removeEventListener('abort', onAbort);
     rejectInterrupt = undefined;
   }
+}
+
+export function shouldUseLivePanelFallback(
+  result: StartDetailScanResponse,
+): boolean {
+  return (
+    result.outcome === 'failed' &&
+    (result.failureKind === 'layout' || result.failureKind === 'missing_fields')
+  );
+}
+
+export interface ReadBossDetailFromLivePanelOptions {
+  document: Document;
+  url: string;
+  card: VisibleJobCard;
+  timeoutMs: number;
+  signal: AbortSignal;
+  previousDiagnostics?: readonly DetailReadDiagnostic[];
+}
+
+export async function readBossDetailFromLivePanel({
+  document,
+  url,
+  card,
+  timeoutMs,
+  signal,
+  previousDiagnostics,
+}: ReadBossDetailFromLivePanelOptions): Promise<StartDetailScanResponse> {
+  const expected = {
+    sourceJobId: card.job.jobId,
+    url: card.job.detailUrl,
+    title: card.job.title,
+    company: card.job.companyName,
+  };
+  const pageType = detectBossPage(document, url);
+  const block = detectBossPageBlock(document, url);
+  const beforeDetail = parseBossDetail(document, url);
+  const diagnosticFor = (
+    outcome: string,
+    matchedBy?: BossCardMatchMethod,
+    detail: BossJobDetail | null = parseBossDetail(document, url),
+  ): DetailReadDiagnostic =>
+    createDiagnostic({
+      source: 'live-panel',
+      card,
+      responseUrl: url,
+      httpStatus: null,
+      detectedPageType: detectBossPage(document, url),
+      hasDetailContainer: hasDetailContainer(document),
+      missingFields: missingDetailFields(document, detail),
+      outcome,
+      ...(matchedBy === undefined ? {} : { matchedBy }),
+    });
+
+  if (signal.aborted) {
+    return StartDetailScanResponseSchema.parse({
+      type: 'boss/start-detail-scan/response',
+      outcome: 'cancelled',
+      diagnostics: diagnosticTrail(
+        previousDiagnostics,
+        diagnosticFor('cancelled'),
+      ),
+    });
+  }
+
+  if (block !== null) {
+    if (FATAL_DETAIL_BLOCKS.has(block.reason)) {
+      return StartDetailScanResponseSchema.parse({
+        type: 'boss/start-detail-scan/response',
+        outcome: 'blocked',
+        reason: block.reason,
+        diagnostics: diagnosticTrail(
+          previousDiagnostics,
+          diagnosticFor(block.reason),
+        ),
+      });
+    }
+    return failed(
+      `实时详情面板不可用：${block.reason}。`,
+      'layout',
+      false,
+      diagnosticTrail(previousDiagnostics, diagnosticFor(block.reason)),
+    );
+  }
+
+  if (pageType !== 'search-detail-panel' && pageType !== 'search-list') {
+    return failed(
+      `当前页面不支持实时详情面板兜底：${pageType}。`,
+      'layout',
+      false,
+      diagnosticTrail(previousDiagnostics, diagnosticFor('unsupported_page')),
+    );
+  }
+
+  const match = findBossJobCardElement(document, url, expected);
+  if (match === null) {
+    const diagnostic = diagnosticFor('card_not_found');
+    diagnostic.missingFields = [
+      ...new Set([...diagnostic.missingFields, 'job_card']),
+    ];
+    return failed(
+      '实时详情面板中找不到对应职位卡片。',
+      'layout',
+      false,
+      diagnosticTrail(previousDiagnostics, diagnostic),
+    );
+  }
+
+  const scan = await scanSelectedBossDetails({
+    document,
+    url,
+    selections: [{ element: match.element, expected }],
+    timeoutMs,
+    signal,
+    predicate: ({ detail }) => detail.description !== null,
+  });
+  const result = scan.entries[0]?.result;
+  const currentDetail =
+    result?.status === 'verified'
+      ? result.detail
+      : parseBossDetail(document, url) ?? beforeDetail;
+
+  if (scan.block !== null && result === undefined) {
+    if (FATAL_DETAIL_BLOCKS.has(scan.block.reason)) {
+      return StartDetailScanResponseSchema.parse({
+        type: 'boss/start-detail-scan/response',
+        outcome: 'blocked',
+        reason: scan.block.reason,
+        diagnostics: diagnosticTrail(
+          previousDiagnostics,
+          diagnosticFor(scan.block.reason, match.matchedBy, currentDetail),
+        ),
+      });
+    }
+    return failed(
+      `实时详情面板不可用：${scan.block.reason}。`,
+      'layout',
+      false,
+      diagnosticTrail(
+        previousDiagnostics,
+        diagnosticFor(scan.block.reason, match.matchedBy, currentDetail),
+      ),
+    );
+  }
+
+  if (result?.status === 'verified') {
+    const job = toJobDetail(result.detail, true, card.job);
+    return job === null
+      ? failed(
+          '实时详情面板缺少必要字段。',
+          'missing_fields',
+          false,
+          diagnosticTrail(
+            previousDiagnostics,
+            diagnosticFor('missing_fields', match.matchedBy, result.detail),
+          ),
+        )
+      : StartDetailScanResponseSchema.parse({
+          type: 'boss/start-detail-scan/response',
+          outcome: 'success',
+          job,
+          diagnostics: diagnosticTrail(
+            previousDiagnostics,
+            diagnosticFor('success', match.matchedBy, result.detail),
+          ),
+        });
+  }
+
+  if (result?.status === 'aborted') {
+    return StartDetailScanResponseSchema.parse({
+      type: 'boss/start-detail-scan/response',
+      outcome: 'cancelled',
+      diagnostics: diagnosticTrail(
+        previousDiagnostics,
+        diagnosticFor('cancelled', match.matchedBy, currentDetail),
+      ),
+    });
+  }
+
+  if (result?.status === 'blocked') {
+    return StartDetailScanResponseSchema.parse({
+      type: 'boss/start-detail-scan/response',
+      outcome: 'blocked',
+      reason: result.block.reason,
+      diagnostics: diagnosticTrail(
+        previousDiagnostics,
+        diagnosticFor(result.block.reason, match.matchedBy, currentDetail),
+      ),
+    });
+  }
+
+  if (
+    result?.status === 'timeout' &&
+    result.lastIdentity !== null &&
+    !result.lastIdentity.verified
+  ) {
+    return StartDetailScanResponseSchema.parse({
+      type: 'boss/start-detail-scan/response',
+      outcome: 'identity_failure',
+      evidence: detailEvidence(currentDetail, result.lastIdentity),
+      diagnostics: diagnosticTrail(
+        previousDiagnostics,
+        diagnosticFor('identity_failure', match.matchedBy, currentDetail),
+      ),
+    });
+  }
+
+  if (currentDetail === null) {
+    return failed(
+      '实时详情面板未生成可解析详情。',
+      'layout',
+      false,
+      diagnosticTrail(
+        previousDiagnostics,
+        diagnosticFor('layout', match.matchedBy, currentDetail),
+      ),
+    );
+  }
+
+  if (currentDetail.description === null) {
+    return failed(
+      '实时详情面板缺少职位描述。',
+      'missing_fields',
+      false,
+      diagnosticTrail(
+        previousDiagnostics,
+        diagnosticFor('missing_fields', match.matchedBy, currentDetail),
+      ),
+    );
+  }
+
+  return StartDetailScanResponseSchema.parse({
+    type: 'boss/start-detail-scan/response',
+    outcome: 'timeout',
+    evidence: detailEvidence(currentDetail, null),
+    diagnostics: diagnosticTrail(
+      previousDiagnostics,
+      diagnosticFor('timeout', match.matchedBy, currentDetail),
+    ),
+  });
 }

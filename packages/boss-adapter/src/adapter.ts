@@ -2,6 +2,7 @@ import { bossSelectors } from "./selectors.js";
 import type {
   BossDetailScanResult,
   BossDetailSelection,
+  BossCardElementMatch,
   BossIdentitySignal,
   BossIdentityVerification,
   BossJobCard,
@@ -311,6 +312,10 @@ export const parseVisibleBossCards = (
   document: Document,
   url: string,
 ): BossJobCard[] => {
+  return visibleCardElements(document).map((card) => parseCardElement(card, url));
+};
+
+const visibleCardElements = (document: Document): Element[] => {
   const containers = [
     ...queryAllByPriority(document, bossSelectors.page.searchListContainers),
     ...queryAllByPriority(
@@ -330,7 +335,7 @@ export const parseVisibleBossCards = (
     }
   }
 
-  return cards.map((card) => parseCardElement(card, url));
+  return cards;
 };
 
 export const parseBossDetail = (
@@ -492,6 +497,45 @@ const companyMatches = (
   expected: BossJobIdentity,
   actual: BossJobIdentity,
 ): boolean | null => relaxedTextMatches(expected.company, actual.company);
+
+export const findBossJobCardElement = (
+  document: Document,
+  url: string,
+  expected: BossJobIdentity,
+): BossCardElementMatch | null => {
+  const candidates = visibleCardElements(document).map((element) => ({
+    element,
+    card: parseCardElement(element, url),
+  }));
+
+  if (expected.sourceJobId !== null) {
+    const match = candidates.find(
+      ({ card }) => card.sourceJobId === expected.sourceJobId,
+    );
+    if (match !== undefined) {
+      return { ...match, matchedBy: "source_job_id" };
+    }
+  }
+
+  const expectedUrl = normalizeBossDetailUrl(expected.url);
+  if (expectedUrl !== null) {
+    const match = candidates.find(
+      ({ card }) => normalizeBossDetailUrl(card.url) === expectedUrl,
+    );
+    if (match !== undefined) {
+      return { ...match, matchedBy: "detail_url" };
+    }
+  }
+
+  const match = candidates.find(
+    ({ card }) =>
+      titleMatches(expected, card) === true &&
+      companyMatches(expected, card) === true,
+  );
+  return match === undefined
+    ? null
+    : { ...match, matchedBy: "title_company" };
+};
 
 const activeCardMatches = (
   expected: BossJobIdentity,

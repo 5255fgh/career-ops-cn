@@ -114,6 +114,17 @@ export interface BossDetailSelection {
   expected?: BossJobIdentity;
 }
 
+export type BossCardMatchMethod =
+  | "source_job_id"
+  | "detail_url"
+  | "title_company";
+
+export interface BossCardElementMatch {
+  element: Element;
+  card: BossJobCard;
+  matchedBy: BossCardMatchMethod;
+}
+
 export interface ScanSelectedBossDetailsOptions {
   document: Document;
   url: string;

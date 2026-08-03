@@ -7,6 +7,7 @@ import {
   bossSelectors,
   detectBossPage,
   detectBossPageBlock,
+  findBossJobCardElement,
   parseBossDetail,
   parseVisibleBossCards,
   scanSelectedBossDetails,
@@ -51,6 +52,8 @@ const fixtureUrls: Record<string, string> = {
   "challenge.html": "https://www.zhipin.com/web/common/challenge",
   "account-risk.html": "https://www.zhipin.com/web/geek/job",
   "empty-page.html": "https://www.zhipin.com/web/geek/job",
+  "fetch-detail-shell.html":
+    "https://www.zhipin.com/job_detail/boss-shell.html",
   "unknown-layout.html": "https://www.zhipin.com/other",
   "stale-detail-b.html": "https://www.zhipin.com/web/geek/job",
   "detail-unchanged.html": "https://www.zhipin.com/web/geek/job",
@@ -536,6 +539,47 @@ describe("等待与批量扫描", () => {
       sourceJobId: "boss-3001",
       title: "Web 前端工程师",
       description: "负责 Web 产品研发与维护。",
+    });
+    window.close();
+  });
+
+  it("按 Job ID、标准化 URL、标题与公司依次定位卡片，不依赖 index", () => {
+    const url = fixtureUrls["search-detail-panel.html"]!;
+    const { window, document } = createDocument(
+      "search-detail-panel.html",
+      url,
+    );
+
+    const byId = findBossJobCardElement(document, url, {
+      sourceJobId: "boss-3002",
+      url: "https://www.zhipin.com/job_detail/wrong.html",
+      title: "错误标题",
+      company: "错误公司",
+    });
+    const byUrl = findBossJobCardElement(document, url, {
+      sourceJobId: null,
+      url: "https://www.zhipin.com/job_detail/boss-3001.html?securityId=redacted",
+      title: "错误标题",
+      company: "错误公司",
+    });
+    const byText = findBossJobCardElement(document, url, {
+      sourceJobId: null,
+      url: null,
+      title: "全栈工程师",
+      company: "示例戊科技",
+    });
+
+    expect(byId).toMatchObject({
+      matchedBy: "source_job_id",
+      card: { sourceJobId: "boss-3002" },
+    });
+    expect(byUrl).toMatchObject({
+      matchedBy: "detail_url",
+      card: { sourceJobId: "boss-3001" },
+    });
+    expect(byText).toMatchObject({
+      matchedBy: "title_company",
+      card: { sourceJobId: "boss-3002" },
     });
     window.close();
   });

@@ -541,6 +541,31 @@ export const StartDetailScanRequestSchema = z.strictObject({
   timeoutMs: z.number().int().positive(),
 });
 
+export const DetailReadDiagnosticSchema = z.strictObject({
+  source: z.enum(["fetch", "live-panel"]),
+  sourceJobId: NonEmptyTextSchema,
+  detailUrl: ZhipinUrlSchema,
+  responseUrl: z.string().url().nullable(),
+  httpStatus: z.number().int().min(100).max(599).nullable(),
+  detectedPageType: BossPageTypeSchema.nullable(),
+  hasDetailContainer: z.boolean(),
+  missingFields: z.array(NonEmptyTextSchema).max(20),
+  outcome: NonEmptyTextSchema,
+  matchedBy: z
+    .enum(["source_job_id", "detail_url", "title_company"])
+    .optional(),
+});
+
+export type DetailReadDiagnostic = z.infer<
+  typeof DetailReadDiagnosticSchema
+>;
+
+const DetailReadDiagnosticsSchema = z
+  .array(DetailReadDiagnosticSchema)
+  .min(1)
+  .max(4)
+  .optional();
+
 const DetailIdentityEvidenceSchema = z.strictObject({
   detailFound: z.boolean(),
   actualJobId: NonEmptyTextSchema.optional(),
@@ -561,25 +586,30 @@ export const StartDetailScanResponseSchema = z.discriminatedUnion("outcome", [
     type: z.literal("boss/start-detail-scan/response"),
     outcome: z.literal("success"),
     job: JobDetailSchema,
+    diagnostics: DetailReadDiagnosticsSchema,
   }),
   z.strictObject({
     type: z.literal("boss/start-detail-scan/response"),
     outcome: z.literal("timeout"),
     evidence: DetailIdentityEvidenceSchema.optional(),
+    diagnostics: DetailReadDiagnosticsSchema,
   }),
   z.strictObject({
     type: z.literal("boss/start-detail-scan/response"),
     outcome: z.literal("identity_failure"),
     evidence: DetailIdentityEvidenceSchema.optional(),
+    diagnostics: DetailReadDiagnosticsSchema,
   }),
   z.strictObject({
     type: z.literal("boss/start-detail-scan/response"),
     outcome: z.literal("blocked"),
     reason: BossPageBlockReasonSchema,
+    diagnostics: DetailReadDiagnosticsSchema,
   }),
   z.strictObject({
     type: z.literal("boss/start-detail-scan/response"),
     outcome: z.literal("cancelled"),
+    diagnostics: DetailReadDiagnosticsSchema,
   }),
   z.strictObject({
     type: z.literal("boss/start-detail-scan/response"),
@@ -593,6 +623,7 @@ export const StartDetailScanResponseSchema = z.discriminatedUnion("outcome", [
       "unknown",
     ]),
     retryable: z.boolean(),
+    diagnostics: DetailReadDiagnosticsSchema,
   }),
 ]);
 

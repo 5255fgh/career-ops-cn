@@ -34,7 +34,8 @@ export const DEFAULT_SCAN_CONFIG: ScanConfig = Object.freeze({
   maxRoundMs: 10 * 60_000,
 });
 
-const CONSECUTIVE_PARSER_FAILURE_LIMIT = 3;
+const PARSER_FAILURE_MIN_ATTEMPTS = 8;
+const PARSER_FAILURE_RATIO = 0.75;
 const DIAGNOSTIC_TIMEOUT_MS = 2_000;
 
 export type ScanStatus =
@@ -621,6 +622,29 @@ export class ScanController {
     card: VisibleJobCard,
     result: StartDetailScanResponse,
   ): Promise<void> {
+    for (const diagnostic of result.diagnostics ?? []) {
+      await this.diagnose({
+        level: diagnostic.outcome === 'success' ? 'info' : 'warning',
+        event: 'detail_read',
+        expectedJobId: card.job.jobId,
+        expectedTitle: card.job.title,
+        outcome: diagnostic.outcome,
+        details: {
+          sourceJobId: diagnostic.sourceJobId,
+          originalDetailUrl: diagnostic.detailUrl,
+          finalResponseUrl: diagnostic.responseUrl,
+          httpStatus: diagnostic.httpStatus,
+          detectedPageType: diagnostic.detectedPageType,
+          hasDetailContainer: diagnostic.hasDetailContainer,
+          missingFields:
+            diagnostic.missingFields.length === 0
+              ? null
+              : diagnostic.missingFields.join(','),
+          readSource: diagnostic.source,
+          matchedBy: diagnostic.matchedBy ?? null,
+        },
+      });
+    }
     await this.diagnose({
       level:
         result.outcome === 'success'
@@ -886,8 +910,9 @@ export class ScanController {
       const seenKeys = new Set<string>();
 
       let consecutiveNoNewPages = 0;
-      let consecutiveParserFailureKind: string | null = null;
-      let consecutiveParserFailures = 0;
+      let detailAttempts = 0;
+      const parserFailuresByKind = new Map<string, number>();
+      let parserFailureMessage: string | null = null;
       let discoveryStopReason: ScanStopReason = 'page_limit';
 
       discovery: while (this.currentState.progress.pagesVisited < maxPages) {
@@ -1119,6 +1144,7 @@ export class ScanController {
                   : 1),
             });
             await this.recordDetailDiagnostic(card, detailResult);
+            detailAttempts += 1;
 
             if (detailResult.outcome === 'cancelled') {
               throw abortError();
@@ -1218,29 +1244,35 @@ export class ScanController {
             }
 
             const failureKind = parserFailureKind(detailResult);
-            if (failureKind === null) {
-              consecutiveParserFailureKind = null;
-              consecutiveParserFailures = 0;
-            } else if (failureKind === consecutiveParserFailureKind) {
-              consecutiveParserFailures += 1;
-            } else {
-              consecutiveParserFailureKind = failureKind;
-              consecutiveParserFailures = 1;
-            }
-            if (
-              consecutiveParserFailures >= CONSECUTIVE_PARSER_FAILURE_LIMIT
-            ) {
-              this.stop(
-                'parser_failure_limit',
-                `连续 ${CONSECUTIVE_PARSER_FAILURE_LIMIT} 个职位出现同类 Parser 错误：${failureKind}。`,
-              );
-              await this.diagnose({
-                level: 'error',
-                event: 'scan_stopped',
-                outcome: 'parser_failure_limit',
-                message: `连续出现同类 Parser 错误：${failureKind}。`,
-              });
-              return this.currentState;
+            if (failureKind !== null) {
+              const failures =
+                (parserFailuresByKind.get(failureKind) ?? 0) + 1;
+              parserFailuresByKind.set(failureKind, failures);
+              const failureRatio = failures / detailAttempts;
+              if (
+                detailAttempts >= PARSER_FAILURE_MIN_ATTEMPTS &&
+                failureRatio >= PARSER_FAILURE_RATIO
+              ) {
+                parserFailureMessage =
+                  `已尝试 ${detailAttempts} 个职位，其中 ${failures} 个出现同类 ` +
+                  `Parser 错误：${failureKind}（${Math.round(failureRatio * 100)}%）。`;
+                discoveryStopReason = 'parser_failure_limit';
+                await this.diagnose({
+                  level: 'error',
+                  event: 'parser_failure_threshold',
+                  outcome: failureKind,
+                  message: parserFailureMessage,
+                  details: {
+                    detailAttempts,
+                    sameKindFailures: failures,
+                    failureRatio,
+                    minimumAttempts: PARSER_FAILURE_MIN_ATTEMPTS,
+                    thresholdRatio: PARSER_FAILURE_RATIO,
+                  },
+                });
+                await this.persistRun('reading-details');
+                break discovery;
+              }
             }
             await this.persistRun('reading-details');
           }
@@ -1364,6 +1396,17 @@ export class ScanController {
           aiCompleted: this.currentState.progress.aiCompleted + 1,
         });
         await this.persistRun('evaluating');
+      }
+
+      if (parserFailureMessage !== null) {
+        this.stop('parser_failure_limit', parserFailureMessage);
+        await this.diagnose({
+          level: 'error',
+          event: 'scan_stopped',
+          outcome: 'parser_failure_limit',
+          message: parserFailureMessage,
+        });
+        return this.currentState;
       }
 
       this.complete(discoveryStopReason);

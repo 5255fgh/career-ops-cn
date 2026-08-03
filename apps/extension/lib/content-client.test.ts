@@ -46,6 +46,20 @@ describe('Content client', () => {
             type: 'boss/start-detail-scan/response',
             outcome: 'success',
             job: detail,
+            diagnostics: [
+              {
+                source: 'live-panel',
+                sourceJobId: job.jobId,
+                detailUrl: job.detailUrl,
+                responseUrl: 'https://www.zhipin.com/web/geek/jobs',
+                httpStatus: null,
+                detectedPageType: 'search-detail-panel',
+                hasDetailContainer: true,
+                missingFields: [],
+                outcome: 'success',
+                matchedBy: 'source_job_id',
+              },
+            ],
           };
         case 'boss/advance-search-page/request':
           return {
@@ -73,6 +87,12 @@ describe('Content client', () => {
     });
     await expect(client.startDetailScan(visibleCard, 8_000)).resolves.toMatchObject({
       outcome: 'success',
+      diagnostics: [
+        expect.objectContaining({
+          source: 'live-panel',
+          matchedBy: 'source_job_id',
+        }),
+      ],
     });
     await expect(client.advanceSearchPage(8_000)).resolves.toMatchObject({
       outcome: 'advanced',
