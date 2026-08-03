@@ -8,6 +8,8 @@ import { z } from "zod";
 
 const DEFAULT_TIMEOUT_MS = 30_000;
 const DEFAULT_MAX_OUTPUT_BYTES = 1024 * 1024;
+const DEFAULT_DEEPSEEK_BASE_URL = "https://api.deepseek.com";
+const DEFAULT_DEEPSEEK_MODEL = "deepseek-v4-flash";
 const DEFAULT_OPENAI_BASE_URL = "https://api.openai.com/v1";
 const DEFAULT_OPENAI_MODEL = "gpt-4o-mini";
 const ERROR_EXCERPT_LENGTH = 500;
@@ -163,7 +165,7 @@ interface CareerOpsAdapterErrorOptions {
   diagnostic?: string | null;
 }
 
-interface OpenAIConfig {
+interface CompatibleApiConfig {
   endpoint: string;
   endpointHost: string;
   model: string;
@@ -210,7 +212,7 @@ function stripAnsi(value: string): string {
 function redactSensitiveText(value: string): string {
   return value
     .replace(/\bsk-[A-Za-z0-9_-]+\b/g, "[REDACTED]")
-    .replace(/(OPENAI_API_KEY\s*[=:]\s*)\S+/gi, "$1[REDACTED]")
+    .replace(/((?:DEEPSEEK|OPENAI)_API_KEY\s*[=:]\s*)\S+/gi, "$1[REDACTED]")
     .replace(/(Authorization\s*:\s*Bearer\s+)\S+/gi, "$1[REDACTED]")
     .replace(/(api[_ -]?key\s*(?:is|=|:)\s*)\S+/gi, "$1[REDACTED]");
 }
@@ -247,14 +249,28 @@ function isAborted(signal: AbortSignal | undefined): boolean {
   return signal?.aborted ?? false;
 }
 
-function readOpenAIConfig(
+function readCompatibleApiConfig(
   environment: NodeJS.ProcessEnv = process.env,
-): OpenAIConfig {
+): CompatibleApiConfig {
+  const deepSeekApiKey = environment.DEEPSEEK_API_KEY?.trim() ?? "";
+  const useDeepSeek = deepSeekApiKey.length > 0;
+  const baseUrlVariable = useDeepSeek
+    ? "DEEPSEEK_BASE_URL"
+    : "OPENAI_BASE_URL";
+  const apiKeyVariable = useDeepSeek
+    ? "DEEPSEEK_API_KEY"
+    : "OPENAI_API_KEY";
   const baseUrl = (
-    environment.OPENAI_BASE_URL?.trim() || DEFAULT_OPENAI_BASE_URL
+    useDeepSeek
+      ? environment.DEEPSEEK_BASE_URL?.trim() || DEFAULT_DEEPSEEK_BASE_URL
+      : environment.OPENAI_BASE_URL?.trim() || DEFAULT_OPENAI_BASE_URL
   ).replace(/\/+$/u, "");
-  const model = environment.OPENAI_MODEL?.trim() || DEFAULT_OPENAI_MODEL;
-  const apiKey = environment.OPENAI_API_KEY?.trim() ?? "";
+  const model = useDeepSeek
+    ? environment.DEEPSEEK_MODEL?.trim() || DEFAULT_DEEPSEEK_MODEL
+    : environment.OPENAI_MODEL?.trim() || DEFAULT_OPENAI_MODEL;
+  const apiKey = useDeepSeek
+    ? deepSeekApiKey
+    : environment.OPENAI_API_KEY?.trim() ?? "";
 
   let parsedUrl: URL;
   try {
@@ -262,7 +278,7 @@ function readOpenAIConfig(
   } catch (cause) {
     throw new CareerOpsAdapterError(
       "INVALID_CONFIGURATION",
-      "OPENAI_BASE_URL 不是有效 URL。",
+      `${baseUrlVariable} 不是有效 URL。`,
       { cause },
     );
   }
@@ -271,13 +287,13 @@ function readOpenAIConfig(
   if (parsedUrl.protocol !== "https:" && !(loopback && parsedUrl.protocol === "http:")) {
     throw new CareerOpsAdapterError(
       "INVALID_CONFIGURATION",
-      "远程 OPENAI_BASE_URL 必须使用 HTTPS；HTTP 只允许回环地址。",
+      `远程 ${baseUrlVariable} 必须使用 HTTPS；HTTP 只允许回环地址。`,
     );
   }
   if (!loopback && apiKey.length === 0) {
     throw new CareerOpsAdapterError(
       "AUTHENTICATION_ERROR",
-      `缺少 ${parsedUrl.hostname} 所需的 OPENAI_API_KEY。`,
+      `缺少 ${parsedUrl.hostname} 所需的 ${apiKeyVariable}。`,
     );
   }
 
@@ -337,7 +353,7 @@ async function readResponseText(
 
 async function requestEvaluation(
   input: JobDetail,
-  config: OpenAIConfig,
+  config: CompatibleApiConfig,
   options: z.infer<typeof EvaluateWithCareerOpsOptionsSchema>,
 ): Promise<string> {
   if (isAborted(options.signal)) {
@@ -594,7 +610,7 @@ export async function evaluateWithCareerOps(
     throw asInvalidInputError("career-ops 适配器参数无效。", parsedOptions.error);
   }
 
-  const config = readOpenAIConfig();
+  const config = readCompatibleApiConfig();
   const gatewayDiagnostics: string[] = [];
   let evaluationText: string | undefined;
   for (

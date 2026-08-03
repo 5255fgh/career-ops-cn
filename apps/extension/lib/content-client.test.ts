@@ -172,6 +172,32 @@ describe('Content client', () => {
     ]);
   });
 
+  it('详情消息端口因页面跳转断开时显示明确的中断说明', async () => {
+    const client = createContentClient({
+      query: async () => [{ id: 10 }],
+      sendMessage: async () => {
+        throw new Error('The message port closed');
+      },
+    });
+
+    await expect(client.startDetailScan(visibleCard, 1_000)).rejects.toMatchObject({
+      name: 'ContentClientError',
+      message: 'BOSS 页面发生跳转，当前扫描已中断；已完成结果已保存。',
+    });
+  });
+
+  it('详情响应不符合契约时保留响应无效提示', async () => {
+    const client = createContentClient({
+      query: async () => [{ id: 11 }],
+      sendMessage: async () => ({ unexpected: true }),
+    });
+
+    await expect(client.startDetailScan(visibleCard, 1_000)).rejects.toMatchObject({
+      name: 'ContentClientError',
+      message: '职位详情扫描响应无效。',
+    });
+  });
+
   it('没有活动标签页时返回明确错误', async () => {
     const client = createContentClient({
       query: async () => [],

@@ -4,6 +4,7 @@
   "job-detail.html": { "pageType": "job-detail", "block": null },
   "job-detail-standalone.html": { "pageType": "job-detail", "block": null },
   "search-detail-panel.html": { "pageType": "search-detail-panel", "block": null },
+  "search-detail-anchor-card.html": { "pageType": "search-detail-panel", "block": null },
   "company-job-list.html": { "pageType": "company-job-list", "block": null },
   "missing-fields.html": { "pageType": "job-detail", "block": null },
   "login.html": { "pageType": "login", "block": "login_required" },

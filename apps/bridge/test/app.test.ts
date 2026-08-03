@@ -1340,6 +1340,22 @@ describe("Bridge 配置与监听", () => {
     expect(
       readBridgeConfig({
         ...TEST_ENVIRONMENT,
+        DEEPSEEK_API_KEY: "configured",
+      }).modelId,
+    ).toBe("deepseek-v4-flash");
+    expect(
+      readBridgeConfig({
+        ...TEST_ENVIRONMENT,
+        DEEPSEEK_API_KEY: "configured",
+        DEEPSEEK_MODEL: "deepseek-v4-pro",
+        OPENAI_MODEL: "ignored-openai-model",
+      }).modelId,
+    ).toBe("deepseek-v4-pro");
+    expect(
+      readBridgeConfig({
+        ...TEST_ENVIRONMENT,
+        DEEPSEEK_API_KEY: "configured",
+        DEEPSEEK_MODEL: "deepseek-v4-pro",
         OPENAI_MODEL: "model-from-openai",
         CAREER_OPS_CN_MODEL_ID: "model-from-bridge",
       }).modelId,

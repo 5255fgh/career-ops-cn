@@ -33,9 +33,22 @@ function jobDetail(jobId: string): JobDetail {
 }
 
 function useRemoteOpenAIEnvironment(): void {
+  vi.stubEnv("DEEPSEEK_API_KEY", "");
   vi.stubEnv("OPENAI_API_KEY", "sk-SYNTHETIC_TEST_KEY_NOT_VALID_000000");
   vi.stubEnv("OPENAI_BASE_URL", "https://api.example.test/v1");
   vi.stubEnv("OPENAI_MODEL", "example-model");
+}
+
+function useDeepSeekEnvironment(options?: {
+  baseUrl?: string;
+  model?: string;
+}): void {
+  vi.stubEnv("DEEPSEEK_API_KEY", "ds-SYNTHETIC_TEST_KEY_NOT_VALID_000000");
+  vi.stubEnv("DEEPSEEK_BASE_URL", options?.baseUrl ?? "");
+  vi.stubEnv("DEEPSEEK_MODEL", options?.model ?? "");
+  vi.stubEnv("OPENAI_API_KEY", "sk-IGNORED_OPENAI_KEY");
+  vi.stubEnv("OPENAI_BASE_URL", "https://ignored-openai.example/v1");
+  vi.stubEnv("OPENAI_MODEL", "ignored-openai-model");
 }
 
 function completionResponse(content: string): Response {
@@ -157,7 +170,47 @@ describe("parseCareerOpsOutput", () => {
 });
 
 describe("evaluateWithCareerOps", () => {
-  it("直接调用 OpenAI-compatible API 并保持现有评估字段", async () => {
+  it("存在 DEEPSEEK_API_KEY 时优先使用 DeepSeek 默认地址和模型", async () => {
+    useDeepSeekEnvironment();
+    const output = (await readOutputFixture("normal-zh.txt")).trim();
+    const fetchMock = vi.fn<typeof fetch>();
+    fetchMock.mockResolvedValue(completionResponse(output));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(
+      evaluateWithCareerOps(jobDetail("deepseek-default")),
+    ).resolves.toMatchObject({ score: 84, recommendation: "apply" });
+
+    const [url, init] = fetchMock.mock.calls[0] ?? [];
+    expect(url).toBe("https://api.deepseek.com/chat/completions");
+    expect(new Headers(init?.headers).get("Authorization")).toBe(
+      "Bearer ds-SYNTHETIC_TEST_KEY_NOT_VALID_000000",
+    );
+    const request = JSON.parse(String(init?.body)) as { model: string };
+    expect(request.model).toBe("deepseek-v4-flash");
+  });
+
+  it("允许 DeepSeek 自定义 base URL 和 deepseek-v4-pro", async () => {
+    useDeepSeekEnvironment({
+      baseUrl: "https://gateway.example.test/deepseek/",
+      model: "deepseek-v4-pro",
+    });
+    const output = (await readOutputFixture("normal-en.txt")).trim();
+    const fetchMock = vi.fn<typeof fetch>();
+    fetchMock.mockResolvedValue(completionResponse(output));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await evaluateWithCareerOps(jobDetail("deepseek-pro"));
+
+    const [url, init] = fetchMock.mock.calls[0] ?? [];
+    expect(url).toBe(
+      "https://gateway.example.test/deepseek/chat/completions",
+    );
+    const request = JSON.parse(String(init?.body)) as { model: string };
+    expect(request.model).toBe("deepseek-v4-pro");
+  });
+
+  it("未配置 DeepSeek Key 时兼容已有 OpenAI-compatible 配置和评估字段", async () => {
     useRemoteOpenAIEnvironment();
     const output = (await readOutputFixture("normal-zh.txt")).trim();
     const fetchMock = vi.fn<typeof fetch>();
@@ -202,6 +255,7 @@ describe("evaluateWithCareerOps", () => {
   });
 
   it("回环 HTTP endpoint 不要求 API Key", async () => {
+    vi.stubEnv("DEEPSEEK_API_KEY", "");
     vi.stubEnv("OPENAI_API_KEY", "");
     vi.stubEnv("OPENAI_BASE_URL", "http://127.0.0.1:45678/v1/");
     vi.stubEnv("OPENAI_MODEL", "local-model");
@@ -218,6 +272,7 @@ describe("evaluateWithCareerOps", () => {
   });
 
   it("远程 endpoint 缺少 API Key 时明确失败", async () => {
+    vi.stubEnv("DEEPSEEK_API_KEY", "");
     vi.stubEnv("OPENAI_API_KEY", "");
     vi.stubEnv("OPENAI_BASE_URL", "https://api.example.test/v1");
     const fetchMock = vi.fn<typeof fetch>();

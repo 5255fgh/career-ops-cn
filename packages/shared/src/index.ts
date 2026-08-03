@@ -620,6 +620,7 @@ export const StartDetailScanResponseSchema = z.discriminatedUnion("outcome", [
       "http",
       "missing_fields",
       "layout",
+      "navigation_changed",
       "unknown",
     ]),
     retryable: z.boolean(),

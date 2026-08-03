@@ -179,7 +179,7 @@ function runDatabaseOperation<T>(operation: () => T): T {
 function redactDiagnosticText(value: string): string {
   return value
     .replace(/\bsk-[A-Za-z0-9_-]+\b/gu, "[REDACTED]")
-    .replace(/(OPENAI_API_KEY\s*[=:]\s*)\S+/giu, "$1[REDACTED]")
+    .replace(/((?:DEEPSEEK|OPENAI)_API_KEY\s*[=:]\s*)\S+/giu, "$1[REDACTED]")
     .replace(/(Authorization\s*:\s*Bearer\s+)\S+/giu, "$1[REDACTED]");
 }
 

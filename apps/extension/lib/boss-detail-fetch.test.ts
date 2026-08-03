@@ -5,6 +5,7 @@ import { Window } from 'happy-dom';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import {
+  activateBossCardWithoutNavigation,
   fetchBossDetail,
   readBossDetailFromLivePanel,
   toJobCard,
@@ -311,6 +312,118 @@ describe('fetchBossDetail', () => {
       ],
     });
     shell.window.close();
+    panel.window.close();
+  });
+
+  it('整张卡片为链接时阻止默认导航、保留冒泡事件并读取更新后的面板', async () => {
+    const searchUrl = 'https://www.zhipin.com/web/geek/jobs?query=frontend';
+    const panel = createDocument('search-detail-anchor-card.html', searchUrl);
+    const target = panel.document.getElementById('anchor-card-b')!;
+    const targetHandler = vi.fn((event: Event) => {
+      expect(event.defaultPrevented).toBe(true);
+      panel.document
+        .getElementById('anchor-panel-detail')!
+        .setAttribute('data-jobid', 'boss-3002');
+      panel.document
+        .getElementById('anchor-panel-detail-link')!
+        .setAttribute('href', '/job_detail/boss-3002.html');
+      panel.document.getElementById('anchor-panel-detail-title')!.textContent =
+        '全栈工程师';
+      panel.document.getElementById('anchor-panel-detail-company')!.textContent =
+        '示例戊科技';
+      panel.document.getElementById('anchor-panel-description')!.textContent =
+        '负责全栈产品研发。';
+    });
+    const bubbleHandler = vi.fn();
+    target.addEventListener('click', targetHandler);
+    panel.document
+      .querySelector('.search-job-result')!
+      .addEventListener('click', bubbleHandler);
+
+    const result = await readBossDetailFromLivePanel({
+      document: panel.document,
+      url: searchUrl,
+      card: panelCard,
+      timeoutMs: 1_000,
+      signal: new AbortController().signal,
+      isContentScriptConnected: () => true,
+    });
+
+    expect(result).toMatchObject({
+      outcome: 'success',
+      job: {
+        jobId: 'boss-3002',
+        description: '负责全栈产品研发。',
+        identityVerified: true,
+      },
+    });
+    expect(targetHandler).toHaveBeenCalledOnce();
+    expect(bubbleHandler).toHaveBeenCalledOnce();
+    expect(panel.window.location.pathname).toBe('/web/geek/jobs');
+    panel.window.close();
+  });
+
+  it('同一搜索 pathname 的 history 参数变化不会误报页面跳转', () => {
+    const searchUrl = 'https://www.zhipin.com/web/geek/jobs?query=frontend';
+    const panel = createDocument('search-detail-anchor-card.html', searchUrl);
+    const target = panel.document.getElementById('anchor-card-b')!;
+    target.addEventListener('click', () => {
+      panel.window.history.pushState(
+        {},
+        '',
+        '/web/geek/jobs?query=frontend&jobId=boss-3002',
+      );
+    });
+
+    const guard = activateBossCardWithoutNavigation({
+      document: panel.document,
+      url: searchUrl,
+      selection: {
+        element: target,
+        expected: {
+          sourceJobId: 'boss-3002',
+          url: panelCard.job.detailUrl,
+          title: panelCard.job.title,
+          company: panelCard.job.companyName,
+        },
+      },
+    });
+
+    expect(guard.navigationFailure()).toBeNull();
+    expect(panel.window.location.pathname).toBe('/web/geek/jobs');
+    guard.dispose();
+    panel.window.close();
+  });
+
+  it('激活导致 pathname 离开搜索页时返回 navigation_changed', async () => {
+    const searchUrl = 'https://www.zhipin.com/web/geek/jobs?query=frontend';
+    const panel = createDocument('search-detail-anchor-card.html', searchUrl);
+    panel.document
+      .getElementById('anchor-card-b')!
+      .addEventListener('click', () => {
+        panel.window.history.pushState({}, '', '/job_detail/boss-3002.html');
+      });
+
+    const result = await readBossDetailFromLivePanel({
+      document: panel.document,
+      url: searchUrl,
+      card: panelCard,
+      timeoutMs: 1_000,
+      signal: new AbortController().signal,
+    });
+
+    expect(result).toMatchObject({
+      outcome: 'failed',
+      failureKind: 'navigation_changed',
+      retryable: false,
+      message: 'BOSS 页面发生跳转，已跳过当前职位；已完成结果已保存。',
+      diagnostics: [
+        expect.objectContaining({
+          source: 'live-panel',
+          outcome: 'navigation_changed',
+        }),
+      ],
+    });
     panel.window.close();
   });
 

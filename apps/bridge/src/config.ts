@@ -11,7 +11,8 @@ export const DEFAULT_BRIDGE_PORT = 3847;
 export const DEFAULT_EVALUATION_TIMEOUT_MS = 120_000;
 export const DEFAULT_PROFILE_VERSION = "default-profile-v1";
 export const DEFAULT_PROMPT_VERSION = "career-ops-cn-openai-v1";
-export const DEFAULT_MODEL_ID = "gpt-4o-mini";
+export const DEFAULT_MODEL_ID = "deepseek-v4-flash";
+const DEFAULT_OPENAI_MODEL_ID = "gpt-4o-mini";
 export const DEFAULT_EVALUATION_SCHEMA_VERSION = "1";
 export const DEFAULT_DATABASE_PATH = fileURLToPath(
   new URL("../career-ops-cn.sqlite", import.meta.url),
@@ -50,6 +51,8 @@ const EnvironmentSchema = z.object({
     .trim()
     .min(1)
     .optional(),
+  DEEPSEEK_API_KEY: z.string().optional(),
+  DEEPSEEK_MODEL: z.string().trim().min(1).optional(),
   OPENAI_MODEL: z.string().trim().min(1).optional(),
   CAREER_OPS_CN_EVALUATION_SCHEMA_VERSION: z
     .string()
@@ -118,8 +121,9 @@ export function readBridgeConfig(
     promptVersion: result.data.CAREER_OPS_CN_PROMPT_VERSION,
     modelId:
       result.data.CAREER_OPS_CN_MODEL_ID ??
-      result.data.OPENAI_MODEL ??
-      DEFAULT_MODEL_ID,
+      ((result.data.DEEPSEEK_API_KEY?.trim() ?? '') !== ''
+        ? result.data.DEEPSEEK_MODEL ?? DEFAULT_MODEL_ID
+        : result.data.OPENAI_MODEL ?? DEFAULT_OPENAI_MODEL_ID),
     evaluationSchemaVersion:
       result.data.CAREER_OPS_CN_EVALUATION_SCHEMA_VERSION,
   };

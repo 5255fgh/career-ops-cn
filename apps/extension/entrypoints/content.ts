@@ -200,6 +200,16 @@ export default defineContentScript({
   matches: ['*://*.zhipin.com/*', '*://zhipin.com/*'],
   main() {
     let activeOperationController: AbortController | null = null;
+    let contentScriptConnected = true;
+    const markContentScriptDisconnected = (): void => {
+      contentScriptConnected = false;
+    };
+    window.addEventListener('pagehide', markContentScriptDisconnected, true);
+    window.addEventListener(
+      'beforeunload',
+      markContentScriptDisconnected,
+      true,
+    );
 
     browser.runtime.onMessage.addListener(async (message: unknown) => {
       if (DetectPageRequestSchema.safeParse(message).success) {
@@ -262,6 +272,7 @@ export default defineContentScript({
             card: startRequest.data.card,
             timeoutMs: startRequest.data.timeoutMs,
             signal: controller.signal,
+            isContentScriptConnected: () => contentScriptConnected,
             ...(fetched.diagnostics === undefined
               ? {}
               : { previousDiagnostics: fetched.diagnostics }),
