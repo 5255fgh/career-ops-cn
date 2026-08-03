@@ -306,6 +306,41 @@ describe('ScanController', () => {
     expect(content.startDetailScan).toHaveBeenCalledTimes(2);
   });
 
+  it('单职位 navigation_changed 只跳过当前职位，后续成功详情仍进入 AI', async () => {
+    const cards = [visibleCard(0), visibleCard(1)];
+    const content = contentMock([cards]);
+    vi.mocked(content.startDetailScan)
+      .mockResolvedValueOnce({
+        type: 'boss/start-detail-scan/response',
+        outcome: 'failed',
+        message: 'BOSS 页面发生跳转，已跳过当前职位；已完成结果已保存。',
+        failureKind: 'navigation_changed',
+        retryable: false,
+      })
+      .mockResolvedValueOnce({
+        type: 'boss/start-detail-scan/response',
+        outcome: 'success',
+        job: detailFor(cards[1]!),
+      });
+    const bridge = bridgeMock();
+
+    const state = await controller(content, bridge).run({ maxPages: 1 });
+
+    expect(state.status).toBe('completed');
+    expect(state.stopReason).toBe('page_limit');
+    expect(state.progress).toMatchObject({
+      detailCompleted: 2,
+      detailSuccess: 1,
+      detailFailure: 1,
+      aiCompleted: 1,
+      aiSuccess: 1,
+    });
+    expect(state.results[0]?.detailError).toContain('BOSS 页面发生跳转');
+    expect(state.results[1]?.evaluation).toBeDefined();
+    expect(content.startDetailScan).toHaveBeenCalledTimes(2);
+    expect(bridge.evaluateJob).toHaveBeenCalledOnce();
+  });
+
   it.each([
     [
       '身份校验失败',

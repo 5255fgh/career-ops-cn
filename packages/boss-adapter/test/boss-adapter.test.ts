@@ -46,6 +46,8 @@ const fixtureUrls: Record<string, string> = {
     "https://www.zhipin.com/job_detail/standalone-2002.html",
   "search-detail-panel.html":
     "https://www.zhipin.com/web/geek/job?query=frontend",
+  "search-detail-anchor-card.html":
+    "https://www.zhipin.com/web/geek/jobs?query=frontend",
   "company-job-list.html": "https://www.zhipin.com/gongsi/job/example.html",
   "missing-fields.html": "https://www.zhipin.com/job_detail/boss-5001.html",
   "login.html": "https://www.zhipin.com/web/user/?ka=header-login",
@@ -472,7 +474,7 @@ describe("等待与批量扫描", () => {
     window.close();
   });
 
-  it("扫描选中卡片时只收集完成身份校验的详情", async () => {
+  it("默认激活只点击卡片容器，不直接点击内部 a[href]", async () => {
     const url = fixtureUrls["search-detail-panel.html"]!;
     const { window, document } = createDocument(
       "search-detail-panel.html",
@@ -503,7 +505,7 @@ describe("等待与批量扫描", () => {
       timeoutMs: 1_000,
     });
 
-    expect(linkClicked).toHaveBeenCalledOnce();
+    expect(linkClicked).not.toHaveBeenCalled();
     expect(result.block).toBeNull();
     expect(result.entries[0]?.result.status).toBe("verified");
     expect(result.details).toHaveLength(1);
@@ -512,6 +514,44 @@ describe("等待与批量扫描", () => {
       title: "全栈工程师",
       description: "负责全栈产品研发。",
     });
+    window.close();
+  });
+
+  it("默认激活遇到整张 a[href] 卡片时不会派发链接 click", async () => {
+    vi.useFakeTimers();
+    const url = fixtureUrls["search-detail-anchor-card.html"]!;
+    const { window, document } = createDocument(
+      "search-detail-anchor-card.html",
+      url,
+    );
+    const anchorCard = document.getElementById("anchor-card-b")!;
+    const linkClicked = vi.fn();
+    anchorCard.addEventListener("click", linkClicked);
+
+    const pending = scanSelectedBossDetails({
+      document,
+      url,
+      selections: [
+        {
+          element: anchorCard,
+          expected: {
+            sourceJobId: "boss-3002",
+            url: "https://www.zhipin.com/job_detail/boss-3002.html",
+            title: "全栈工程师",
+            company: "示例戊科技",
+          },
+        },
+      ],
+      timeoutMs: 250,
+    });
+
+    await vi.advanceTimersByTimeAsync(250);
+    await expect(pending).resolves.toMatchObject({
+      entries: [{ result: { status: "timeout" } }],
+      details: [],
+    });
+    expect(linkClicked).not.toHaveBeenCalled();
+    expect(window.location.pathname).toBe("/web/geek/jobs");
     window.close();
   });
 

@@ -112,6 +112,14 @@ const previousOpenAIEnvironment = {
   model: process.env.OPENAI_MODEL,
   apiKey: process.env.OPENAI_API_KEY,
 };
+const previousDeepSeekEnvironment = {
+  baseUrl: process.env.DEEPSEEK_BASE_URL,
+  model: process.env.DEEPSEEK_MODEL,
+  apiKey: process.env.DEEPSEEK_API_KEY,
+};
+delete process.env.DEEPSEEK_BASE_URL;
+delete process.env.DEEPSEEK_MODEL;
+delete process.env.DEEPSEEK_API_KEY;
 process.env.OPENAI_BASE_URL = `http://127.0.0.1:${evaluatorAddress.port}/v1`;
 process.env.OPENAI_MODEL = "smoke-model";
 delete process.env.OPENAI_API_KEY;
@@ -342,6 +350,9 @@ try {
     ["OPENAI_BASE_URL", previousOpenAIEnvironment.baseUrl],
     ["OPENAI_MODEL", previousOpenAIEnvironment.model],
     ["OPENAI_API_KEY", previousOpenAIEnvironment.apiKey],
+    ["DEEPSEEK_BASE_URL", previousDeepSeekEnvironment.baseUrl],
+    ["DEEPSEEK_MODEL", previousDeepSeekEnvironment.model],
+    ["DEEPSEEK_API_KEY", previousDeepSeekEnvironment.apiKey],
   ]) {
     if (value === undefined) delete process.env[name];
     else process.env[name] = value;

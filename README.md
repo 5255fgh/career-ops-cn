@@ -11,7 +11,7 @@
 - 检测 BOSS 搜索列表、搜索详情组合页、单职位详情页、登录页、挑战页和不支持的布局。
 - 点击一次后自动处理当前搜索条件下最多 3 页、最多 60 个本轮新职位；连续两页没有新职位也会结束。
 - 列表阶段只根据标题、公司、已有地点/薪资和去重信息预筛；读取完整 JD 后再做详情硬规则筛选。
-- BOSS 详情读取固定并发为 1；先同源 `fetch(detailUrl)`，若响应是动态壳、布局不可识别、缺少详情容器或职位描述，则按 Job ID、标准化详情 URL、标题与公司的顺序定位卡片并从当前右侧实时面板兜底读取。请求间隔以 1800ms 为基础加入不超过 ±20% 抖动，临时网络失败最多重试 1 次。
+- BOSS 详情读取固定并发为 1；先同源 `fetch(detailUrl)`，若响应是动态壳、布局不可识别、缺少详情容器或职位描述，则按 Job ID、标准化详情 URL、标题与公司的顺序定位完整卡片并从当前右侧实时面板兜底读取。实时面板激活只在搜索组合页内触发，链接卡片会在捕获阶段阻止默认导航但保留 BOSS 的冒泡处理器。请求间隔以 1800ms 为基础加入不超过 ±20% 抖动，临时网络失败最多重试 1 次。
 - 单轮最长约 10 分钟；单轮 AI 调用防失控上限为 30，没有每日 AI 调用上限。
 - 在单职位详情页完成 JobDetail 提取、职位身份校验、Bridge 保存和 AI 评估。
 - 在保存或评估前校验职位身份，避免把职位 B 的详情保存或分析为职位 A。
@@ -55,18 +55,20 @@ pnpm check
 
 ```dotenv
 CAREER_OPS_CN_TOKEN=使用一个仅本机保存的随机长 token
-OPENAI_API_KEY=使用你的 provider key
-OPENAI_BASE_URL=https://api.openai.com/v1
-OPENAI_MODEL=gpt-4o-mini
+DEEPSEEK_API_KEY=使用你的 DeepSeek API Key
+DEEPSEEK_BASE_URL=https://api.deepseek.com
+DEEPSEEK_MODEL=deepseek-v4-flash
 ```
 
-`OPENAI_BASE_URL` 必须是包含版本路径的 OpenAI-compatible base URL，内置 evaluator 会请求其 `/chat/completions`；远程地址必须使用 HTTPS，本机回环 HTTP endpoint 可以不配置 Key。可选配置还包括 Bridge 端口、SQLite 路径、评估超时、JSON 格式的规则偏好，以及写入评估缓存键的 profile/Prompt/model/schema 版本；模型标识优先读取 `CAREER_OPS_CN_MODEL_ID`，未设置时沿用 `OPENAI_MODEL`，可用变量见 [.env.example](./.env.example)。配置完成后运行：
+配置 `DEEPSEEK_API_KEY` 后，内置 evaluator 会使用 DeepSeek 配置并请求 `https://api.deepseek.com/chat/completions`；模型默认是 `deepseek-v4-flash`，需要时可把 `DEEPSEEK_MODEL` 改为 `deepseek-v4-pro`。远程地址必须使用 HTTPS。
+
+未配置 `DEEPSEEK_API_KEY` 时，项目继续兼容 `OPENAI_API_KEY`、`OPENAI_BASE_URL` 和 `OPENAI_MODEL`；OpenAI-compatible base URL 默认 `https://api.openai.com/v1`，本机回环 HTTP endpoint 可以不配置 Key。两套变量不需要同时存在；只要 `DEEPSEEK_API_KEY` 非空，DeepSeek 配置优先。可选配置还包括 Bridge 端口、SQLite 路径、评估超时、JSON 格式的规则偏好，以及写入评估缓存键的 profile/Prompt/model/schema 版本；`CAREER_OPS_CN_MODEL_ID` 仍可显式覆盖缓存中的模型标识，可用变量见 [.env.example](./.env.example)。配置完成后运行：
 
 ```powershell
 pnpm doctor
 ```
 
-`doctor` 会检查 Node/pnpm、Bridge token、OpenAI-compatible endpoint、凭据、SQLite 目录、扩展构建和当前 Bridge 连接；Bridge 尚未启动只会显示警告。
+`doctor` 会分别显示 Provider、Base URL、Model 和 API Key 是否已配置，并检查 Node/pnpm、Bridge token、SQLite 目录、扩展构建和当前 Bridge 连接；它绝不会显示 API Key 原文，Bridge 尚未启动只会显示警告。
 
 ## AI evaluator 配置
 
@@ -74,7 +76,7 @@ AI 评估实现位于 `packages/career-ops-adapter`，随本仓库安装和构�
 
 内置 Prompt 只依据 BOSS JobDetail，明确不臆造候选人简历或外部公司研究，并生成 A–G 中文评估以及固定的 `SCORE_SUMMARY`。适配器保留 `score`、`recommendation`、`rawReport`、`company`、`role`、`archetype` 和 `legitimacy` 字段；score 仍由 0–5 转为 0–100，recommendation 阈值仍为 apply ≥ 4、review ≥ 3.2、其余 skip。
 
-真实模型评估需要在启动 Bridge 的环境中提供 `OPENAI_API_KEY`、`OPENAI_BASE_URL` 和 `OPENAI_MODEL`；后两项未设置时分别默认 `https://api.openai.com/v1` 和 `gpt-4o-mini`。模型密钥只留在本机 Bridge 进程环境中，不要输入扩展，也不会进入 Extension bundle。
+真实模型评估日常默认读取 `DEEPSEEK_API_KEY`、`DEEPSEEK_BASE_URL` 和 `DEEPSEEK_MODEL`；后两项未设置时分别默认 `https://api.deepseek.com` 和 `deepseek-v4-flash`。只有未配置 `DEEPSEEK_API_KEY` 时才读取兼容的 `OPENAI_*` 变量。模型密钥只留在本机 Bridge 进程环境中，不要输入扩展，也不会进入 Extension bundle。
 
 ## Bridge 启动
 
@@ -142,7 +144,7 @@ SQLite 中会保存职位描述和完整 raw report。不要把真实数据库�
 
 - **Bridge 离线**：确认 `pnpm dev:bridge` 正在运行，并检查端口是否被占用。
 - **Token 无效**：确保 Side Panel 中保存的 token 与 `CAREER_OPS_CN_TOKEN` 完全一致。
-- **真实 evaluator 无法认证**：在启动 Bridge 的同一环境提供有效 `OPENAI_API_KEY`，然后重启 Bridge。不要把 Key 填入扩展。
+- **真实 evaluator 无法认证**：日常 DeepSeek 配置应在启动 Bridge 的同一环境提供有效 `DEEPSEEK_API_KEY`，然后重启 Bridge；仅使用兼容配置时提供 `OPENAI_API_KEY`。不要把 Key 填入扩展。
 - **provider HTTP 502/503/504**：适配器会进行 2 次有限重试（共 3 次尝试）。持续失败不会生成伪造 score/raw report；脱敏后的状态、尝试次数和响应摘要会写入 diagnostics，并在 Bridge 错误中返回诊断 ID。
 - **evaluator timeout**：检查 provider 连通性，并按需要调整 `CAREER_OPS_CN_EVALUATION_TIMEOUT_MS`。
 - **用户取消**：Side Panel 显示“已取消”是预期结果，当前 HTTP 请求会被中止。
@@ -151,6 +153,7 @@ SQLite 中会保存职位描述和完整 raw report。不要把真实数据库�
 - **登录失效**：在 BOSS 页面重新登录，刷新页面后再次检测。
 - **challenge 或账号风险**：立即停止扫描，在浏览器中由用户自行完成站点要求；工具不会绕过验证。
 - **unsupported layout**：单个详情 `fetch` 返回动态壳或缺字段时会自动尝试当前搜索页实时详情面板；只有列表整体无法解析，或详情至少 8 个样本中同类 Parser 错误达到 75%，才停止整轮。仍失败时需要用脱敏的真实页面证据更新 `packages/boss-adapter` 的 fixture、Selector 和测试。
+- **实时面板激活失败**：Extension 不直接导航职位链接；若整张卡片只有链接可触发面板，会对本次 click 调用 `preventDefault()`，同时保留 BOSS 自身的冒泡处理。搜索 pathname、职位列表或 Content Script 连接状态异常时，该职位记为 `navigation_changed` 并继续后续职位；如果标签页真的完成导航并销毁 Content Script，则显示“BOSS 页面发生跳转，当前扫描已中断；已完成结果已保存。”，不会刷新、回退或自动恢复页面。
 - **身份校验失败**：Job ID 或标准化详情 URL 一致即可直接确认；缺少强信号时会组合标题和公司判断。实时面板兜底后仍不一致的详情会拒绝保存，单条失败只记录后继续。
 - **diagnostics 写入失败**：Side Panel 会显示警告；职位保存、筛选和已完成评估的状态保持不变。
 
@@ -161,12 +164,12 @@ SQLite 中会保存职位描述和完整 raw report。不要把真实数据库�
 - 扫描执行仍只存在于用户主动打开的前台 Extension 上下文；Bridge/SQLite 持久化状态和结果，但关闭 Side Panel 不会在后台继续操纵 BOSS 页面。
 - BOSS 列表不提供完整 JD。卡片字段未变化时会按要求跳过重复详情读取；远端仅修改 JD、但列表字段完全不变的情况，要等后续显式读取到新详情后才能发现并生成新 `jd_hash`。
 - BOSS 页面结构变化可能导致 Selector 暂时失效。
-- 真实评估依赖可用的 OpenAI-compatible provider 配置和模型额度。
+- 真实评估依赖可用的 DeepSeek（或兼容的 OpenAI-compatible）配置和模型额度。
 - Side Panel 必须在受支持的 BOSS 页面打开，重新加载扩展后需要刷新已有标签页。
 
 ## 常用命令
 
-- `pnpm doctor`：检查本机配置、OpenAI-compatible endpoint、扩展构建和 Bridge 连接。
+- `pnpm doctor`：检查本机配置、DeepSeek/OpenAI-compatible endpoint、扩展构建和 Bridge 连接。
 - `pnpm start`：启动已经构建的本机 Bridge。
 - `pnpm typecheck`：检查全部 workspace 的 TypeScript 类型。
 - `pnpm test`：运行全部 Vitest 测试。

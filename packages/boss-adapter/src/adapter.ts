@@ -710,14 +710,11 @@ const identityFromSelection = (
 
 const activateSelection = (selection: BossDetailSelection): void => {
   const view = selection.element.ownerDocument.defaultView;
-  if (view === null) {
+  if (view === null || selection.element.matches("a[href]")) {
     return;
   }
 
-  const target =
-    queryFirstWithAttribute(selection.element, bossSelectors.card.links, "href") ??
-    selection.element;
-  target.dispatchEvent(
+  selection.element.dispatchEvent(
     new view.MouseEvent("click", { bubbles: true, cancelable: true }),
   );
 };

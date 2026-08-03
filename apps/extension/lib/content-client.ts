@@ -49,6 +49,9 @@ function isSignalAborted(signal: AbortSignal | undefined): boolean {
   return signal?.aborted === true;
 }
 
+const NAVIGATION_INTERRUPTED_MESSAGE =
+  'BOSS 页面发生跳转，当前扫描已中断；已完成结果已保存。';
+
 function abortReason(signal: AbortSignal | undefined): unknown {
   return signal?.reason ?? abortError();
 }
@@ -140,7 +143,7 @@ export function createContentClient(tabs: TabsClient = browserTabs): ContentClie
         throw abortReason(signal);
       }
       throw new ContentClientError(
-        '无法连接当前 BOSS 页面，请确认页面已刷新且扩展已启用。',
+        NAVIGATION_INTERRUPTED_MESSAGE,
         { cause: error },
       );
     }
@@ -196,12 +199,24 @@ export function createContentClient(tabs: TabsClient = browserTabs): ContentClie
 
       try {
         const response = await withAbort(tabs.sendMessage(tabId, message), signal);
-        return StartDetailScanResponseSchema.parse(response);
+        try {
+          return StartDetailScanResponseSchema.parse(response);
+        } catch (error) {
+          throw new ContentClientError('职位详情扫描响应无效。', {
+            cause: error,
+          });
+        }
       } catch (error) {
         if (isSignalAborted(signal)) {
           throw abortReason(signal);
         }
-        throw new ContentClientError('职位详情扫描消息失败。', { cause: error });
+        if (error instanceof ContentClientError) {
+          throw error;
+        }
+        throw new ContentClientError(
+          NAVIGATION_INTERRUPTED_MESSAGE,
+          { cause: error },
+        );
       } finally {
         signal?.removeEventListener('abort', onAbort);
       }

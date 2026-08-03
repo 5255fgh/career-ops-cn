@@ -16,7 +16,8 @@
 
 ### Content Script
 
-- 只识别 BOSS 页面、解析当前页卡片、读取当前或目标职位详情、滚动/点击下一页，并返回经过 shared Zod 契约校验的结果。目标详情先同源 fetch；动态壳、缺详情容器或缺 description 时，按 Job ID、标准化 URL、标题与公司定位卡片，点击后等待右侧面板身份或内容变化并再次校验。
+- 只识别 BOSS 页面、解析当前页卡片、读取当前或目标职位详情、滚动/点击下一页，并返回经过 shared Zod 契约校验的结果。目标详情先同源 fetch；动态壳、缺详情容器或缺 description 时，按 Job ID、标准化 URL、标题与公司定位完整卡片，由 Extension 专用安全激活函数等待右侧面板身份或内容变化并再次校验。
+- 安全激活不会使用 boss-adapter 的通用 anchor 激活：优先派发到完整卡片或无 `href` 的交互区域；必须经过链接处理器时临时在捕获阶段 `preventDefault()`，不停止冒泡，随后立即移除监听器。激活前后校验搜索 pathname、列表签名、详情身份和 Content Script 连接；同 pathname 的查询参数变化允许继续，独立详情/首页/安全页跳转或生命周期卸载返回 `navigation_changed`。单职位结果可返回时只隔离该职位；真实导航销毁消息端口时由 Side Panel 将 run 标为 `interrupted` 并保留完成结果，不刷新、回退或重载页面。
 - BOSS Selector 全部位于 `packages/boss-adapter`；Bridge 不读取或操作 DOM。
 - 相邻 BOSS 请求以 1800ms 为基础加入不超过 ±20% 抖动；单职位临时网络失败最多重试 1 次。
 - `detailTimeoutMs` 分别控制详情 `fetch` 和实时面板等待。每次尝试只回传脱敏 URL、HTTP 状态、页面类型、详情容器、缺失字段、读取来源和有限身份信号；不保存整页 HTML。用户取消、超时、普通网络错误、身份失败和页面阻断是不同契约结果。
@@ -67,7 +68,7 @@ Bridge 只绑定 `127.0.0.1`，启动时读取 `CAREER_OPS_CN_TOKEN`。`GET /hea
 - 每个职位最多保留最近 3 个评估版本。
 - 不保存整页原始 HTML，也不引入清理框架、Redis、队列、Cron 或通用调度器。
 
-`packages/career-ops-adapter` 内置唯一的 evaluator 实现。它在 Bridge 进程内使用 `fetch` 调用 `OPENAI_BASE_URL/chat/completions`，读取 `OPENAI_API_KEY`、`OPENAI_BASE_URL` 和 `OPENAI_MODEL`，不启动子进程、不读取外部仓库，也不落地临时 JobDetail。远程 endpoint 强制 HTTPS，回环地址允许 HTTP；认证失败直接返回，502/503/504 最多共尝试 3 次，超时和用户取消都会中止当前请求，无效 JSON、空内容、缺失 summary 或越界 score 不会写入评估。
+`packages/career-ops-adapter` 内置唯一的 OpenAI-compatible Chat Completions evaluator 实现。它在 Bridge 进程内使用 `fetch`；有 `DEEPSEEK_API_KEY` 时读取 `DEEPSEEK_BASE_URL`/`DEEPSEEK_MODEL`（默认 `https://api.deepseek.com` 和 `deepseek-v4-flash`），请求 `/chat/completions`。否则兼容读取 `OPENAI_API_KEY`、`OPENAI_BASE_URL` 和 `OPENAI_MODEL`。它不启动子进程、不读取外部仓库，也不落地临时 JobDetail。远程 endpoint 强制 HTTPS，回环地址允许 HTTP；认证失败直接返回，502/503/504 最多共尝试 3 次，超时和用户取消都会中止当前请求，无效 JSON、空内容、缺失 summary 或越界 score 不会写入评估。
 
 Prompt 只使用已经通过 shared Schema 的 BOSS JobDetail，要求模型生成 A–G 中文分析和固定 `SCORE_SUMMARY`。模型没有候选人简历或浏览器研究能力，因此 Prompt 明确禁止臆造候选人/公司事实，也不生成简历、求职信或投递内容。summary 经本地解析后保持 `score`、`recommendation`、`rawReport`、`company`、`role`、`archetype`、`legitimacy` 对外字段不变。
 

@@ -40,28 +40,43 @@ record(
   token.length > 0 ? '已配置（值未显示）' : '缺少 CAREER_OPS_CN_TOKEN',
 );
 
-const evaluatorBaseUrl =
-  process.env.OPENAI_BASE_URL?.trim() || 'https://api.openai.com/v1';
+const deepSeekApiKey = process.env.DEEPSEEK_API_KEY?.trim() ?? '';
+const useDeepSeek = deepSeekApiKey.length > 0;
+const provider = useDeepSeek ? 'DeepSeek' : 'OpenAI-compatible';
+const evaluatorBaseUrl = useDeepSeek
+  ? process.env.DEEPSEEK_BASE_URL?.trim() || 'https://api.deepseek.com'
+  : process.env.OPENAI_BASE_URL?.trim() || 'https://api.openai.com/v1';
+const evaluatorModel = useDeepSeek
+  ? process.env.DEEPSEEK_MODEL?.trim() || 'deepseek-v4-flash'
+  : process.env.OPENAI_MODEL?.trim() || 'gpt-4o-mini';
+const evaluatorApiKey = useDeepSeek
+  ? deepSeekApiKey
+  : process.env.OPENAI_API_KEY?.trim() ?? '';
+const baseUrlVariable = useDeepSeek ? 'DEEPSEEK_BASE_URL' : 'OPENAI_BASE_URL';
+
+record('ok', 'Provider', provider);
 let evaluatorUrl;
+let evaluatorLoopback = false;
 try {
   evaluatorUrl = new URL(evaluatorBaseUrl);
-  const loopback =
+  evaluatorLoopback =
     evaluatorUrl.hostname === 'localhost' ||
     evaluatorUrl.hostname === '127.0.0.1' ||
     evaluatorUrl.hostname === '::1';
   const secure =
     evaluatorUrl.protocol === 'https:' ||
-    (loopback && evaluatorUrl.protocol === 'http:');
+    (evaluatorLoopback && evaluatorUrl.protocol === 'http:');
   record(
     secure ? 'ok' : 'fail',
-    'Evaluator endpoint',
+    'Base URL',
     secure
-      ? `${evaluatorUrl.origin}（模型 ${process.env.OPENAI_MODEL?.trim() || 'gpt-4o-mini'}）`
-      : '远程 OPENAI_BASE_URL 必须使用 HTTPS；HTTP 只允许回环地址',
+      ? evaluatorBaseUrl.replace(/\/+$/u, '')
+      : `远程 ${baseUrlVariable} 必须使用 HTTPS；HTTP 只允许回环地址`,
   );
 } catch {
-  record('fail', 'Evaluator endpoint', 'OPENAI_BASE_URL 不是有效 URL');
+  record('fail', 'Base URL', `${baseUrlVariable} 不是有效 URL`);
 }
+record('ok', 'Model', evaluatorModel);
 
 const configuredDatabasePath =
   process.env.CAREER_OPS_CN_DATABASE_PATH?.trim() ??
@@ -93,14 +108,16 @@ record(
     : '尚未构建；运行 pnpm build 后再加载扩展',
 );
 
-if ((process.env.OPENAI_API_KEY?.trim() ?? '') === '') {
+if (evaluatorApiKey === '') {
   record(
-    'warn',
-    'Evaluator 凭据',
-    '当前环境未发现 OPENAI_API_KEY；仅本机回环 endpoint 可不使用 Key',
+    evaluatorLoopback ? 'ok' : 'warn',
+    'API Key',
+    evaluatorLoopback
+      ? '未配置（本机回环 endpoint 允许）'
+      : `未配置 ${useDeepSeek ? 'DEEPSEEK_API_KEY' : 'OPENAI_API_KEY'}`,
   );
 } else {
-  record('ok', 'Evaluator 凭据', '已配置（值未显示）');
+  record('ok', 'API Key', '已配置（值未显示）');
 }
 
 const port = Number(process.env.CAREER_OPS_CN_BRIDGE_PORT ?? '3847');

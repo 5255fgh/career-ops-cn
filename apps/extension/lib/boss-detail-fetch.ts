@@ -3,9 +3,13 @@ import {
   detectBossPage,
   detectBossPageBlock,
   findBossJobCardElement,
+  normalizeBossDetailUrl,
   parseBossDetail,
+  parseVisibleBossCards,
   scanSelectedBossDetails,
   verifyDetailIdentity,
+  type BossDetailScanResult,
+  type BossDetailSelection,
   type BossCardMatchMethod,
   type BossIdentityVerification,
   type BossJobCard,
@@ -116,7 +120,13 @@ function detailEvidence(
 
 function failed(
   message: string,
-  failureKind: 'network' | 'http' | 'missing_fields' | 'layout' | 'unknown',
+  failureKind:
+    | 'network'
+    | 'http'
+    | 'missing_fields'
+    | 'layout'
+    | 'navigation_changed'
+    | 'unknown',
   retryable: boolean,
   diagnostics?: readonly DetailReadDiagnostic[],
 ): StartDetailScanResponse {
@@ -200,6 +210,181 @@ function diagnosticTrail(
   diagnostic: DetailReadDiagnostic,
 ): DetailReadDiagnostic[] {
   return [...(previous ?? []), diagnostic].slice(-4);
+}
+
+export interface BossCardActivationSnapshot {
+  href: string;
+  pathname: string;
+  listSignature: string;
+  detailJobId: string | null;
+  detailTitle: string | null;
+}
+
+export interface BossCardActivationGuard {
+  before: BossCardActivationSnapshot;
+  navigationFailure(): string | null;
+  dispose(): void;
+}
+
+class BossNavigationChangedError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'BossNavigationChangedError';
+  }
+}
+
+function currentPageUrl(document: Document, fallbackUrl: string): string {
+  return document.defaultView?.location.href ?? fallbackUrl;
+}
+
+function bossSearchListSignature(document: Document, url: string): string {
+  return parseVisibleBossCards(document, url)
+    .map((card) =>
+      [
+        card.sourceJobId,
+        normalizeBossDetailUrl(card.url),
+        card.title,
+        card.company,
+      ]
+        .map((value) => value ?? '')
+        .join('\u001f'),
+    )
+    .join('\u001e');
+}
+
+function activationSnapshot(
+  document: Document,
+  fallbackUrl: string,
+): BossCardActivationSnapshot {
+  const href = currentPageUrl(document, fallbackUrl);
+  const detail = parseBossDetail(document, href);
+  let pathname = '';
+  try {
+    pathname = new URL(href).pathname;
+  } catch {
+    pathname = '';
+  }
+  return {
+    href,
+    pathname,
+    listSignature: bossSearchListSignature(document, href),
+    detailJobId: detail?.sourceJobId ?? null,
+    detailTitle: detail?.title ?? null,
+  };
+}
+
+function isBossSearchPath(pathname: string): boolean {
+  return /^\/web\/geek\/jobs?\/?$/u.test(pathname);
+}
+
+export function activateBossCardWithoutNavigation(options: {
+  document: Document;
+  url: string;
+  selection: BossDetailSelection;
+  isContentScriptConnected?: () => boolean;
+}): BossCardActivationGuard {
+  const view = options.document.defaultView;
+  if (view === null) {
+    throw new BossNavigationChangedError(
+      'BOSS 页面发生跳转，已跳过当前职位；已完成结果已保存。',
+    );
+  }
+
+  const before = activationSnapshot(options.document, options.url);
+  let lifecycleNavigation = false;
+  let disposed = false;
+  const markLifecycleNavigation = (): void => {
+    lifecycleNavigation = true;
+  };
+  view.addEventListener('pagehide', markLifecycleNavigation, true);
+  view.addEventListener('beforeunload', markLifecycleNavigation, true);
+
+  const guard: BossCardActivationGuard = {
+    before,
+    navigationFailure() {
+      if (
+        lifecycleNavigation ||
+        options.isContentScriptConnected?.() === false
+      ) {
+        return 'BOSS 页面发生跳转，已跳过当前职位；已完成结果已保存。';
+      }
+      const after = activationSnapshot(options.document, options.url);
+      const pageType = detectBossPage(options.document, after.href);
+      if (
+        !isBossSearchPath(after.pathname) ||
+        (pageType !== 'search-list' && pageType !== 'search-detail-panel') ||
+        after.listSignature === ''
+      ) {
+        return 'BOSS 页面发生跳转，已跳过当前职位；已完成结果已保存。';
+      }
+      return null;
+    },
+    dispose() {
+      if (disposed) {
+        return;
+      }
+      disposed = true;
+      view.removeEventListener('pagehide', markLifecycleNavigation, true);
+      view.removeEventListener('beforeunload', markLifecycleNavigation, true);
+    },
+  };
+
+  if (
+    !isBossSearchPath(before.pathname) ||
+    before.listSignature === '' ||
+    options.isContentScriptConnected?.() === false
+  ) {
+    guard.dispose();
+    throw new BossNavigationChangedError(
+      'BOSS 页面发生跳转，已跳过当前职位；已完成结果已保存。',
+    );
+  }
+
+  const target = options.selection.element;
+  const nonLinkInteractive = Array.from(
+    target.querySelectorAll(
+      'button:not([disabled]), [role="button"], [tabindex]:not([tabindex="-1"])',
+    ),
+  ).find((element) => element.closest('a[href]') === null);
+  const activationLink = target.matches('a[href]')
+    ? target
+    : target.querySelector('a[href]');
+  const linkedNonAnchorTarget =
+    activationLink?.querySelector(
+      '.job-name, .job-title, [data-role="job-title"], span, div',
+    ) ?? null;
+  const activationTarget =
+    nonLinkInteractive ?? linkedNonAnchorTarget ?? activationLink ?? target;
+  const click = new view.MouseEvent('click', {
+    bubbles: true,
+    cancelable: true,
+  });
+  if (activationLink !== null) {
+    const preventTargetNavigation = (event: Event): void => {
+      if (event.composedPath().includes(activationLink)) {
+        event.preventDefault();
+      }
+    };
+    options.document.addEventListener('click', preventTargetNavigation, true);
+    try {
+      activationTarget.dispatchEvent(click);
+    } finally {
+      options.document.removeEventListener(
+        'click',
+        preventTargetNavigation,
+        true,
+      );
+    }
+  } else {
+    activationTarget.dispatchEvent(click);
+  }
+
+  const navigationFailure = guard.navigationFailure();
+  if (navigationFailure !== null) {
+    guard.dispose();
+    throw new BossNavigationChangedError(navigationFailure);
+  }
+  return guard;
 }
 
 function timeoutError(): DOMException {
@@ -406,6 +591,7 @@ export interface ReadBossDetailFromLivePanelOptions {
   timeoutMs: number;
   signal: AbortSignal;
   previousDiagnostics?: readonly DetailReadDiagnostic[];
+  isContentScriptConnected?: () => boolean;
 }
 
 export async function readBossDetailFromLivePanel({
@@ -415,6 +601,7 @@ export async function readBossDetailFromLivePanel({
   timeoutMs,
   signal,
   previousDiagnostics,
+  isContentScriptConnected,
 }: ReadBossDetailFromLivePanelOptions): Promise<StartDetailScanResponse> {
   const expected = {
     sourceJobId: card.job.jobId,
@@ -428,19 +615,24 @@ export async function readBossDetailFromLivePanel({
   const diagnosticFor = (
     outcome: string,
     matchedBy?: BossCardMatchMethod,
-    detail: BossJobDetail | null = parseBossDetail(document, url),
-  ): DetailReadDiagnostic =>
-    createDiagnostic({
+    detail: BossJobDetail | null = parseBossDetail(
+      document,
+      currentPageUrl(document, url),
+    ),
+  ): DetailReadDiagnostic => {
+    const responseUrl = currentPageUrl(document, url);
+    return createDiagnostic({
       source: 'live-panel',
       card,
-      responseUrl: url,
+      responseUrl,
       httpStatus: null,
-      detectedPageType: detectBossPage(document, url),
+      detectedPageType: detectBossPage(document, responseUrl),
       hasDetailContainer: hasDetailContainer(document),
       missingFields: missingDetailFields(document, detail),
       outcome,
       ...(matchedBy === undefined ? {} : { matchedBy }),
     });
+  };
 
   if (signal.aborted) {
     return StartDetailScanResponseSchema.parse({
@@ -496,14 +688,59 @@ export async function readBossDetailFromLivePanel({
     );
   }
 
-  const scan = await scanSelectedBossDetails({
-    document,
-    url,
-    selections: [{ element: match.element, expected }],
-    timeoutMs,
-    signal,
-    predicate: ({ detail }) => detail.description !== null,
-  });
+  const activationState: { guard: BossCardActivationGuard | null } = {
+    guard: null,
+  };
+  let scan: BossDetailScanResult;
+  try {
+    scan = await scanSelectedBossDetails({
+      document,
+      url,
+      selections: [{ element: match.element, expected }],
+      timeoutMs,
+      signal,
+      predicate: ({ detail }) => detail.description !== null,
+      activate: (selection) => {
+        activationState.guard?.dispose();
+        activationState.guard = activateBossCardWithoutNavigation({
+          document,
+          url,
+          selection,
+          ...(isContentScriptConnected === undefined
+            ? {}
+            : { isContentScriptConnected }),
+        });
+      },
+    });
+    const navigationFailure =
+      activationState.guard?.navigationFailure() ?? null;
+    if (navigationFailure !== null) {
+      return failed(
+        navigationFailure,
+        'navigation_changed',
+        false,
+        diagnosticTrail(
+          previousDiagnostics,
+          diagnosticFor('navigation_changed', match.matchedBy),
+        ),
+      );
+    }
+  } catch (error) {
+    if (error instanceof BossNavigationChangedError) {
+      return failed(
+        error.message,
+        'navigation_changed',
+        false,
+        diagnosticTrail(
+          previousDiagnostics,
+          diagnosticFor('navigation_changed', match.matchedBy),
+        ),
+      );
+    }
+    throw error;
+  } finally {
+    activationState.guard?.dispose();
+  }
   const result = scan.entries[0]?.result;
   const currentDetail =
     result?.status === 'verified'
