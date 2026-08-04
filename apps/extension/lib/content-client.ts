@@ -46,6 +46,11 @@ export interface BossScanSession {
   queryScope: string;
 }
 
+export interface DetailScanGovernance {
+  deadlineAt: number;
+  requestIntervalMs: number;
+}
+
 export interface ContentClient {
   beginSession(signal?: AbortSignal): Promise<BossScanSession>;
   endSession(): Promise<boolean>;
@@ -59,6 +64,7 @@ export interface ContentClient {
     card: VisibleJobCard,
     timeoutMs: number,
     signal?: AbortSignal,
+    governance?: DetailScanGovernance,
   ): Promise<StartDetailScanResponse>;
   cancelDetailScan(): Promise<boolean>;
 }
@@ -412,7 +418,7 @@ export function createContentClient(
       return parsed;
     },
 
-    async startDetailScan(card, timeoutMs, signal) {
+    async startDetailScan(card, timeoutMs, signal, governance) {
       if (isSignalAborted(signal)) {
         throw abortReason(signal);
       }
@@ -426,6 +432,8 @@ export function createContentClient(
         expectedTitle: card.job.title,
         expectedCompany: card.job.companyName,
         timeoutMs,
+        deadlineAt: governance?.deadlineAt ?? Date.now() + timeoutMs,
+        requestIntervalMs: governance?.requestIntervalMs ?? 1_800,
       });
       const onAbort = (): void => {
         const cancelMessage = CancelDetailScanRequestSchema.parse({

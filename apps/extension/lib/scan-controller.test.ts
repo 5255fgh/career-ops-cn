@@ -218,8 +218,6 @@ function controller(
     content,
     bridge,
     config: { requestIntervalMs: 0, maxRoundMs: 30_000 },
-    delay: async () => undefined,
-    random: () => 0.5,
   });
 }
 
@@ -360,6 +358,24 @@ describe('ScanController', () => {
     expect(content.startDetailScan).toHaveBeenCalledTimes(2);
   });
 
+  it('请求 gate 判定会越过绝对 deadline 时立即按轮次预算完成', async () => {
+    const cards = [visibleCard(0), visibleCard(1)];
+    const content = contentMock([cards]);
+    vi.mocked(content.startDetailScan).mockResolvedValue({
+      type: 'boss/start-detail-scan/response',
+      outcome: 'deadline_exceeded',
+    });
+    const bridge = bridgeMock();
+
+    const state = await controller(content, bridge).run();
+
+    expect(state.status).toBe('completed');
+    expect(state.stopReason).toBe('round_time_limit');
+    expect(content.startDetailScan).toHaveBeenCalledOnce();
+    expect(bridge.saveJob).not.toHaveBeenCalled();
+    expect(bridge.evaluateJob).not.toHaveBeenCalled();
+  });
+
   it.each([
     [
       '身份校验失败',
@@ -462,7 +478,6 @@ describe('ScanController', () => {
         };
       });
     const bridge = bridgeMock();
-    const delay = vi.fn(async () => undefined);
     const scan = new ScanController({
       content,
       bridge,
@@ -471,8 +486,6 @@ describe('ScanController', () => {
         requestIntervalMs: 1_800,
         maxRoundMs: 30_000,
       },
-      delay,
-      random: () => 0,
     });
 
     const state = await scan.run();
@@ -480,7 +493,13 @@ describe('ScanController', () => {
     expect(state.status).toBe('completed');
     expect(content.startDetailScan).toHaveBeenCalledTimes(2);
     expect(maxActive).toBe(1);
-    expect(delay).toHaveBeenCalledWith(1_440, expect.any(AbortSignal));
+    expect(content.startDetailScan).toHaveBeenNthCalledWith(
+      2,
+      card,
+      8_000,
+      expect.any(AbortSignal),
+      expect.objectContaining({ requestIntervalMs: 1_800 }),
+    );
     expect(state.progress.detailCompleted).toBe(1);
   });
 
@@ -714,43 +733,38 @@ describe('ScanController', () => {
   );
 
   it.each(['login_required', 'challenge', 'account_risk'] as const)(
-    '主动 %s event 在请求间隔等待中立即终止且不发起 retry',
+    '主动 %s event 在详情请求悬挂中立即终止且不发起 retry',
     async (reason) => {
       const card = visibleCard(0);
       const content = contentMock([[card]]);
-      vi.mocked(content.startDetailScan).mockResolvedValue({
-        type: 'boss/start-detail-scan/response',
-        outcome: 'failed',
-        message: '临时网络失败',
-        failureKind: 'network',
-        retryable: true,
+      let markRequestStarted: (() => void) | undefined;
+      const requestStarted = new Promise<void>((resolve) => {
+        markRequestStarted = resolve;
       });
-      const bridge = bridgeMock();
-      let markDelayStarted: (() => void) | undefined;
-      const delayStarted = new Promise<void>((resolve) => {
-        markDelayStarted = resolve;
-      });
-      const delay = vi.fn(
-        async (_milliseconds: number, signal: AbortSignal) =>
-          await new Promise<void>((resolve, reject) => {
-            markDelayStarted?.();
-            signal.addEventListener(
+      vi.mocked(content.startDetailScan).mockImplementation(
+        async (_card, _timeout, signal) =>
+          await new Promise((resolve) => {
+            markRequestStarted?.();
+            signal?.addEventListener(
               'abort',
-              () => reject(signal.reason),
+              () =>
+                resolve({
+                  type: 'boss/start-detail-scan/response',
+                  outcome: 'cancelled',
+                }),
               { once: true },
             );
           }),
       );
+      const bridge = bridgeMock();
       const scan = new ScanController({
         content,
         bridge,
         config: { requestIntervalMs: 1_800, maxRoundMs: 30_000 },
-        delay,
-        random: () => 0.5,
       });
 
       const running = scan.run();
-      await delayStarted;
+      await requestStarted;
       emitContentFatal(content, reason);
       const state = await running;
 

@@ -104,8 +104,6 @@ export interface ScanControllerOptions {
   content: ContentClient;
   bridge: BridgeClient;
   config?: Partial<ScanConfig>;
-  delay?: (milliseconds: number, signal: AbortSignal) => Promise<void>;
-  random?: () => number;
 }
 
 export interface ScanRunOptions {
@@ -166,31 +164,6 @@ function abortError(): DOMException {
 
 function roundTimeoutError(): DOMException {
   return new DOMException('本轮扫描已达到最长运行时间。', 'TimeoutError');
-}
-
-async function defaultDelay(
-  milliseconds: number,
-  signal: AbortSignal,
-): Promise<void> {
-  if (milliseconds === 0) {
-    return;
-  }
-  if (signal.aborted) {
-    throw abortError();
-  }
-
-  await new Promise<void>((resolve, reject) => {
-    const onAbort = (): void => {
-      clearTimeout(timer);
-      signal.removeEventListener('abort', onAbort);
-      reject(abortError());
-    };
-    const timer = setTimeout(() => {
-      signal.removeEventListener('abort', onAbort);
-      resolve();
-    }, milliseconds);
-    signal.addEventListener('abort', onAbort, { once: true });
-  });
 }
 
 function errorMessage(error: unknown): string {
@@ -379,17 +352,11 @@ export class ScanController {
   readonly config: ScanConfig;
   private readonly content: ContentClient;
   private readonly bridge: BridgeClient;
-  private readonly delay: (
-    milliseconds: number,
-    signal: AbortSignal,
-  ) => Promise<void>;
-  private readonly random: () => number;
   private readonly listeners = new Set<ScanStateListener>();
   private abortController: AbortController | null = null;
   private currentScanId: string | null = null;
   private sourceQuery = 'boss:unknown';
   private diagnosticError: string | null = null;
-  private hasIssuedBossRequest = false;
   private interruptionRequested = false;
   private fatalReason: BossAccountFatalReason | null = null;
   private currentState: ScanState = {
@@ -409,8 +376,6 @@ export class ScanController {
       ...DEFAULT_SCAN_CONFIG,
       ...options.config,
     });
-    this.delay = options.delay ?? defaultDelay;
-    this.random = options.random ?? Math.random;
   }
 
   get state(): ScanState {
@@ -606,30 +571,21 @@ export class ScanController {
     }
   }
 
-  private async beforeBossRequest(signal: AbortSignal): Promise<void> {
-    if (!this.hasIssuedBossRequest) {
-      this.hasIssuedBossRequest = true;
-      return;
-    }
-    const sample = Math.min(1, Math.max(0, this.random()));
-    const milliseconds = Math.round(
-      this.config.requestIntervalMs * (0.8 + sample * 0.4),
-    );
-    await this.delay(milliseconds, signal);
-  }
-
   private async readDetailWithRetry(
     card: VisibleJobCard,
     signal: AbortSignal,
+    deadlineAt: number,
   ): Promise<StartDetailScanResponse> {
     for (let attempt = 1; attempt <= 2; attempt += 1) {
-      this.assertRoundSafe(signal);
-      await this.beforeBossRequest(signal);
       this.assertRoundSafe(signal);
       const result = await this.content.startDetailScan(
         card,
         this.config.detailTimeoutMs,
         signal,
+        {
+          deadlineAt,
+          requestIntervalMs: this.config.requestIntervalMs,
+        },
       );
       this.assertRoundSafe(signal);
       if (
@@ -875,12 +831,12 @@ export class ScanController {
     this.currentScanId = null;
     this.sourceQuery = 'boss:unknown';
     this.diagnosticError = null;
-    this.hasIssuedBossRequest = false;
     this.interruptionRequested = false;
     this.fatalReason = null;
     const maxNewJobs = options.maxNewJobs ?? this.config.maxNewJobs;
     const maxAiJobs = options.maxAiJobs ?? this.config.maxAiJobs;
     const maxRoundMs = options.maxRoundMs ?? this.config.maxRoundMs;
+    const deadlineAt = Date.now() + maxRoundMs;
     let deadlineReached = false;
     const deadlineTimer = setTimeout(() => {
       deadlineReached = true;
@@ -1224,7 +1180,13 @@ export class ScanController {
             const detailResult = await this.readDetailWithRetry(
               card,
               controller.signal,
+              deadlineAt,
             );
+            if (detailResult.outcome === 'deadline_exceeded') {
+              deadlineReached = true;
+              controller.abort(roundTimeoutError());
+              throw controller.signal.reason ?? roundTimeoutError();
+            }
             this.updateProgress({
               detailCompleted: this.currentState.progress.detailCompleted + 1,
               detailSuccess:

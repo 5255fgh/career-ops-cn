@@ -42,6 +42,7 @@ import {
   type BossContentSession,
   type BossLocatorSessionRef,
 } from '../lib/boss-content-session';
+import { BossRequestGate } from '../lib/boss-request-gate';
 
 function currentSourceQuery(): string {
   const url = new URL(window.location.href);
@@ -103,6 +104,7 @@ export default defineContentScript({
     let activeOperationController: AbortController | null = null;
     let monitoredSession: BossContentSession | null = null;
     let fatalObserver: MutationObserver | null = null;
+    let requestGate: { intervalMs: number; gate: BossRequestGate } | null = null;
     const locatorStore = new BossContentLocatorStore();
 
     const stopFatalMonitoring = (): void => {
@@ -112,6 +114,7 @@ export default defineContentScript({
     };
 
     const broadcastFatal = (event: BossFatalBlockEvent): void => {
+      requestGate = null;
       activeOperationController?.abort(
         new DOMException(`页面已停止扫描：${event.reason}`, 'AbortError'),
       );
@@ -138,6 +141,7 @@ export default defineContentScript({
     ): BossFatalBlockEvent | ReturnType<typeof BossSessionErrorResponseSchema.parse> | null => {
       const validation = locatorStore.validate(session, currentSourceQuery());
       if (validation.status === 'context_changed') {
+        requestGate = null;
         return BossSessionErrorResponseSchema.parse({
           type: 'boss/session-error/response',
           sessionId: session.sessionId,
@@ -168,6 +172,7 @@ export default defineContentScript({
           currentSourceQuery(),
         );
         if (validation.status === 'context_changed') {
+          requestGate = null;
           activeOperationController?.abort(
             new DOMException('BOSS 查询上下文已改变。', 'AbortError'),
           );
@@ -191,6 +196,7 @@ export default defineContentScript({
       if (beginRequest.success) {
         activeOperationController?.abort();
         activeOperationController = null;
+        requestGate = null;
         const session = locatorStore.beginSession(
           beginRequest.data.sessionId,
           currentSourceQuery(),
@@ -216,6 +222,7 @@ export default defineContentScript({
           });
         }
         stopFatalMonitoring();
+        requestGate = null;
         activeOperationController?.abort();
         activeOperationController = null;
         return EndBossSessionResponseSchema.parse({
@@ -299,6 +306,24 @@ export default defineContentScript({
             retryable: false,
           });
         }
+        if (requestGate === null) {
+          requestGate = {
+            intervalMs: startRequest.data.requestIntervalMs,
+            gate: new BossRequestGate({
+              intervalMs: startRequest.data.requestIntervalMs,
+            }),
+          };
+        } else if (
+          requestGate.intervalMs !== startRequest.data.requestIntervalMs
+        ) {
+          return StartDetailScanResponseSchema.parse({
+            type: 'boss/start-detail-scan/response',
+            outcome: 'failed',
+            message: '同一 content session 的 BOSS 请求间隔配置发生变化。',
+            failureKind: 'unknown',
+            retryable: false,
+          });
+        }
         activeOperationController?.abort();
         const controller = new AbortController();
         activeOperationController = controller;
@@ -316,7 +341,9 @@ export default defineContentScript({
             },
             rawDetailUrl,
             timeoutMs: startRequest.data.timeoutMs,
+            deadlineAt: startRequest.data.deadlineAt,
             signal: controller.signal,
+            requestGate: requestGate.gate,
           });
           if (
             result.outcome === 'blocked' &&

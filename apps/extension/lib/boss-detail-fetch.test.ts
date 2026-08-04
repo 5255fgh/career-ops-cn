@@ -5,6 +5,7 @@ import { Window } from 'happy-dom';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { fetchBossDetail, toJobCard } from './boss-detail-fetch';
+import { BossRequestGate } from './boss-request-gate';
 
 const card: VisibleJobCard = {
   index: 0,
@@ -80,6 +81,13 @@ function pendingFetch(): typeof fetch {
   }) as unknown as typeof fetch;
 }
 
+function requestGovernance() {
+  return {
+    deadlineAt: Date.now() + 60_000,
+    requestGate: new BossRequestGate({ intervalMs: 0 }),
+  };
+}
+
 afterEach(() => {
   vi.useRealTimers();
 });
@@ -121,6 +129,7 @@ describe('fetchBossDetail', () => {
       card,
       rawDetailUrl: card.job.detailUrl,
       timeoutMs: 250,
+      ...requestGovernance(),
       signal: userController.signal,
       fetchImpl,
     });
@@ -155,6 +164,7 @@ describe('fetchBossDetail', () => {
       card,
       rawDetailUrl: card.job.detailUrl,
       timeoutMs: 10_000,
+      ...requestGovernance(),
       signal: userController.signal,
       fetchImpl: pendingFetch(),
     });
@@ -172,6 +182,7 @@ describe('fetchBossDetail', () => {
       card,
       rawDetailUrl: card.job.detailUrl,
       timeoutMs: 1_000,
+      ...requestGovernance(),
       signal: new AbortController().signal,
       fetchImpl: vi.fn(async () => {
         throw new TypeError('Failed to fetch');
@@ -183,6 +194,34 @@ describe('fetchBossDetail', () => {
       failureKind: 'network',
       retryable: true,
     });
+  });
+
+  it('限速等待会越过 round deadline 时不发出真实 fetch', async () => {
+    let now = 1_000;
+    const gate = new BossRequestGate({
+      intervalMs: 1_800,
+      now: () => now,
+      random: () => 0.5,
+      delay: async (milliseconds) => {
+        now += milliseconds;
+      },
+    });
+    const signal = new AbortController().signal;
+    await gate.run({ signal, deadlineAt: 10_000 }, async () => undefined);
+    const fetchImpl = vi.fn<typeof fetch>();
+
+    const result = await fetchBossDetail({
+      card,
+      rawDetailUrl: card.job.detailUrl,
+      timeoutMs: 8_000,
+      deadlineAt: 2_000,
+      signal,
+      requestGate: gate,
+      fetchImpl,
+    });
+
+    expect(result).toMatchObject({ outcome: 'deadline_exceeded' });
+    expect(fetchImpl).not.toHaveBeenCalled();
   });
 
   it('直接 fetch 成功时解析详情并记录有限响应诊断', async () => {
@@ -198,6 +237,7 @@ describe('fetchBossDetail', () => {
       card: directCard,
       rawDetailUrl,
       timeoutMs: 1_000,
+      ...requestGovernance(),
       signal: new AbortController().signal,
       fetchImpl: fetchImpl as unknown as typeof fetch,
       parseDocument: () => fixture.document,
@@ -252,6 +292,7 @@ describe('fetchBossDetail', () => {
       rawDetailUrl:
         'https://www.zhipin.com/job_detail/boss-other.html?securityId=request-only',
       timeoutMs: 1_000,
+      ...requestGovernance(),
       signal: new AbortController().signal,
       fetchImpl: vi.fn(async () =>
         htmlResponse(fixture.html, responseUrl),
@@ -282,6 +323,7 @@ describe('fetchBossDetail', () => {
       card: panelCard,
       rawDetailUrl: `${panelCard.job.detailUrl}?securityId=do-not-log`,
       timeoutMs: 1_000,
+      ...requestGovernance(),
       signal: new AbortController().signal,
       fetchImpl: vi.fn(async () =>
         htmlResponse(shell.html, responseUrl),

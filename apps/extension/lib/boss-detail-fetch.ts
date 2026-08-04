@@ -20,6 +20,11 @@ import {
   type VisibleJobCard,
 } from '@career-ops-cn/shared';
 
+import {
+  BossRequestDeadlineError,
+  type BossRequestGate,
+} from './boss-request-gate';
+
 const TRANSIENT_HTTP_STATUSES = new Set([408, 425, 429, 500, 502, 503, 504]);
 const FATAL_DETAIL_BLOCKS = new Set([
   'login_required',
@@ -201,7 +206,9 @@ export interface FetchBossDetailOptions {
   card: VisibleJobCard;
   rawDetailUrl: string;
   timeoutMs: number;
+  deadlineAt: number;
   signal: AbortSignal;
+  requestGate: BossRequestGate;
   fetchImpl?: typeof fetch;
   parseDocument?: (html: string) => Document;
 }
@@ -210,7 +217,9 @@ export async function fetchBossDetail({
   card,
   rawDetailUrl,
   timeoutMs,
+  deadlineAt,
   signal,
+  requestGate,
   fetchImpl = fetch,
   parseDocument = (html) => new DOMParser().parseFromString(html, 'text/html'),
 }: FetchBossDetailOptions): Promise<StartDetailScanResponse> {
@@ -251,18 +260,26 @@ export async function fetchBossDetail({
       reject(error);
     }, timeoutMs);
   });
+  // Gate 等待可能先于 fetch 结束；显式挂接处理器，避免取消时留下未消费 rejection。
+  void interrupted.catch(() => undefined);
 
   try {
-    const response = await Promise.race([
-      fetchImpl(rawDetailUrl, {
-        method: 'GET',
-        credentials: 'include',
-        redirect: 'follow',
-        signal: requestController.signal,
-      }),
-      interrupted,
-    ]);
-    const html = await Promise.race([response.text(), interrupted]);
+    const { response, html } = await requestGate.run(
+      { signal: requestController.signal, deadlineAt },
+      async () => {
+        const response = await Promise.race([
+          fetchImpl(rawDetailUrl, {
+            method: 'GET',
+            credentials: 'include',
+            redirect: 'follow',
+            signal: requestController.signal,
+          }),
+          interrupted,
+        ]);
+        const html = await Promise.race([response.text(), interrupted]);
+        return { response, html };
+      },
+    );
     const responseUrl = response.url === '' ? rawDetailUrl : response.url;
     const detailDocument = parseDocument(html);
     const pageType = detectBossPage(detailDocument, responseUrl);
@@ -348,8 +365,22 @@ export async function fetchBossDetail({
       detectedPageType: null,
       hasDetailContainer: false,
       missingFields: [],
-      outcome: timedOut ? 'timeout' : signal.aborted ? 'cancelled' : 'network',
+      outcome:
+        error instanceof BossRequestDeadlineError
+          ? 'round_deadline'
+          : timedOut
+            ? 'timeout'
+            : signal.aborted
+              ? 'cancelled'
+              : 'network',
     });
+    if (error instanceof BossRequestDeadlineError) {
+      return StartDetailScanResponseSchema.parse({
+        type: 'boss/start-detail-scan/response',
+        outcome: 'deadline_exceeded',
+        diagnostics: [diagnostic],
+      });
+    }
     if (timedOut) {
       return StartDetailScanResponseSchema.parse({
         type: 'boss/start-detail-scan/response',

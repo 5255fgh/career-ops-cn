@@ -704,6 +704,8 @@ export const StartDetailScanRequestSchema = z.strictObject({
   expectedTitle: NonEmptyTextSchema,
   expectedCompany: NonEmptyTextSchema,
   timeoutMs: z.number().int().positive(),
+  deadlineAt: z.number().int().positive(),
+  requestIntervalMs: z.number().int().nonnegative(),
 });
 
 export type StartDetailScanRequest = z.infer<
@@ -770,6 +772,11 @@ export const StartDetailScanResponseSchema = z.discriminatedUnion("outcome", [
     type: z.literal("boss/start-detail-scan/response"),
     outcome: z.literal("blocked"),
     reason: BossPageBlockReasonSchema,
+    diagnostics: DetailReadDiagnosticsSchema,
+  }),
+  z.strictObject({
+    type: z.literal("boss/start-detail-scan/response"),
+    outcome: z.literal("deadline_exceeded"),
     diagnostics: DetailReadDiagnosticsSchema,
   }),
   z.strictObject({

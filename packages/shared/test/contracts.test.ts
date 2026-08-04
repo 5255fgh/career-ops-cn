@@ -297,6 +297,8 @@ describe("其余边界对象", () => {
       expectedTitle: "前端开发工程师",
       expectedCompany: "示例科技",
       timeoutMs: 8_000,
+      deadlineAt: 1_800_000_000_000,
+      requestIntervalMs: 1_800,
     });
 
     expect(request).toEqual({
@@ -308,6 +310,8 @@ describe("其余边界对象", () => {
       expectedTitle: "前端开发工程师",
       expectedCompany: "示例科技",
       timeoutMs: 8_000,
+      deadlineAt: 1_800_000_000_000,
+      requestIntervalMs: 1_800,
     });
     expect(JSON.stringify(request)).not.toContain("securityId");
     expect(() =>

@@ -128,7 +128,12 @@ describe('Content client', () => {
     await expect(client.extractVisibleCards()).resolves.toMatchObject({
       cards: [visibleCard],
     });
-    await expect(client.startDetailScan(visibleCard, 8_000)).resolves.toMatchObject({
+    await expect(
+      client.startDetailScan(visibleCard, 8_000, undefined, {
+        deadlineAt: 1_800_000_000_000,
+        requestIntervalMs: 1_800,
+      }),
+    ).resolves.toMatchObject({
       outcome: 'success',
       diagnostics: [
         expect.objectContaining({
@@ -167,6 +172,8 @@ describe('Content client', () => {
       expectedTitle: job.title,
       expectedCompany: job.companyName,
       timeoutMs: 8_000,
+      deadlineAt: 1_800_000_000_000,
+      requestIntervalMs: 1_800,
     });
     expect(startMessage).not.toHaveProperty('card');
     expect(JSON.stringify(startMessage)).not.toContain('securityId');
