@@ -1,6 +1,9 @@
 import {
   JobDetailSchema,
   JobResponseSchema,
+  type BossAccountFatalReason,
+  type BossFatalBlockEvent,
+  type BossSessionInvalidatedEvent,
   type JobCard,
   type JobDetail,
   type ScanRunSnapshot,
@@ -11,6 +14,8 @@ import { describe, expect, it, vi } from 'vitest';
 
 import type { BridgeClient } from './bridge-client';
 import {
+  BossFatalBlockError,
+  ContentContextChangedError,
   createContentClient,
   type ContentClient,
   type TabsClient,
@@ -20,6 +25,23 @@ import {
   ScanController,
   scanStateFromSnapshot,
 } from './scan-controller';
+
+const contentFatalEmitters = new WeakMap<
+  ContentClient,
+  (reason: BossAccountFatalReason) => void
+>();
+const contentInvalidationEmitters = new WeakMap<ContentClient, () => void>();
+
+function emitContentFatal(
+  content: ContentClient,
+  reason: BossAccountFatalReason,
+): void {
+  contentFatalEmitters.get(content)?.(reason);
+}
+
+function emitContentInvalidation(content: ContentClient): void {
+  contentInvalidationEmitters.get(content)?.();
+}
 
 function visibleCard(index: number, page = 0): VisibleJobCard {
   const suffix = page * 100 + index;
@@ -86,8 +108,26 @@ function scanRun(status: 'running' | 'cancelled' | 'interrupted' = 'running') {
 }
 
 function contentMock(pages: VisibleJobCard[][]): ContentClient {
-  let pageIndex = 0;
-  return {
+  const fatalListeners = new Set<(event: BossFatalBlockEvent) => void>();
+  const invalidationListeners = new Set<
+    (event: BossSessionInvalidatedEvent) => void
+  >();
+  const content: ContentClient = {
+    beginSession: vi.fn(async () => ({
+      sessionId: 'session-1',
+      tabId: 42,
+      generation: 'generation-1',
+      queryScope: 'boss:/web/geek/job?query=TypeScript',
+    })),
+    endSession: vi.fn(async () => true),
+    onFatalBlock(listener) {
+      fatalListeners.add(listener);
+      return () => fatalListeners.delete(listener);
+    },
+    onSessionInvalidated(listener) {
+      invalidationListeners.add(listener);
+      return () => invalidationListeners.delete(listener);
+    },
     detectPage: vi.fn(async () => ({
       type: 'boss/detect-page/response' as const,
       pageType: 'search-detail-panel' as const,
@@ -95,9 +135,11 @@ function contentMock(pages: VisibleJobCard[][]): ContentClient {
     })),
     extractCurrentDetail: vi.fn(async () => null),
     extractVisibleCards: vi.fn(async () => {
-      const cards = pages[pageIndex] ?? [];
+      const cards = pages[0] ?? [];
       return {
         type: 'boss/extract-visible-cards/response' as const,
+        sessionId: 'session-1',
+        generation: 'generation-1',
         cards,
         totalVisible: cards.length,
         invalidCount: 0,
@@ -108,21 +150,31 @@ function contentMock(pages: VisibleJobCard[][]): ContentClient {
       outcome: 'success' as const,
       job: detailFor(card),
     })),
-    advanceSearchPage: vi.fn(async () => {
-      if (pageIndex + 1 >= pages.length) {
-        return {
-          type: 'boss/advance-search-page/response' as const,
-          outcome: 'end' as const,
-        };
-      }
-      pageIndex += 1;
-      return {
-        type: 'boss/advance-search-page/response' as const,
-        outcome: 'advanced' as const,
-      };
-    }),
     cancelDetailScan: vi.fn(async () => true),
   };
+  contentFatalEmitters.set(content, (reason) => {
+    const event: BossFatalBlockEvent = {
+      type: 'boss/fatal-block/event',
+      sessionId: 'session-1',
+      generation: 'generation-1',
+      reason,
+    };
+    for (const listener of fatalListeners) {
+      listener(event);
+    }
+  });
+  contentInvalidationEmitters.set(content, () => {
+    const event: BossSessionInvalidatedEvent = {
+      type: 'boss/session-invalidated/event',
+      sessionId: 'session-1',
+      generation: 'generation-1',
+      reason: 'context_changed',
+    };
+    for (const listener of invalidationListeners) {
+      listener(event);
+    }
+  });
+  return content;
 }
 
 function bridgeMock(): BridgeClient {
@@ -191,8 +243,6 @@ function controller(
     content,
     bridge,
     config: { requestIntervalMs: 0, maxRoundMs: 30_000 },
-    delay: async () => undefined,
-    random: () => 0.5,
   });
 }
 
@@ -245,9 +295,9 @@ describe('ScanController', () => {
     expect(restored.warnings[0]).toContain('可重新开始');
   });
 
-  it('固定默认预算支持 3 页、60 个新职位和至少 30 次 AI', () => {
+  it('默认只处理当前页，同时保留其他预算', () => {
     expect(DEFAULT_SCAN_CONFIG).toMatchObject({
-      maxPages: 3,
+      maxPages: 1,
       maxNewJobs: 60,
       maxAiJobs: 30,
       requestIntervalMs: 1_800,
@@ -255,8 +305,8 @@ describe('ScanController', () => {
     });
   });
 
-  it('一次点击自动处理多页，并在 60 个新职位预算处正常完成', async () => {
-    const pages = [0, 1, 2].map((page) =>
+  it('当前页存在后续页面时也只处理一次并正常完成', async () => {
+    const pages = [0, 1].map((page) =>
       Array.from({ length: 25 }, (_, index) => visibleCard(index, page)),
     );
     const content = contentMock(pages);
@@ -274,12 +324,165 @@ describe('ScanController', () => {
 
     expect(state.error).toBeNull();
     expect(state.status).toBe('completed');
-    expect(state.stopReason).toBe('new_job_limit');
-    expect(state.progress.pagesVisited).toBe(3);
-    expect(state.progress.newJobs).toBe(60);
-    expect(state.results).toHaveLength(60);
-    expect(content.advanceSearchPage).toHaveBeenCalledTimes(2);
+    expect(state.stopReason).toBe('current_page_complete');
+    expect(state.progress.pagesVisited).toBe(1);
+    expect(state.progress.newJobs).toBe(25);
+    expect(state.results).toHaveLength(25);
+    expect(content.extractVisibleCards).toHaveBeenCalledOnce();
     expect(content.startDetailScan).not.toHaveBeenCalled();
+    expect(content.beginSession).toHaveBeenCalledOnce();
+    expect(content.endSession).toHaveBeenCalledOnce();
+  });
+
+  it('maxNewJobs 恰好覆盖当前页全部新职位时仍是 current_page_complete', async () => {
+    const cards = [visibleCard(0), visibleCard(1)];
+    const content = contentMock([cards]);
+    const bridge = bridgeMock();
+
+    const state = await controller(content, bridge).run({ maxNewJobs: 2 });
+
+    expect(state.status).toBe('completed');
+    expect(state.stopReason).toBe('current_page_complete');
+    expect(content.startDetailScan).toHaveBeenCalledTimes(2);
+  });
+
+  it('当前页有新职位因 maxNewJobs 被跳过时才使用 new_job_limit', async () => {
+    const cards = [visibleCard(0), visibleCard(1), visibleCard(2)];
+    const content = contentMock([cards]);
+    const bridge = bridgeMock();
+
+    const state = await controller(content, bridge).run({ maxNewJobs: 2 });
+
+    expect(state.status).toBe('completed');
+    expect(state.stopReason).toBe('new_job_limit');
+    expect(content.startDetailScan).toHaveBeenCalledTimes(2);
+  });
+
+  it('queryScope 或 content generation 改变时整轮进入 interrupted', async () => {
+    const content = contentMock([[visibleCard(0)]]);
+    vi.mocked(content.detectPage).mockRejectedValue(
+      new ContentContextChangedError(),
+    );
+    const bridge = bridgeMock();
+
+    const state = await controller(content, bridge).run();
+
+    expect(state.status).toBe('interrupted');
+    expect(state.stopReason).toBeNull();
+    expect(bridge.saveJob).not.toHaveBeenCalled();
+    expect(bridge.evaluateJob).not.toHaveBeenCalled();
+    expect(content.endSession).toHaveBeenCalledOnce();
+  });
+
+  it('Bridge 阶段收到主动 session invalidation 时立即 interrupted 且不保存或调用 AI', async () => {
+    const content = contentMock([[visibleCard(0)]]);
+    const bridge = bridgeMock();
+    vi.mocked(bridge.observeJobs).mockImplementation(async () => {
+      emitContentInvalidation(content);
+      return [
+        {
+          sourceJobId: 'boss-0',
+          action: 'read-detail',
+          reason: 'new',
+        },
+      ];
+    });
+
+    const state = await controller(content, bridge).run();
+
+    expect(state.status).toBe('interrupted');
+    expect(state.stopReason).toBeNull();
+    expect(content.startDetailScan).not.toHaveBeenCalled();
+    expect(bridge.saveJob).not.toHaveBeenCalled();
+    expect(bridge.evaluateJob).not.toHaveBeenCalled();
+  });
+
+  it('正常处理结束但固定 tab 在 endSession 前断开时最终仍返回 interrupted', async () => {
+    const content = contentMock([[visibleCard(0)]]);
+    vi.mocked(content.endSession).mockResolvedValue(false);
+    const bridge = bridgeMock();
+
+    const state = await controller(content, bridge).run();
+
+    expect(state.status).toBe('interrupted');
+    expect(state.stopReason).toBeNull();
+    expect(state.error).toContain('页面 generation');
+    expect(bridge.updateScanRun).toHaveBeenLastCalledWith(
+      'scan-1',
+      expect.objectContaining({ status: 'interrupted', phase: 'finished' }),
+      expect.any(AbortSignal),
+    );
+  });
+
+  it('beginSession pending 期间主动 invalidation 保持 interrupted', async () => {
+    const content = contentMock([[visibleCard(0)]]);
+    vi.mocked(content.beginSession).mockImplementation(async () => {
+      emitContentInvalidation(content);
+      return {
+        sessionId: 'session-1',
+        tabId: 42,
+        generation: 'generation-1',
+        queryScope: 'boss:/web/geek/job?query=TypeScript',
+      };
+    });
+    const bridge = bridgeMock();
+
+    const state = await controller(content, bridge).run();
+
+    expect(state.status).toBe('interrupted');
+    expect(bridge.createScanRun).not.toHaveBeenCalled();
+  });
+
+  it('beginSession 超过 round deadline 时归类为 completed/round_time_limit', async () => {
+    vi.useFakeTimers();
+    try {
+      const content = contentMock([[visibleCard(0)]]);
+      vi.mocked(content.beginSession).mockImplementation(
+        async (signal) =>
+          await new Promise((_resolve, reject) => {
+            signal?.addEventListener(
+              'abort',
+              () => reject(signal.reason),
+              { once: true },
+            );
+          }),
+      );
+      const bridge = bridgeMock();
+
+      const running = controller(content, bridge).run({ maxRoundMs: 20 });
+      await vi.advanceTimersByTimeAsync(20);
+      const state = await running;
+
+      expect(state.status).toBe('completed');
+      expect(state.stopReason).toBe('round_time_limit');
+      expect(bridge.createScanRun).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('createScanRun 期间 fatal 不会被普通 Bridge 错误覆盖', async () => {
+    const content = contentMock([[visibleCard(0)]]);
+    const bridge = bridgeMock();
+    vi.mocked(bridge.createScanRun).mockImplementation(async () => {
+      emitContentFatal(content, 'challenge');
+      throw new Error('create response lost');
+    });
+
+    const state = await controller(content, bridge).run();
+
+    expect(state.status).toBe('failed');
+    expect(state.stopReason).toBe('challenge');
+    expect(state.error).toContain('challenge');
+  });
+
+  it('maxPages 不为 1 时在创建 run 前明确拒绝', async () => {
+    const content = contentMock([[visibleCard(0)]]);
+    const bridge = bridgeMock();
+    const scan = controller(content, bridge);
+
+    await expect(scan.run({ maxPages: 2 })).rejects.toThrow();
+    expect(bridge.createScanRun).not.toHaveBeenCalled();
   });
 
   it('单个职位超时只记录失败，下一个职位仍保存并评估', async () => {
@@ -304,6 +507,24 @@ describe('ScanController', () => {
     expect(state.results[1]?.savedJob).toBeDefined();
     expect(state.results[1]?.evaluation).toBeDefined();
     expect(content.startDetailScan).toHaveBeenCalledTimes(2);
+  });
+
+  it('请求 gate 判定会越过绝对 deadline 时立即按轮次预算完成', async () => {
+    const cards = [visibleCard(0), visibleCard(1)];
+    const content = contentMock([cards]);
+    vi.mocked(content.startDetailScan).mockResolvedValue({
+      type: 'boss/start-detail-scan/response',
+      outcome: 'deadline_exceeded',
+    });
+    const bridge = bridgeMock();
+
+    const state = await controller(content, bridge).run();
+
+    expect(state.status).toBe('completed');
+    expect(state.stopReason).toBe('round_time_limit');
+    expect(content.startDetailScan).toHaveBeenCalledOnce();
+    expect(bridge.saveJob).not.toHaveBeenCalled();
+    expect(bridge.evaluateJob).not.toHaveBeenCalled();
   });
 
   it.each([
@@ -331,6 +552,16 @@ describe('ScanController', () => {
         outcome: 'failed' as const,
         message: '单个职位详情布局无法识别。',
         failureKind: 'layout' as const,
+        retryable: false,
+      },
+    ],
+    [
+      'content locator 缺失',
+      {
+        type: 'boss/start-detail-scan/response' as const,
+        outcome: 'failed' as const,
+        message: '当前 content session 缺少该职位的请求定位信息。',
+        failureKind: 'locator' as const,
         retryable: false,
       },
     ],
@@ -398,7 +629,6 @@ describe('ScanController', () => {
         };
       });
     const bridge = bridgeMock();
-    const delay = vi.fn(async () => undefined);
     const scan = new ScanController({
       content,
       bridge,
@@ -407,8 +637,6 @@ describe('ScanController', () => {
         requestIntervalMs: 1_800,
         maxRoundMs: 30_000,
       },
-      delay,
-      random: () => 0,
     });
 
     const state = await scan.run();
@@ -416,7 +644,13 @@ describe('ScanController', () => {
     expect(state.status).toBe('completed');
     expect(content.startDetailScan).toHaveBeenCalledTimes(2);
     expect(maxActive).toBe(1);
-    expect(delay).toHaveBeenCalledWith(1_440, expect.any(AbortSignal));
+    expect(content.startDetailScan).toHaveBeenNthCalledWith(
+      2,
+      card,
+      8_000,
+      expect.any(AbortSignal),
+      expect.objectContaining({ requestIntervalMs: 1_800 }),
+    );
     expect(state.progress.detailCompleted).toBe(1);
   });
 
@@ -558,22 +792,6 @@ describe('ScanController', () => {
     expect(bridge.evaluateJob).not.toHaveBeenCalled();
   });
 
-  it('翻页时出现 challenge 会立即停止，不再读取下一页', async () => {
-    const content = contentMock([[visibleCard(0)], [visibleCard(0, 1)]]);
-    vi.mocked(content.advanceSearchPage).mockResolvedValue({
-      type: 'boss/advance-search-page/response',
-      outcome: 'blocked',
-      reason: 'challenge',
-    });
-    const bridge = bridgeMock();
-
-    const state = await controller(content, bridge).run();
-
-    expect(state.status).toBe('failed');
-    expect(state.stopReason).toBe('challenge');
-    expect(content.extractVisibleCards).toHaveBeenCalledOnce();
-  });
-
   it('5 个详情成功、3 个 layout 失败时继续完成并评估所有成功职位', async () => {
     const cards = Array.from({ length: 8 }, (_, index) => visibleCard(index));
     const content = contentMock([cards]);
@@ -598,7 +816,7 @@ describe('ScanController', () => {
     const state = await controller(content, bridge).run({ maxPages: 1 });
 
     expect(state.status).toBe('completed');
-    expect(state.stopReason).toBe('page_limit');
+    expect(state.stopReason).toBe('current_page_complete');
     expect(state.progress).toMatchObject({
       detailCompleted: 8,
       detailSuccess: 5,
@@ -665,36 +883,175 @@ describe('ScanController', () => {
     },
   );
 
-  it('连续两页没有新职位时正常完成', async () => {
-    const duplicate = visibleCard(0);
-    const content = contentMock([[duplicate], [duplicate], [visibleCard(1, 2)]]);
+  it.each(['login_required', 'challenge', 'account_risk'] as const)(
+    '主动 %s event 在详情请求悬挂中立即终止且不发起 retry',
+    async (reason) => {
+      const card = visibleCard(0);
+      const content = contentMock([[card]]);
+      let markRequestStarted: (() => void) | undefined;
+      const requestStarted = new Promise<void>((resolve) => {
+        markRequestStarted = resolve;
+      });
+      vi.mocked(content.startDetailScan).mockImplementation(
+        async (_card, _timeout, signal) =>
+          await new Promise((resolve) => {
+            markRequestStarted?.();
+            signal?.addEventListener(
+              'abort',
+              () =>
+                resolve({
+                  type: 'boss/start-detail-scan/response',
+                  outcome: 'cancelled',
+                }),
+              { once: true },
+            );
+          }),
+      );
+      const bridge = bridgeMock();
+      const scan = new ScanController({
+        content,
+        bridge,
+        config: { requestIntervalMs: 1_800, maxRoundMs: 30_000 },
+      });
+
+      const running = scan.run();
+      await requestStarted;
+      emitContentFatal(content, reason);
+      const state = await running;
+
+      expect(state.status).toBe('failed');
+      expect(state.stopReason).toBe(reason);
+      expect(content.startDetailScan).toHaveBeenCalledOnce();
+      expect(bridge.saveJob).not.toHaveBeenCalled();
+      expect(bridge.evaluateJob).not.toHaveBeenCalled();
+    },
+  );
+
+  it('主动 fatal 在列表筛选前置位后禁止筛选、保存和 AI', async () => {
+    const content = contentMock([[visibleCard(0)]]);
     const bridge = bridgeMock();
-    const existing = savedFor(detailFor(duplicate));
-    vi.mocked(bridge.observeJobs).mockImplementation(
-      async (_runId, _sourceQuery, jobs) =>
-        jobs.map((job) => ({
-          sourceJobId: job.jobId,
-          action: 'reuse' as const,
-          job: existing,
-          evaluation: {
-            score: 88,
-            recommendation: 'apply',
-            rawReport: '缓存评估。',
-          },
-          cacheHit: true,
-        })),
+    vi.mocked(bridge.observeJobs).mockImplementation(async () => {
+      emitContentFatal(content, 'challenge');
+      return [
+        {
+          sourceJobId: 'boss-0',
+          action: 'read-detail',
+          reason: 'new',
+        },
+      ];
+    });
+
+    const state = await controller(content, bridge).run();
+
+    expect(state.stopReason).toBe('challenge');
+    expect(bridge.screenJobs).not.toHaveBeenCalled();
+    expect(bridge.saveJob).not.toHaveBeenCalled();
+    expect(bridge.evaluateJob).not.toHaveBeenCalled();
+  });
+
+  it('主动 fatal 在职位保存前置位后禁止保存和 AI', async () => {
+    const card = visibleCard(0);
+    const content = contentMock([[card]]);
+    vi.mocked(content.startDetailScan).mockImplementation(async () => {
+      emitContentFatal(content, 'account_risk');
+      return {
+        type: 'boss/start-detail-scan/response',
+        outcome: 'success',
+        job: detailFor(card),
+      };
+    });
+    const bridge = bridgeMock();
+
+    const state = await controller(content, bridge).run();
+
+    expect(state.stopReason).toBe('account_risk');
+    expect(bridge.saveJob).not.toHaveBeenCalled();
+    expect(bridge.evaluateJob).not.toHaveBeenCalled();
+  });
+
+  it('主动 fatal 在 AI 前置位后不再调用 AI', async () => {
+    const card = visibleCard(0);
+    const content = contentMock([[card]]);
+    const bridge = bridgeMock();
+    vi.mocked(bridge.screenJobs).mockImplementation(
+      async (jobs, _preferences, _signal, phase: ScreeningPhase = 'list') => {
+        if (phase === 'detail') {
+          emitContentFatal(content, 'login_required');
+        }
+        return jobs.map((job) => ({
+          jobId: job.jobId,
+          matched: true,
+          reasons: [],
+        }));
+      },
     );
 
     const state = await controller(content, bridge).run();
 
-    expect(state.status).toBe('completed');
-    expect(state.stopReason).toBe('no_new_jobs');
-    expect(state.progress.pagesVisited).toBe(2);
-    expect(content.advanceSearchPage).toHaveBeenCalledOnce();
-    expect(state.results).toHaveLength(1);
-    expect(state.progress.cacheHits).toBe(1);
-    expect(content.startDetailScan).not.toHaveBeenCalled();
+    expect(state.stopReason).toBe('login_required');
+    expect(bridge.saveJob).toHaveBeenCalledOnce();
     expect(bridge.evaluateJob).not.toHaveBeenCalled();
+  });
+
+  it('最后一次 evaluating 状态写入期间发生 fatal 时不能覆盖为 completed', async () => {
+    const card = visibleCard(0);
+    const content = contentMock([[card]]);
+    const bridge = bridgeMock();
+    let evaluatingWrites = 0;
+    vi.mocked(bridge.updateScanRun).mockImplementation(async (_runId, update) => {
+      if (update.phase === 'evaluating') {
+        evaluatingWrites += 1;
+        if (evaluatingWrites === 2) {
+          emitContentFatal(content, 'account_risk');
+        }
+      }
+      return scanRun();
+    });
+
+    const state = await controller(content, bridge).run();
+
+    expect(bridge.evaluateJob).toHaveBeenCalledOnce();
+    expect(state.status).toBe('failed');
+    expect(state.stopReason).toBe('account_risk');
+  });
+
+  it('endSession 最终返回 fatal 时覆盖普通完成终态', async () => {
+    const content = contentMock([[]]);
+    vi.mocked(content.endSession).mockRejectedValueOnce(
+      new BossFatalBlockError('login_required'),
+    );
+    const bridge = bridgeMock();
+
+    const state = await controller(content, bridge).run();
+
+    expect(state.status).toBe('failed');
+    expect(state.stopReason).toBe('login_required');
+  });
+
+  it('fatal 终态写回 Bridge 失败时只追加警告，不降级为 interrupted', async () => {
+    const content = contentMock([[]]);
+    vi.mocked(content.detectPage).mockResolvedValue({
+      type: 'boss/detect-page/response',
+      pageType: 'challenge',
+      block: { reason: 'challenge', pageType: 'challenge' },
+    });
+    const bridge = bridgeMock();
+    vi.mocked(bridge.updateScanRun).mockImplementation(
+      async (_runId, update) => {
+        if (update.status === 'failed') {
+          throw new Error('Bridge write failed');
+        }
+        return scanRun();
+      },
+    );
+
+    const state = await controller(content, bridge).run();
+
+    expect(state.status).toBe('failed');
+    expect(state.stopReason).toBe('challenge');
+    expect(state.warnings).toContain(
+      'scan run 最终状态写入失败：Bridge write failed',
+    );
   });
 
   it('旧职位 cache miss 时重建完整硬规则，阻断后不调用 AI', async () => {
@@ -741,6 +1098,13 @@ describe('ScanController', () => {
     const sendMessage = vi.fn<TabsClient['sendMessage']>(
       async (_tabId, message) => {
         switch ((message as { type?: string }).type) {
+          case 'boss/begin-session/request':
+            return {
+              type: 'boss/begin-session/response',
+              sessionId: 'session-11',
+              generation: 'generation-11',
+              queryScope: 'boss:/web/geek/jobs',
+            };
           case 'boss/detect-page/request':
             return {
               type: 'boss/detect-page/response',
@@ -750,6 +1114,8 @@ describe('ScanController', () => {
           case 'boss/extract-visible-cards/request':
             return {
               type: 'boss/extract-visible-cards/response',
+              sessionId: 'session-11',
+              generation: 'generation-11',
               cards: [card],
               totalVisible: 1,
               invalidCount: 0,
@@ -761,15 +1127,24 @@ describe('ScanController', () => {
               type: 'boss/cancel-detail-scan/response',
               cancelled: true,
             };
+          case 'boss/end-session/request':
+            return {
+              type: 'boss/end-session/response',
+              ended: true,
+            };
           default:
             return undefined;
         }
       },
     );
-    const content = createContentClient({
-      query: async () => [{ id: 11 }],
-      sendMessage,
-    });
+    const content = createContentClient(
+      {
+        query: async () => [{ id: 11 }],
+        sendMessage,
+      },
+      { addMessageListener: () => () => undefined },
+      () => 'session-11',
+    );
     const bridge = bridgeMock();
 
     const state = await controller(content, bridge).run({ maxRoundMs: 20 });
@@ -824,6 +1199,73 @@ describe('ScanController', () => {
     expect(state.results[1]?.savedJob).toBeUndefined();
   });
 
+  it('用户取消先中止本地详情，再等待 Bridge 的 best-effort 标志', async () => {
+    const card = visibleCard(0);
+    const content = contentMock([[card]]);
+    let detailAborted = false;
+    vi.mocked(content.startDetailScan).mockImplementation(
+      async (_card, _timeout, signal) =>
+        await new Promise((resolve) => {
+          signal?.addEventListener(
+            'abort',
+            () => {
+              detailAborted = true;
+              resolve({
+                type: 'boss/start-detail-scan/response',
+                outcome: 'cancelled',
+              });
+            },
+            { once: true },
+          );
+        }),
+    );
+    const bridge = bridgeMock();
+    let finishBridgeCancellation: (() => void) | undefined;
+    vi.mocked(bridge.requestScanRunCancel).mockImplementation(
+      async () =>
+        await new Promise((resolve) => {
+          finishBridgeCancellation = () =>
+            resolve({ ...scanRun(), cancelRequested: true });
+        }),
+    );
+    const scan = controller(content, bridge);
+    const running = scan.run();
+    await vi.waitFor(() =>
+      expect(content.startDetailScan).toHaveBeenCalledOnce(),
+    );
+
+    const cancelling = scan.cancel();
+
+    expect(detailAborted).toBe(true);
+    expect(scan.state.status).toBe('cancelled');
+    await expect(running).resolves.toMatchObject({ status: 'cancelled' });
+    await expect(scan.run()).rejects.toThrow('上一轮扫描仍在清理中');
+    finishBridgeCancellation?.();
+    await cancelling;
+  });
+
+  it('旧轮次 endSession 完成前拒绝启动新轮次', async () => {
+    const content = contentMock([[]]);
+    let finishEndSession: (() => void) | undefined;
+    vi.mocked(content.endSession)
+      .mockImplementationOnce(
+        async () =>
+          await new Promise<boolean>((resolve) => {
+            finishEndSession = () => resolve(true);
+          }),
+      )
+      .mockResolvedValue(true);
+    const scan = controller(content, bridgeMock());
+    const running = scan.run();
+    await vi.waitFor(() => expect(content.endSession).toHaveBeenCalledOnce());
+
+    await expect(scan.run()).rejects.toThrow('上一轮扫描仍在清理中');
+    finishEndSession?.();
+    await running;
+
+    await expect(scan.run()).resolves.toMatchObject({ status: 'completed' });
+  });
+
   it('Side Panel 关闭时不等待 Content Script 即发出 keepalive 中断写入', async () => {
     const content = contentMock([[]]);
     let finishContentCancellation: (() => void) | undefined;
@@ -839,10 +1281,14 @@ describe('ScanController', () => {
 
     const interrupted = scan.interrupt('side-panel-closed');
 
-    expect(bridge.interruptScanRun).toHaveBeenCalledWith('scan-1', {
-      reason: 'side-panel-closed',
-      errorSummary: '扫描上下文已关闭，可重新开始并复用已完成结果。',
-    });
+    expect(bridge.interruptScanRun).toHaveBeenCalledWith(
+      'scan-1',
+      {
+        reason: 'side-panel-closed',
+        errorSummary: '扫描上下文已关闭，可重新开始并复用已完成结果。',
+      },
+      expect.any(AbortSignal),
+    );
     finishContentCancellation?.();
     await interrupted;
     expect(scan.state.status).toBe('interrupted');

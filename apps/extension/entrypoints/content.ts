@@ -1,5 +1,4 @@
 import {
-  bossSelectors,
   detectBossPage,
   detectBossPageBlock,
   parseBossDetail,
@@ -8,19 +7,27 @@ import {
   verifyDetailIdentity,
 } from '@career-ops-cn/boss-adapter';
 import {
-  AdvanceSearchPageRequestSchema,
-  AdvanceSearchPageResponseSchema,
+  BeginBossSessionRequestSchema,
+  BeginBossSessionResponseSchema,
+  BossAccountFatalReasonSchema,
+  BossFatalBlockEventSchema,
+  BossSessionInvalidatedEventSchema,
+  BossSessionErrorResponseSchema,
   CancelDetailScanRequestSchema,
   CancelDetailScanResponseSchema,
   DetectPageRequestSchema,
   DetectPageResponseSchema,
+  EndBossSessionRequestSchema,
+  EndBossSessionResponseSchema,
   ExtractCurrentDetailRequestSchema,
   ExtractCurrentDetailResponseSchema,
   ExtractVisibleCardsRequestSchema,
   ExtractVisibleCardsResponseSchema,
+  JobCardSchema,
   StartDetailScanRequestSchema,
   StartDetailScanResponseSchema,
-  type AdvanceSearchPageResponse,
+  type BossFatalBlockEvent,
+  type BossSessionInvalidatedEvent,
   type VisibleJobCard,
 } from '@career-ops-cn/shared';
 import { browser } from 'wxt/browser';
@@ -28,35 +35,17 @@ import { defineContentScript } from 'wxt/utils/define-content-script';
 
 import {
   fetchBossDetail,
-  readBossDetailFromLivePanel,
-  shouldUseLivePanelFallback,
   toJobCard,
   toJobDetail,
   type JobCardField,
 } from '../lib/boss-detail-fetch';
-
-function queryFirstByPriority(
-  root: Document | Element,
-  selectors: readonly string[],
-): Element | null {
-  for (const selector of selectors) {
-    const element = root.querySelector(selector);
-    if (element !== null) {
-      return element;
-    }
-  }
-  return null;
-}
-
-function visibleCardSignature(): string {
-  return parseVisibleBossCards(document, window.location.href)
-    .map((card) =>
-      [card.sourceJobId, card.url, card.title, card.company]
-        .map((value) => value ?? '')
-        .join('\u001f'),
-    )
-    .join('\u001e');
-}
+import {
+  BossContentLocatorStore,
+  type BossContentSession,
+  type BossLocatorSessionRef,
+} from '../lib/boss-content-session';
+import { BossRequestGate } from '../lib/boss-request-gate';
+import { observeBossSessionChanges } from '../lib/boss-session-monitor';
 
 function currentSourceQuery(): string {
   const url = new URL(window.location.href);
@@ -67,112 +56,18 @@ function currentSourceQuery(): string {
   return `boss:${url.pathname}${url.search}`.slice(0, 2_048);
 }
 
-function isDisabled(element: Element): boolean {
-  return (
-    element.matches(bossSelectors.pagination.disabled) ||
-    element.closest(bossSelectors.pagination.disabled) !== null
-  );
-}
-
-async function advanceSearchPage(
-  timeoutMs: number,
-  signal: AbortSignal,
-): Promise<AdvanceSearchPageResponse> {
-  if (signal.aborted) {
-    return AdvanceSearchPageResponseSchema.parse({
-      type: 'boss/advance-search-page/response',
-      outcome: 'cancelled',
-    });
-  }
-
-  const initialBlock = detectBossPageBlock(document, window.location.href);
-  if (initialBlock !== null) {
-    return AdvanceSearchPageResponseSchema.parse({
-      type: 'boss/advance-search-page/response',
-      outcome: 'blocked',
-      reason: initialBlock.reason,
-    });
-  }
-
-  const previousSignature = visibleCardSignature();
-  const next = queryFirstByPriority(document, bossSelectors.pagination.next);
-  if (next === null || isDisabled(next)) {
-    return AdvanceSearchPageResponseSchema.parse({
-      type: 'boss/advance-search-page/response',
-      outcome: 'end',
-    });
-  }
-
-  return await new Promise<AdvanceSearchPageResponse>((resolve) => {
-    let settled = false;
-    const observer = new MutationObserver(evaluate);
-    const finish = (response: AdvanceSearchPageResponse): void => {
-      if (settled) {
-        return;
-      }
-      settled = true;
-      observer.disconnect();
-      clearTimeout(timer);
-      signal.removeEventListener('abort', onAbort);
-      resolve(AdvanceSearchPageResponseSchema.parse(response));
-    };
-    const onAbort = (): void => {
-      finish({
-        type: 'boss/advance-search-page/response',
-        outcome: 'cancelled',
-      });
-    };
-    function evaluate(): void {
-      const block = detectBossPageBlock(document, window.location.href);
-      if (
-        block !== null &&
-        (block.reason === 'login_required' ||
-          block.reason === 'challenge' ||
-          block.reason === 'account_risk')
-      ) {
-        finish({
-          type: 'boss/advance-search-page/response',
-          outcome: 'blocked',
-          reason: block.reason,
-        });
-        return;
-      }
-      const signature = visibleCardSignature();
-      if (signature !== '' && signature !== previousSignature) {
-        finish({
-          type: 'boss/advance-search-page/response',
-          outcome: 'advanced',
-        });
-      }
-    }
-    const timer = setTimeout(() => {
-      finish({
-        type: 'boss/advance-search-page/response',
-        outcome: 'failed',
-        message: '翻页后职位列表未在超时前更新。',
-      });
-    }, timeoutMs);
-
-    signal.addEventListener('abort', onAbort, { once: true });
-    observer.observe(document.documentElement, {
-      attributes: true,
-      childList: true,
-      characterData: true,
-      subtree: true,
-    });
-    next.dispatchEvent(
-      new MouseEvent('click', { bubbles: true, cancelable: true }),
-    );
-    evaluate();
-  });
-}
-
-function extractVisibleCards(): {
+function extractVisibleCards(
+  locatorStore: BossContentLocatorStore,
+  session: BossLocatorSessionRef,
+): {
+  sessionId: string;
+  generation: string;
   cards: VisibleJobCard[];
   totalVisible: number;
   invalidCount: number;
   invalidFieldCounts: Partial<Record<JobCardField, number>>;
 } {
+  locatorStore.clearLocators();
   const parsedCards = parseVisibleBossCards(document, window.location.href);
   const cards: VisibleJobCard[] = [];
   const invalidFieldCounts: Partial<Record<JobCardField, number>> = {};
@@ -180,7 +75,15 @@ function extractVisibleCards(): {
   parsedCards.forEach((card, index) => {
     const { job, invalidFields } = toJobCard(card);
     if (job !== null) {
-      cards.push({ index, job });
+      if (
+        card.url !== null &&
+        locatorStore.register(session, job.jobId, job.detailUrl, card.url)
+      ) {
+        cards.push({ index, job });
+      } else {
+        invalidFieldCounts.detailUrl =
+          (invalidFieldCounts.detailUrl ?? 0) + 1;
+      }
       return;
     }
     for (const field of invalidFields) {
@@ -189,6 +92,8 @@ function extractVisibleCards(): {
   });
 
   return {
+    sessionId: session.sessionId,
+    generation: session.generation,
     cards,
     totalVisible: parsedCards.length,
     invalidCount: parsedCards.length - cards.length,
@@ -200,9 +105,188 @@ export default defineContentScript({
   matches: ['*://*.zhipin.com/*', '*://zhipin.com/*'],
   main() {
     let activeOperationController: AbortController | null = null;
+    let monitoredSession: BossContentSession | null = null;
+    let fatalObserver: MutationObserver | null = null;
+    let pageHideListener: (() => void) | null = null;
+    let requestGate: { intervalMs: number; gate: BossRequestGate } | null = null;
+    const locatorStore = new BossContentLocatorStore(window.location.origin);
+
+    const stopFatalMonitoring = (): void => {
+      fatalObserver?.disconnect();
+      fatalObserver = null;
+      if (pageHideListener !== null) {
+        window.removeEventListener('pagehide', pageHideListener);
+        pageHideListener = null;
+      }
+      monitoredSession = null;
+    };
+
+    const broadcastFatal = (event: BossFatalBlockEvent): void => {
+      stopFatalMonitoring();
+      requestGate = null;
+      activeOperationController?.abort(
+        new DOMException(`页面已停止扫描：${event.reason}`, 'AbortError'),
+      );
+      void browser.runtime
+        .sendMessage(BossFatalBlockEventSchema.parse(event))
+        .catch(() => undefined);
+    };
+
+    const broadcastSessionInvalidated = (
+      session: BossLocatorSessionRef,
+    ): void => {
+      if (
+        monitoredSession?.sessionId !== session.sessionId ||
+        monitoredSession.generation !== session.generation
+      ) {
+        return;
+      }
+      locatorStore.invalidate(session);
+      const event: BossSessionInvalidatedEvent =
+        BossSessionInvalidatedEventSchema.parse({
+          type: 'boss/session-invalidated/event',
+          sessionId: session.sessionId,
+          generation: session.generation,
+          reason: 'context_changed',
+        });
+      stopFatalMonitoring();
+      requestGate = null;
+      activeOperationController?.abort(
+        new DOMException('BOSS 查询上下文已改变。', 'AbortError'),
+      );
+      void browser.runtime.sendMessage(event).catch(() => undefined);
+    };
+
+    const latchVisibleFatal = (): BossFatalBlockEvent | null => {
+      const block = detectBossPageBlock(document, window.location.href);
+      const reason = BossAccountFatalReasonSchema.safeParse(block?.reason);
+      if (!reason.success) {
+        return null;
+      }
+      const event = locatorStore.latchFatal(reason.data);
+      if (event !== null) {
+        broadcastFatal(event);
+      }
+      return event;
+    };
+
+    const sessionControlResponse = (
+      session: BossLocatorSessionRef,
+    ): BossFatalBlockEvent | ReturnType<typeof BossSessionErrorResponseSchema.parse> | null => {
+      const visibleFatal = latchVisibleFatal();
+      if (visibleFatal !== null) {
+        return visibleFatal;
+      }
+      const validation = locatorStore.validate(session, currentSourceQuery());
+      if (validation.status === 'context_changed') {
+        broadcastSessionInvalidated(session);
+        return BossSessionErrorResponseSchema.parse({
+          type: 'boss/session-error/response',
+          sessionId: session.sessionId,
+          generation: session.generation,
+          reason: 'context_changed',
+        });
+      }
+      if (validation.status === 'fatal') {
+        return validation.event;
+      }
+      return null;
+    };
+
+    const monitorSession = (session: BossContentSession): void => {
+      stopFatalMonitoring();
+      monitoredSession = session;
+      const check = (): void => {
+        if (monitoredSession === null) {
+          return;
+        }
+        if (latchVisibleFatal() !== null) {
+          return;
+        }
+        const validation = locatorStore.validate(
+          monitoredSession,
+          currentSourceQuery(),
+        );
+        if (validation.status === 'context_changed') {
+          broadcastSessionInvalidated(monitoredSession);
+          return;
+        }
+        if (validation.status === 'fatal') {
+          broadcastFatal(validation.event);
+        }
+      };
+      fatalObserver = observeBossSessionChanges(
+        document.documentElement,
+        check,
+      );
+      pageHideListener = () => {
+        broadcastSessionInvalidated(session);
+      };
+      window.addEventListener('pagehide', pageHideListener, { once: true });
+      queueMicrotask(check);
+    };
 
     browser.runtime.onMessage.addListener(async (message: unknown) => {
-      if (DetectPageRequestSchema.safeParse(message).success) {
+      const beginRequest = BeginBossSessionRequestSchema.safeParse(message);
+      if (beginRequest.success) {
+        activeOperationController?.abort();
+        activeOperationController = null;
+        requestGate = null;
+        const session = locatorStore.beginSession(
+          beginRequest.data.sessionId,
+          currentSourceQuery(),
+        );
+        monitorSession(session);
+        return BeginBossSessionResponseSchema.parse({
+          type: 'boss/begin-session/response',
+          sessionId: session.sessionId,
+          generation: session.generation,
+          queryScope: session.queryScope,
+        });
+      }
+
+      const endRequest = EndBossSessionRequestSchema.safeParse(message);
+      if (endRequest.success) {
+        latchVisibleFatal();
+        const termination = locatorStore.endSession(
+          endRequest.data,
+          currentSourceQuery(),
+        );
+        if (termination.status === 'stale') {
+          return BossSessionErrorResponseSchema.parse({
+            type: 'boss/session-error/response',
+            sessionId: endRequest.data.sessionId,
+            generation: endRequest.data.generation,
+            reason: 'context_changed',
+          });
+        }
+        stopFatalMonitoring();
+        requestGate = null;
+        activeOperationController?.abort();
+        activeOperationController = null;
+        if (termination.status === 'fatal') {
+          return termination.event;
+        }
+        if (termination.status === 'context_changed') {
+          return BossSessionErrorResponseSchema.parse({
+            type: 'boss/session-error/response',
+            sessionId: endRequest.data.sessionId,
+            generation: endRequest.data.generation,
+            reason: 'context_changed',
+          });
+        }
+        return EndBossSessionResponseSchema.parse({
+          type: 'boss/end-session/response',
+          ended: true,
+        });
+      }
+
+      const detectRequest = DetectPageRequestSchema.safeParse(message);
+      if (detectRequest.success) {
+        const control = sessionControlResponse(detectRequest.data);
+        if (control !== null) {
+          return control;
+        }
         return DetectPageResponseSchema.parse({
           type: 'boss/detect-page/response',
           pageType: detectBossPage(document, window.location.href),
@@ -211,7 +295,13 @@ export default defineContentScript({
         });
       }
 
-      if (ExtractCurrentDetailRequestSchema.safeParse(message).success) {
+      const currentDetailRequest =
+        ExtractCurrentDetailRequestSchema.safeParse(message);
+      if (currentDetailRequest.success) {
+        const control = sessionControlResponse(currentDetailRequest.data);
+        if (control !== null) {
+          return control;
+        }
         const detail = parseBossDetail(document, window.location.href);
         const identity =
           detail === null
@@ -234,39 +324,98 @@ export default defineContentScript({
         });
       }
 
-      if (ExtractVisibleCardsRequestSchema.safeParse(message).success) {
+      const visibleCardsRequest =
+        ExtractVisibleCardsRequestSchema.safeParse(message);
+      if (visibleCardsRequest.success) {
+        const control = sessionControlResponse(visibleCardsRequest.data);
+        if (control !== null) {
+          return control;
+        }
         return ExtractVisibleCardsResponseSchema.parse({
           type: 'boss/extract-visible-cards/response',
-          ...extractVisibleCards(),
+          ...extractVisibleCards(locatorStore, visibleCardsRequest.data),
         });
       }
 
       const startRequest = StartDetailScanRequestSchema.safeParse(message);
       if (startRequest.success) {
+        const control = sessionControlResponse(startRequest.data);
+        if (control !== null) {
+          return control;
+        }
+        const rawDetailUrl = locatorStore.resolve(
+          startRequest.data,
+          startRequest.data.sourceJobId,
+          startRequest.data.detailUrl,
+        );
+        if (rawDetailUrl === null) {
+          return StartDetailScanResponseSchema.parse({
+            type: 'boss/start-detail-scan/response',
+            outcome: 'failed',
+            message: '当前 content session 缺少该职位的请求定位信息。',
+            failureKind: 'locator',
+            retryable: false,
+          });
+        }
+        if (requestGate === null) {
+          requestGate = {
+            intervalMs: startRequest.data.requestIntervalMs,
+            gate: new BossRequestGate({
+              intervalMs: startRequest.data.requestIntervalMs,
+            }),
+          };
+        } else if (
+          requestGate.intervalMs !== startRequest.data.requestIntervalMs
+        ) {
+          return StartDetailScanResponseSchema.parse({
+            type: 'boss/start-detail-scan/response',
+            outcome: 'failed',
+            message: '同一 content session 的 BOSS 请求间隔配置发生变化。',
+            failureKind: 'unknown',
+            retryable: false,
+          });
+        }
         activeOperationController?.abort();
         const controller = new AbortController();
         activeOperationController = controller;
 
         try {
-          const fetched = await fetchBossDetail({
-            card: startRequest.data.card,
+          const result = await fetchBossDetail({
+            card: {
+              index: 0,
+              job: JobCardSchema.parse({
+                jobId: startRequest.data.sourceJobId,
+                title: startRequest.data.expectedTitle,
+                companyName: startRequest.data.expectedCompany,
+                detailUrl: startRequest.data.detailUrl,
+              }),
+            },
+            rawDetailUrl,
             timeoutMs: startRequest.data.timeoutMs,
+            deadlineAt: startRequest.data.deadlineAt,
             signal: controller.signal,
+            requestGate: requestGate.gate,
           });
-          if (!shouldUseLivePanelFallback(fetched)) {
-            return fetched;
+          if (
+            result.outcome === 'blocked' &&
+            BossAccountFatalReasonSchema.safeParse(result.reason).success
+          ) {
+            const reason = BossAccountFatalReasonSchema.parse(result.reason);
+            const event = locatorStore.latchFatal(reason);
+            if (event !== null) {
+              broadcastFatal(event);
+            }
           }
-          return await readBossDetailFromLivePanel({
-            document,
-            url: window.location.href,
-            card: startRequest.data.card,
-            timeoutMs: startRequest.data.timeoutMs,
-            signal: controller.signal,
-            ...(fetched.diagnostics === undefined
-              ? {}
-              : { previousDiagnostics: fetched.diagnostics }),
-          });
+          const afterRequest = sessionControlResponse(startRequest.data);
+          if (afterRequest !== null) {
+            return afterRequest;
+          }
+          return result;
         } catch (error) {
+          const afterRequest = sessionControlResponse(startRequest.data);
+          if (afterRequest !== null) {
+            return afterRequest;
+          }
           return StartDetailScanResponseSchema.parse({
             type: 'boss/start-detail-scan/response',
             outcome: controller.signal.aborted ? 'cancelled' : 'failed',
@@ -286,35 +435,12 @@ export default defineContentScript({
         }
       }
 
-      const advanceRequest = AdvanceSearchPageRequestSchema.safeParse(message);
-      if (advanceRequest.success) {
-        activeOperationController?.abort();
-        const controller = new AbortController();
-        activeOperationController = controller;
-        try {
-          return await advanceSearchPage(
-            advanceRequest.data.timeoutMs,
-            controller.signal,
-          );
-        } catch (error) {
-          return AdvanceSearchPageResponseSchema.parse({
-            type: 'boss/advance-search-page/response',
-            outcome: controller.signal.aborted ? 'cancelled' : 'failed',
-            ...(controller.signal.aborted
-              ? {}
-              : {
-                  message:
-                    error instanceof Error ? error.message : '搜索页翻页失败。',
-                }),
-          });
-        } finally {
-          if (activeOperationController === controller) {
-            activeOperationController = null;
-          }
+      const cancelRequest = CancelDetailScanRequestSchema.safeParse(message);
+      if (cancelRequest.success) {
+        const control = sessionControlResponse(cancelRequest.data);
+        if (control !== null) {
+          return control;
         }
-      }
-
-      if (CancelDetailScanRequestSchema.safeParse(message).success) {
         const cancelled = activeOperationController !== null;
         activeOperationController?.abort();
         activeOperationController = null;

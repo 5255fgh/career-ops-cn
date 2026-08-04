@@ -4,11 +4,8 @@ import { JobCardSchema, type VisibleJobCard } from '@career-ops-cn/shared';
 import { Window } from 'happy-dom';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import {
-  fetchBossDetail,
-  readBossDetailFromLivePanel,
-  toJobCard,
-} from './boss-detail-fetch';
+import { fetchBossDetail, toJobCard } from './boss-detail-fetch';
+import { BossRequestGate } from './boss-request-gate';
 
 const card: VisibleJobCard = {
   index: 0,
@@ -84,6 +81,13 @@ function pendingFetch(): typeof fetch {
   }) as unknown as typeof fetch;
 }
 
+function requestGovernance() {
+  return {
+    deadlineAt: Date.now() + 60_000,
+    requestGate: new BossRequestGate({ intervalMs: 0 }),
+  };
+}
+
 afterEach(() => {
   vi.useRealTimers();
 });
@@ -123,7 +127,9 @@ describe('fetchBossDetail', () => {
     const fetchImpl = pendingFetch();
     const resultPromise = fetchBossDetail({
       card,
+      rawDetailUrl: card.job.detailUrl,
       timeoutMs: 250,
+      ...requestGovernance(),
       signal: userController.signal,
       fetchImpl,
     });
@@ -156,7 +162,9 @@ describe('fetchBossDetail', () => {
     const userController = new AbortController();
     const resultPromise = fetchBossDetail({
       card,
+      rawDetailUrl: card.job.detailUrl,
       timeoutMs: 10_000,
+      ...requestGovernance(),
       signal: userController.signal,
       fetchImpl: pendingFetch(),
     });
@@ -172,7 +180,9 @@ describe('fetchBossDetail', () => {
   it('普通网络错误可重试，但不会伪装成超时或页面阻断', async () => {
     const result = await fetchBossDetail({
       card,
+      rawDetailUrl: card.job.detailUrl,
       timeoutMs: 1_000,
+      ...requestGovernance(),
       signal: new AbortController().signal,
       fetchImpl: vi.fn(async () => {
         throw new TypeError('Failed to fetch');
@@ -186,19 +196,50 @@ describe('fetchBossDetail', () => {
     });
   });
 
+  it('限速等待会越过 round deadline 时不发出真实 fetch', async () => {
+    let now = 1_000;
+    const gate = new BossRequestGate({
+      intervalMs: 1_800,
+      now: () => now,
+      random: () => 0.5,
+      delay: async (milliseconds) => {
+        now += milliseconds;
+      },
+    });
+    const signal = new AbortController().signal;
+    await gate.run({ signal, deadlineAt: 10_000 }, async () => undefined);
+    const fetchImpl = vi.fn<typeof fetch>();
+
+    const result = await fetchBossDetail({
+      card,
+      rawDetailUrl: card.job.detailUrl,
+      timeoutMs: 8_000,
+      deadlineAt: 2_000,
+      signal,
+      requestGate: gate,
+      fetchImpl,
+    });
+
+    expect(result).toMatchObject({ outcome: 'deadline_exceeded' });
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
   it('直接 fetch 成功时解析详情并记录有限响应诊断', async () => {
     const url = directCard.job.detailUrl;
     const fixture = createDocument('job-detail.html', url);
     const responseUrl =
       'https://www.zhipin.com/job_detail/boss-2001.html?securityId=secret';
+    const rawDetailUrl =
+      'https://www.zhipin.com/job_detail/boss-2001.html?securityId=request-only';
+    const fetchImpl = vi.fn(async () => htmlResponse(fixture.html, responseUrl));
 
     const result = await fetchBossDetail({
       card: directCard,
+      rawDetailUrl,
       timeoutMs: 1_000,
+      ...requestGovernance(),
       signal: new AbortController().signal,
-      fetchImpl: vi.fn(async () =>
-        htmlResponse(fixture.html, responseUrl),
-      ) as unknown as typeof fetch,
+      fetchImpl: fetchImpl as unknown as typeof fetch,
       parseDocument: () => fixture.document,
     });
 
@@ -223,11 +264,58 @@ describe('fetchBossDetail', () => {
         },
       ],
     });
+    expect(fetchImpl).toHaveBeenCalledWith(
+      rawDetailUrl,
+      expect.objectContaining({
+        credentials: 'include',
+        redirect: 'error',
+      }),
+    );
     expect(JSON.stringify(result)).not.toContain('secret');
+    expect(JSON.stringify(result)).not.toContain('request-only');
     fixture.window.close();
   });
 
-  it('fetch 缺少详情容器时点击按 Job ID 找到的卡片并读取实时面板', async () => {
+  it('标题公司一致但响应 Job ID 不同仍按严格身份失败', async () => {
+    const responseUrl =
+      'https://www.zhipin.com/job_detail/boss-2001.html?securityId=response-only';
+    const fixture = createDocument('job-detail.html', responseUrl);
+    const mismatchedCard: VisibleJobCard = {
+      index: 10,
+      job: JobCardSchema.parse({
+        jobId: 'boss-other',
+        title: '高级前端工程师',
+        companyName: '示例丙软件',
+        detailUrl: 'https://www.zhipin.com/job_detail/boss-other.html',
+      }),
+    };
+
+    const result = await fetchBossDetail({
+      card: mismatchedCard,
+      rawDetailUrl:
+        'https://www.zhipin.com/job_detail/boss-other.html?securityId=request-only',
+      timeoutMs: 1_000,
+      ...requestGovernance(),
+      signal: new AbortController().signal,
+      fetchImpl: vi.fn(async () =>
+        htmlResponse(fixture.html, responseUrl),
+      ) as unknown as typeof fetch,
+      parseDocument: () => fixture.document,
+    });
+
+    expect(result).toMatchObject({
+      outcome: 'identity_failure',
+      evidence: {
+        detailFound: true,
+        actualJobId: 'boss-2001',
+        signals: { jobIdentity: false, title: true, company: true },
+      },
+    });
+    expect(JSON.stringify(result)).not.toContain('securityId');
+    fixture.window.close();
+  });
+
+  it('fetch 缺少详情容器时按单职位布局失败处理', async () => {
     const shell = createDocument(
       'fetch-detail-shell.html',
       panelCard.job.detailUrl,
@@ -236,7 +324,9 @@ describe('fetchBossDetail', () => {
       'https://www.zhipin.com/web/passport/zp/security.html?seed=do-not-log';
     const fetched = await fetchBossDetail({
       card: panelCard,
+      rawDetailUrl: `${panelCard.job.detailUrl}?securityId=do-not-log`,
       timeoutMs: 1_000,
+      ...requestGovernance(),
       signal: new AbortController().signal,
       fetchImpl: vi.fn(async () =>
         htmlResponse(shell.html, responseUrl),
@@ -262,129 +352,6 @@ describe('fetchBossDetail', () => {
       ],
     });
     expect(JSON.stringify(fetched)).not.toContain('do-not-log');
-
-    const searchUrl = 'https://www.zhipin.com/web/geek/job?query=frontend';
-    const panel = createDocument('search-detail-panel.html', searchUrl);
-    panel.document.getElementById('panel-card-b')!.addEventListener('click', () => {
-      panel.document
-        .getElementById('panel-detail')!
-        .setAttribute('data-jobid', 'boss-3002');
-      panel.document
-        .getElementById('panel-detail-link')!
-        .setAttribute('href', '/job_detail/boss-3002.html');
-      panel.document.getElementById('panel-detail-title')!.textContent =
-        '全栈工程师';
-      panel.document.getElementById('panel-detail-company')!.textContent =
-        '示例戊科技';
-      panel.document.getElementById('panel-description')!.textContent =
-        '负责全栈产品研发。';
-    });
-
-    const result = await readBossDetailFromLivePanel({
-      document: panel.document,
-      url: searchUrl,
-      card: panelCard,
-      timeoutMs: 1_000,
-      signal: new AbortController().signal,
-      previousDiagnostics: fetched.diagnostics ?? [],
-    });
-
-    expect(result).toMatchObject({
-      outcome: 'success',
-      job: {
-        jobId: 'boss-3002',
-        title: '全栈工程师',
-        description: '负责全栈产品研发。',
-        identityVerified: true,
-      },
-      diagnostics: [
-        expect.objectContaining({
-          source: 'fetch',
-          hasDetailContainer: false,
-        }),
-        expect.objectContaining({
-          source: 'live-panel',
-          matchedBy: 'source_job_id',
-          hasDetailContainer: true,
-          outcome: 'success',
-        }),
-      ],
-    });
     shell.window.close();
-    panel.window.close();
-  });
-
-  it('实时面板点击后身份仍不一致时拒绝详情结果', async () => {
-    vi.useFakeTimers();
-    const searchUrl = 'https://www.zhipin.com/web/geek/job?query=frontend';
-    const panel = createDocument('search-detail-panel.html', searchUrl);
-    const pending = readBossDetailFromLivePanel({
-      document: panel.document,
-      url: searchUrl,
-      card: panelCard,
-      timeoutMs: 250,
-      signal: new AbortController().signal,
-    });
-
-    await vi.advanceTimersByTimeAsync(250);
-
-    await expect(pending).resolves.toMatchObject({
-      outcome: 'identity_failure',
-      evidence: {
-        actualJobId: 'boss-3001',
-        signals: { jobIdentity: false },
-      },
-      diagnostics: [
-        expect.objectContaining({
-          source: 'live-panel',
-          matchedBy: 'source_job_id',
-          outcome: 'identity_failure',
-        }),
-      ],
-    });
-    panel.window.close();
-  });
-
-  it('实时面板身份匹配但仍缺少 description 时按单职位字段缺失处理', async () => {
-    vi.useFakeTimers();
-    const searchUrl = 'https://www.zhipin.com/web/geek/job?query=frontend';
-    const panel = createDocument('search-detail-panel.html', searchUrl);
-    panel.document.getElementById('panel-card-b')!.addEventListener('click', () => {
-      panel.document
-        .getElementById('panel-detail')!
-        .setAttribute('data-jobid', 'boss-3002');
-      panel.document
-        .getElementById('panel-detail-link')!
-        .setAttribute('href', '/job_detail/boss-3002.html');
-      panel.document.getElementById('panel-detail-title')!.textContent =
-        '全栈工程师';
-      panel.document.getElementById('panel-detail-company')!.textContent =
-        '示例戊科技';
-      panel.document.getElementById('panel-description')!.textContent = '';
-    });
-
-    const pending = readBossDetailFromLivePanel({
-      document: panel.document,
-      url: searchUrl,
-      card: panelCard,
-      timeoutMs: 250,
-      signal: new AbortController().signal,
-    });
-
-    await vi.advanceTimersByTimeAsync(250);
-
-    await expect(pending).resolves.toMatchObject({
-      outcome: 'failed',
-      failureKind: 'missing_fields',
-      diagnostics: [
-        expect.objectContaining({
-          source: 'live-panel',
-          matchedBy: 'source_job_id',
-          missingFields: expect.arrayContaining(['description']),
-          outcome: 'missing_fields',
-        }),
-      ],
-    });
-    panel.window.close();
   });
 });

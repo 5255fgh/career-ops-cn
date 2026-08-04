@@ -8,7 +8,7 @@ const completedState: ScanState = {
   runId: 'scan-1',
   status: 'completed',
   progress: {
-    pagesVisited: 2,
+    pagesVisited: 1,
     listJobs: 12,
     newJobs: 8,
     screenedJobs: 12,
@@ -22,7 +22,7 @@ const completedState: ScanState = {
     aiFailure: 0,
     cacheHits: 0,
   },
-  stopReason: null,
+  stopReason: 'current_page_complete',
   error: null,
   warnings: [],
   results: [
@@ -139,6 +139,8 @@ function props(overrides: Partial<SidePanelViewProps> = {}): SidePanelViewProps 
       },
     ],
     diagnosticsError: '',
+    browserSessionBusy: false,
+    localScanSessionActive: false,
     onTokenChange: () => undefined,
     onSaveConnection: () => undefined,
     onRefreshPage: () => undefined,
@@ -194,6 +196,9 @@ describe('SidePanelView', () => {
     expect(html).toContain('导出 JSON');
     expect(html).toContain('detail_mapping');
     expect(html).toContain('boss-1');
+    expect(html).toContain('每轮只读取当前页，不点击职位或分页');
+    expect(html).toContain('完成原因：当前页处理完成');
+    expect(html).toContain('本轮读取页数');
     expect(html).not.toContain('strengths');
     expect(html).not.toContain('gaps');
   });
@@ -239,5 +244,32 @@ describe('SidePanelView', () => {
     expect(html).toContain('重新开始');
     expect(html).toContain('1 个详情失败；已完成结果仍可复用。');
     expect(html).toContain('评估缓存命中');
+  });
+
+  it('未知的持久化 stopReason 使用原值回退显示', () => {
+    const html = renderToStaticMarkup(
+      <SidePanelView
+        {...props({
+          scanState: {
+            ...completedState,
+            status: 'interrupted',
+            stopReason: 'bridge-restarted' as ScanState['stopReason'],
+            error: 'Bridge 重启导致任务中断。',
+          },
+        })}
+      />,
+    );
+
+    expect(html).toContain('停止原因：bridge-restarted');
+  });
+
+  it('扫描 session 使用或清理期间禁用刷新、开始和 Token 重配', () => {
+    const html = renderToStaticMarkup(
+      <SidePanelView {...props({ browserSessionBusy: true })} />,
+    );
+
+    expect(html).toMatch(/id="bridge-token"[^>]*disabled=""/u);
+    expect(html).toMatch(/type="submit"[^>]*disabled=""/u);
+    expect(html.match(/disabled=""/gu)?.length ?? 0).toBeGreaterThanOrEqual(4);
   });
 });

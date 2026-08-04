@@ -3,11 +3,14 @@ import { DatabaseSync } from "node:sqlite";
 
 import {
   CandidateRecordSchema,
+  canonicalizeZhipinUrl,
   DiagnosticEventRequestSchema,
   DiagnosticEventSchema,
   EvaluationResultSchema,
   JobHistoryEntrySchema,
   JobResponseSchema,
+  sanitizeDiagnosticEventRequest,
+  sanitizeDiagnosticText,
   ScanRunSchema,
   ScreeningResultSchema,
   type CandidateRecord,
@@ -180,24 +183,7 @@ export type ObservedJob =
     };
 
 export function normalizeJobUrl(value: string | undefined): string | null {
-  if (value === undefined) {
-    return null;
-  }
-
-  const url = new URL(value);
-  url.hash = "";
-  url.search = "";
-  url.hostname = url.hostname.toLowerCase();
-
-  if (url.port === "443") {
-    url.port = "";
-  }
-
-  if (url.pathname.length > 1) {
-    url.pathname = url.pathname.replace(/\/+$/u, "");
-  }
-
-  return url.toString();
+  return value === undefined ? null : canonicalizeZhipinUrl(value);
 }
 
 function tableColumns(database: DatabaseSync, table: string): Set<string> {
@@ -306,11 +292,12 @@ function backfillJobMetadata(database: DatabaseSync): void {
 
   const rows = database.prepare("SELECT * FROM jobs").all() as unknown as JobRow[];
   const update = database.prepare(
-    "UPDATE jobs SET jd_hash = ?, list_hash = ?, normalized_url = ? WHERE id = ?",
+    "UPDATE jobs SET jd_hash = ?, list_hash = ?, normalized_url = ?, url = ? WHERE id = ?",
   );
   for (const row of rows) {
+    const canonicalUrl = normalizeJobUrl(row.url ?? undefined);
     const normalizedUrl =
-      row.normalized_url ?? normalizeJobUrl(row.url ?? undefined);
+      canonicalUrl ?? normalizeJobUrl(row.normalized_url ?? undefined);
     const jdHash =
       row.jd_hash ??
       (row.description === null
@@ -331,12 +318,131 @@ function backfillJobMetadata(database: DatabaseSync): void {
         ...(row.education === null ? {} : { education: row.education }),
         ...(row.url === null ? {} : { url: row.url }),
       });
-    update.run(jdHash, listHash, normalizedUrl, row.id);
+    update.run(jdHash, listHash, normalizedUrl, canonicalUrl, row.id);
   }
 
   database
     .prepare("UPDATE evaluations SET created_at = COALESCE(created_at, ?)")
     .run(migratedAt);
+}
+
+function parseLegacyDiagnosticDetails(
+  value: string | null,
+): Record<string, string | number | boolean | null> | undefined {
+  if (value === null) {
+    return undefined;
+  }
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    if (
+      typeof parsed !== "object" ||
+      parsed === null ||
+      Array.isArray(parsed)
+    ) {
+      return undefined;
+    }
+    return Object.fromEntries(
+      Object.entries(parsed).filter((entry): entry is [
+        string,
+        string | number | boolean | null,
+      ] => {
+        const detail = entry[1];
+        return (
+          detail === null ||
+          typeof detail === "string" ||
+          typeof detail === "number" ||
+          typeof detail === "boolean"
+        );
+      }),
+    );
+  } catch {
+    return undefined;
+  }
+}
+
+function sanitizeLegacyDiagnostics(database: DatabaseSync): void {
+  if (!tableExists(database, "diagnostics")) {
+    return;
+  }
+
+  const select = database.prepare("SELECT rowid AS row_id, * FROM diagnostics");
+  const update = database.prepare(
+    `UPDATE diagnostics
+     SET event = ?, scan_id = ?, job_id = ?, expected_job_id = ?,
+         actual_job_id = ?, expected_title = ?, actual_title = ?,
+         outcome = ?, message = ?, details_json = ?
+     WHERE rowid = ?`,
+  );
+
+  database.exec("BEGIN IMMEDIATE");
+  try {
+    const rows = select.all() as unknown as Array<
+      DiagnosticRow & { row_id: number }
+    >;
+    for (const row of rows) {
+      const details = parseLegacyDiagnosticDetails(row.details_json);
+      const candidate = DiagnosticEventRequestSchema.safeParse({
+        source: row.source,
+        level: row.level,
+        event: row.event,
+        ...(row.scan_id === null ? {} : { scanId: row.scan_id }),
+        ...(row.job_id === null ? {} : { jobId: row.job_id }),
+        ...(row.expected_job_id === null
+          ? {}
+          : { expectedJobId: row.expected_job_id }),
+        ...(row.actual_job_id === null
+          ? {}
+          : { actualJobId: row.actual_job_id }),
+        ...(row.expected_title === null
+          ? {}
+          : { expectedTitle: row.expected_title }),
+        ...(row.actual_title === null
+          ? {}
+          : { actualTitle: row.actual_title }),
+        ...(row.outcome === null ? {} : { outcome: row.outcome }),
+        ...(row.message === null ? {} : { message: row.message }),
+        ...(details === undefined ? {} : { details }),
+      });
+      const sanitized = candidate.success
+        ? sanitizeDiagnosticEventRequest(candidate.data)
+        : null;
+      update.run(
+        sanitized?.event ?? sanitizeDiagnosticText(row.event),
+        sanitized?.scanId ??
+          (row.scan_id === null ? null : sanitizeDiagnosticText(row.scan_id)),
+        sanitized?.jobId ??
+          (row.job_id === null ? null : sanitizeDiagnosticText(row.job_id)),
+        sanitized?.expectedJobId ??
+          (row.expected_job_id === null
+            ? null
+            : sanitizeDiagnosticText(row.expected_job_id)),
+        sanitized?.actualJobId ??
+          (row.actual_job_id === null
+            ? null
+            : sanitizeDiagnosticText(row.actual_job_id)),
+        sanitized?.expectedTitle ??
+          (row.expected_title === null
+            ? null
+            : sanitizeDiagnosticText(row.expected_title)),
+        sanitized?.actualTitle ??
+          (row.actual_title === null
+            ? null
+            : sanitizeDiagnosticText(row.actual_title)),
+        sanitized?.outcome ??
+          (row.outcome === null ? null : sanitizeDiagnosticText(row.outcome)),
+        sanitized?.message ??
+          (row.message === null ? null : sanitizeDiagnosticText(row.message)),
+        sanitized?.details === undefined
+          ? null
+          : JSON.stringify(sanitized.details),
+        row.row_id,
+      );
+    }
+    database.exec("COMMIT");
+  } catch (error) {
+    database.exec("ROLLBACK");
+    throw error;
+  }
 }
 
 export function initializeDatabase(database: DatabaseSync): void {
@@ -454,6 +560,7 @@ export function initializeDatabase(database: DatabaseSync): void {
   addMissingColumns(database, "evaluations", EVALUATION_COLUMNS);
   migrateLegacyDecisions(database);
   backfillJobMetadata(database);
+  sanitizeLegacyDiagnostics(database);
 
   database.exec(`
     CREATE INDEX IF NOT EXISTS jobs_normalized_url_idx
@@ -603,7 +710,7 @@ export function saveJob(
         input.experience ?? null,
         input.education ?? null,
         input.description ?? null,
-        input.url ?? null,
+        normalizedUrl,
         input.identityVerified ? 1 : 0,
         firstSeenAt,
         now,
@@ -1054,7 +1161,9 @@ export function saveDiagnostic(
   database: DatabaseSync,
   input: DiagnosticEventRequest,
 ): DiagnosticEvent {
-  const diagnostic = DiagnosticEventRequestSchema.parse(input);
+  const diagnostic = sanitizeDiagnosticEventRequest(
+    DiagnosticEventRequestSchema.parse(input),
+  );
   const row = database
     .prepare(
       `

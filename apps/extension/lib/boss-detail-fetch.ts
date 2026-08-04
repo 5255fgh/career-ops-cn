@@ -2,16 +2,14 @@ import {
   bossSelectors,
   detectBossPage,
   detectBossPageBlock,
-  findBossJobCardElement,
   parseBossDetail,
-  scanSelectedBossDetails,
-  verifyDetailIdentity,
-  type BossCardMatchMethod,
+  verifyStrictDetailIdentity,
   type BossIdentityVerification,
   type BossJobCard,
   type BossJobDetail,
 } from '@career-ops-cn/boss-adapter';
 import {
+  BossAccountFatalReasonSchema,
   DetailReadDiagnosticSchema,
   JobCardSchema,
   JobDetailSchema,
@@ -23,12 +21,12 @@ import {
   type VisibleJobCard,
 } from '@career-ops-cn/shared';
 
+import {
+  BossRequestDeadlineError,
+  type BossRequestGate,
+} from './boss-request-gate';
+
 const TRANSIENT_HTTP_STATUSES = new Set([408, 425, 429, 500, 502, 503, 504]);
-const FATAL_DETAIL_BLOCKS = new Set([
-  'login_required',
-  'challenge',
-  'account_risk',
-]);
 
 export const JOB_CARD_FIELDS = [
   'jobId',
@@ -77,7 +75,6 @@ export function toJobCard(card: BossJobCard): {
   }
   return { job: null, invalidFields: [...invalidFields] };
 }
-
 export function toJobDetail(
   detail: BossJobDetail,
   identityVerified: boolean,
@@ -130,22 +127,6 @@ function failed(
   });
 }
 
-function sanitizeDiagnosticUrl(value: string | null): string | null {
-  if (value === null || value === '') {
-    return null;
-  }
-  try {
-    const url = new URL(value);
-    url.username = '';
-    url.password = '';
-    url.search = '';
-    url.hash = '';
-    return url.toString();
-  } catch {
-    return null;
-  }
-}
-
 function hasDetailContainer(document: Document): boolean {
   return bossSelectors.page.detailContainers.some(
     (selector) => document.querySelector(selector) !== null,
@@ -168,7 +149,7 @@ function missingDetailFields(
 }
 
 function createDiagnostic(input: {
-  source: 'fetch' | 'live-panel';
+  source: 'fetch';
   card: VisibleJobCard;
   responseUrl: string | null;
   httpStatus: number | null;
@@ -176,30 +157,18 @@ function createDiagnostic(input: {
   hasDetailContainer: boolean;
   missingFields: readonly string[];
   outcome: string;
-  matchedBy?: BossCardMatchMethod;
 }): DetailReadDiagnostic {
-  const detailUrl =
-    sanitizeDiagnosticUrl(input.card.job.detailUrl) ??
-    input.card.job.detailUrl;
   return DetailReadDiagnosticSchema.parse({
     source: input.source,
     sourceJobId: input.card.job.jobId,
-    detailUrl,
-    responseUrl: sanitizeDiagnosticUrl(input.responseUrl),
+    detailUrl: input.card.job.detailUrl,
+    responseUrl: input.responseUrl,
     httpStatus: input.httpStatus,
     detectedPageType: input.detectedPageType,
     hasDetailContainer: input.hasDetailContainer,
     missingFields: [...input.missingFields],
     outcome: input.outcome,
-    ...(input.matchedBy === undefined ? {} : { matchedBy: input.matchedBy }),
   });
-}
-
-function diagnosticTrail(
-  previous: readonly DetailReadDiagnostic[] | undefined,
-  diagnostic: DetailReadDiagnostic,
-): DetailReadDiagnostic[] {
-  return [...(previous ?? []), diagnostic].slice(-4);
 }
 
 function timeoutError(): DOMException {
@@ -212,16 +181,22 @@ function cancelError(): DOMException {
 
 export interface FetchBossDetailOptions {
   card: VisibleJobCard;
+  rawDetailUrl: string;
   timeoutMs: number;
+  deadlineAt: number;
   signal: AbortSignal;
+  requestGate: BossRequestGate;
   fetchImpl?: typeof fetch;
   parseDocument?: (html: string) => Document;
 }
 
 export async function fetchBossDetail({
   card,
+  rawDetailUrl,
   timeoutMs,
+  deadlineAt,
   signal,
+  requestGate,
   fetchImpl = fetch,
   parseDocument = (html) => new DOMParser().parseFromString(html, 'text/html'),
 }: FetchBossDetailOptions): Promise<StartDetailScanResponse> {
@@ -262,19 +237,27 @@ export async function fetchBossDetail({
       reject(error);
     }, timeoutMs);
   });
+  // Gate 等待可能先于 fetch 结束；显式挂接处理器，避免取消时留下未消费 rejection。
+  void interrupted.catch(() => undefined);
 
   try {
-    const response = await Promise.race([
-      fetchImpl(card.job.detailUrl, {
-        method: 'GET',
-        credentials: 'include',
-        redirect: 'follow',
-        signal: requestController.signal,
-      }),
-      interrupted,
-    ]);
-    const html = await Promise.race([response.text(), interrupted]);
-    const responseUrl = response.url === '' ? card.job.detailUrl : response.url;
+    const { response, html } = await requestGate.run(
+      { signal: requestController.signal, deadlineAt },
+      async () => {
+        const response = await Promise.race([
+          fetchImpl(rawDetailUrl, {
+            method: 'GET',
+            credentials: 'include',
+            redirect: 'error',
+            signal: requestController.signal,
+          }),
+          interrupted,
+        ]);
+        const html = await Promise.race([response.text(), interrupted]);
+        return { response, html };
+      },
+    );
+    const responseUrl = response.url === '' ? rawDetailUrl : response.url;
     const detailDocument = parseDocument(html);
     const pageType = detectBossPage(detailDocument, responseUrl);
     const block = detectBossPageBlock(detailDocument, responseUrl);
@@ -291,7 +274,10 @@ export async function fetchBossDetail({
         outcome,
       });
 
-    if (block !== null && FATAL_DETAIL_BLOCKS.has(block.reason)) {
+    if (
+      block !== null &&
+      BossAccountFatalReasonSchema.safeParse(block.reason).success
+    ) {
       return StartDetailScanResponseSchema.parse({
         type: 'boss/start-detail-scan/response',
         outcome: 'blocked',
@@ -321,7 +307,7 @@ export async function fetchBossDetail({
         diagnosticFor('layout'),
       ]);
     }
-    const identity = verifyDetailIdentity({
+    const identity = verifyStrictDetailIdentity({
       expected: {
         sourceJobId: card.job.jobId,
         url: card.job.detailUrl,
@@ -359,8 +345,22 @@ export async function fetchBossDetail({
       detectedPageType: null,
       hasDetailContainer: false,
       missingFields: [],
-      outcome: timedOut ? 'timeout' : signal.aborted ? 'cancelled' : 'network',
+      outcome:
+        error instanceof BossRequestDeadlineError
+          ? 'round_deadline'
+          : timedOut
+            ? 'timeout'
+            : signal.aborted
+              ? 'cancelled'
+              : 'network',
     });
+    if (error instanceof BossRequestDeadlineError) {
+      return StartDetailScanResponseSchema.parse({
+        type: 'boss/start-detail-scan/response',
+        outcome: 'deadline_exceeded',
+        diagnostics: [diagnostic],
+      });
+    }
     if (timedOut) {
       return StartDetailScanResponseSchema.parse({
         type: 'boss/start-detail-scan/response',
@@ -388,244 +388,4 @@ export async function fetchBossDetail({
     signal.removeEventListener('abort', onAbort);
     rejectInterrupt = undefined;
   }
-}
-
-export function shouldUseLivePanelFallback(
-  result: StartDetailScanResponse,
-): boolean {
-  return (
-    result.outcome === 'failed' &&
-    (result.failureKind === 'layout' || result.failureKind === 'missing_fields')
-  );
-}
-
-export interface ReadBossDetailFromLivePanelOptions {
-  document: Document;
-  url: string;
-  card: VisibleJobCard;
-  timeoutMs: number;
-  signal: AbortSignal;
-  previousDiagnostics?: readonly DetailReadDiagnostic[];
-}
-
-export async function readBossDetailFromLivePanel({
-  document,
-  url,
-  card,
-  timeoutMs,
-  signal,
-  previousDiagnostics,
-}: ReadBossDetailFromLivePanelOptions): Promise<StartDetailScanResponse> {
-  const expected = {
-    sourceJobId: card.job.jobId,
-    url: card.job.detailUrl,
-    title: card.job.title,
-    company: card.job.companyName,
-  };
-  const pageType = detectBossPage(document, url);
-  const block = detectBossPageBlock(document, url);
-  const beforeDetail = parseBossDetail(document, url);
-  const diagnosticFor = (
-    outcome: string,
-    matchedBy?: BossCardMatchMethod,
-    detail: BossJobDetail | null = parseBossDetail(document, url),
-  ): DetailReadDiagnostic =>
-    createDiagnostic({
-      source: 'live-panel',
-      card,
-      responseUrl: url,
-      httpStatus: null,
-      detectedPageType: detectBossPage(document, url),
-      hasDetailContainer: hasDetailContainer(document),
-      missingFields: missingDetailFields(document, detail),
-      outcome,
-      ...(matchedBy === undefined ? {} : { matchedBy }),
-    });
-
-  if (signal.aborted) {
-    return StartDetailScanResponseSchema.parse({
-      type: 'boss/start-detail-scan/response',
-      outcome: 'cancelled',
-      diagnostics: diagnosticTrail(
-        previousDiagnostics,
-        diagnosticFor('cancelled'),
-      ),
-    });
-  }
-
-  if (block !== null) {
-    if (FATAL_DETAIL_BLOCKS.has(block.reason)) {
-      return StartDetailScanResponseSchema.parse({
-        type: 'boss/start-detail-scan/response',
-        outcome: 'blocked',
-        reason: block.reason,
-        diagnostics: diagnosticTrail(
-          previousDiagnostics,
-          diagnosticFor(block.reason),
-        ),
-      });
-    }
-    return failed(
-      `实时详情面板不可用：${block.reason}。`,
-      'layout',
-      false,
-      diagnosticTrail(previousDiagnostics, diagnosticFor(block.reason)),
-    );
-  }
-
-  if (pageType !== 'search-detail-panel' && pageType !== 'search-list') {
-    return failed(
-      `当前页面不支持实时详情面板兜底：${pageType}。`,
-      'layout',
-      false,
-      diagnosticTrail(previousDiagnostics, diagnosticFor('unsupported_page')),
-    );
-  }
-
-  const match = findBossJobCardElement(document, url, expected);
-  if (match === null) {
-    const diagnostic = diagnosticFor('card_not_found');
-    diagnostic.missingFields = [
-      ...new Set([...diagnostic.missingFields, 'job_card']),
-    ];
-    return failed(
-      '实时详情面板中找不到对应职位卡片。',
-      'layout',
-      false,
-      diagnosticTrail(previousDiagnostics, diagnostic),
-    );
-  }
-
-  const scan = await scanSelectedBossDetails({
-    document,
-    url,
-    selections: [{ element: match.element, expected }],
-    timeoutMs,
-    signal,
-    predicate: ({ detail }) => detail.description !== null,
-  });
-  const result = scan.entries[0]?.result;
-  const currentDetail =
-    result?.status === 'verified'
-      ? result.detail
-      : parseBossDetail(document, url) ?? beforeDetail;
-
-  if (scan.block !== null && result === undefined) {
-    if (FATAL_DETAIL_BLOCKS.has(scan.block.reason)) {
-      return StartDetailScanResponseSchema.parse({
-        type: 'boss/start-detail-scan/response',
-        outcome: 'blocked',
-        reason: scan.block.reason,
-        diagnostics: diagnosticTrail(
-          previousDiagnostics,
-          diagnosticFor(scan.block.reason, match.matchedBy, currentDetail),
-        ),
-      });
-    }
-    return failed(
-      `实时详情面板不可用：${scan.block.reason}。`,
-      'layout',
-      false,
-      diagnosticTrail(
-        previousDiagnostics,
-        diagnosticFor(scan.block.reason, match.matchedBy, currentDetail),
-      ),
-    );
-  }
-
-  if (result?.status === 'verified') {
-    const job = toJobDetail(result.detail, true, card.job);
-    return job === null
-      ? failed(
-          '实时详情面板缺少必要字段。',
-          'missing_fields',
-          false,
-          diagnosticTrail(
-            previousDiagnostics,
-            diagnosticFor('missing_fields', match.matchedBy, result.detail),
-          ),
-        )
-      : StartDetailScanResponseSchema.parse({
-          type: 'boss/start-detail-scan/response',
-          outcome: 'success',
-          job,
-          diagnostics: diagnosticTrail(
-            previousDiagnostics,
-            diagnosticFor('success', match.matchedBy, result.detail),
-          ),
-        });
-  }
-
-  if (result?.status === 'aborted') {
-    return StartDetailScanResponseSchema.parse({
-      type: 'boss/start-detail-scan/response',
-      outcome: 'cancelled',
-      diagnostics: diagnosticTrail(
-        previousDiagnostics,
-        diagnosticFor('cancelled', match.matchedBy, currentDetail),
-      ),
-    });
-  }
-
-  if (result?.status === 'blocked') {
-    return StartDetailScanResponseSchema.parse({
-      type: 'boss/start-detail-scan/response',
-      outcome: 'blocked',
-      reason: result.block.reason,
-      diagnostics: diagnosticTrail(
-        previousDiagnostics,
-        diagnosticFor(result.block.reason, match.matchedBy, currentDetail),
-      ),
-    });
-  }
-
-  if (
-    result?.status === 'timeout' &&
-    result.lastIdentity !== null &&
-    !result.lastIdentity.verified
-  ) {
-    return StartDetailScanResponseSchema.parse({
-      type: 'boss/start-detail-scan/response',
-      outcome: 'identity_failure',
-      evidence: detailEvidence(currentDetail, result.lastIdentity),
-      diagnostics: diagnosticTrail(
-        previousDiagnostics,
-        diagnosticFor('identity_failure', match.matchedBy, currentDetail),
-      ),
-    });
-  }
-
-  if (currentDetail === null) {
-    return failed(
-      '实时详情面板未生成可解析详情。',
-      'layout',
-      false,
-      diagnosticTrail(
-        previousDiagnostics,
-        diagnosticFor('layout', match.matchedBy, currentDetail),
-      ),
-    );
-  }
-
-  if (currentDetail.description === null) {
-    return failed(
-      '实时详情面板缺少职位描述。',
-      'missing_fields',
-      false,
-      diagnosticTrail(
-        previousDiagnostics,
-        diagnosticFor('missing_fields', match.matchedBy, currentDetail),
-      ),
-    );
-  }
-
-  return StartDetailScanResponseSchema.parse({
-    type: 'boss/start-detail-scan/response',
-    outcome: 'timeout',
-    evidence: detailEvidence(currentDetail, null),
-    diagnostics: diagnosticTrail(
-      previousDiagnostics,
-      diagnosticFor('timeout', match.matchedBy, currentDetail),
-    ),
-  });
 }

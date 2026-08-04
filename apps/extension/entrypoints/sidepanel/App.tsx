@@ -6,7 +6,14 @@ import {
   type JobHistoryEntry,
   type ScanConfig,
 } from '@career-ops-cn/shared';
-import { type FormEvent, useCallback, useEffect, useMemo, useState } from 'react';
+import {
+  type FormEvent,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from 'react';
 import { browser } from 'wxt/browser';
 
 import { createBridgeClient } from '../../lib/bridge-client';
@@ -31,6 +38,7 @@ import {
   ScanController,
   type ScanState,
 } from '../../lib/scan-controller';
+import { readBossPagePreview } from '../../lib/page-preview';
 import {
   SidePanelView,
   type ConnectionState,
@@ -69,6 +77,13 @@ const IDLE_SCAN_STATE: ScanState = {
   error: null,
   warnings: [],
 };
+
+const ACTIVE_SCAN_STATUSES = new Set<ScanState['status']>([
+  'reading-list',
+  'screening',
+  'reading-details',
+  'evaluating',
+]);
 
 function messageFromError(error: unknown): string {
   return error instanceof Error ? error.message : '操作失败。';
@@ -120,6 +135,10 @@ export function App() {
   const [exportMessage, setExportMessage] = useState('');
   const [diagnostics, setDiagnostics] = useState<DiagnosticEvent[]>([]);
   const [diagnosticsError, setDiagnosticsError] = useState('');
+  const [browserSessionBusy, setBrowserSessionBusy] = useState(false);
+  const browserSessionOwner = useRef<'preview' | 'scan' | 'cancel' | null>(
+    null,
+  );
 
   const bridge = useMemo(
     () => (savedToken === '' ? null : createBridgeClient({ token: savedToken })),
@@ -151,20 +170,21 @@ export function App() {
   );
 
   const refreshPage = useCallback(async () => {
+    if (browserSessionOwner.current !== null) {
+      return;
+    }
+    browserSessionOwner.current = 'preview';
+    setBrowserSessionBusy(true);
     setPageError('');
     try {
-      const [page, visible] = await Promise.all([
-        content.detectPage(),
-        content.extractVisibleCards(),
-      ]);
-      setPageSnapshot({
-        pageType: page.pageType,
-        block: page.block,
-        jobCount: visible.totalVisible,
-        invalidCount: visible.invalidCount,
-      });
+      setPageSnapshot(await readBossPagePreview(content));
     } catch (error) {
       setPageError(messageFromError(error));
+    } finally {
+      if (browserSessionOwner.current === 'preview') {
+        browserSessionOwner.current = null;
+        setBrowserSessionBusy(false);
+      }
     }
   }, [content]);
 
@@ -321,6 +341,13 @@ export function App() {
 
   const saveConnection = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
+    if (
+      browserSessionOwner.current !== null ||
+      ACTIVE_SCAN_STATUSES.has(scanState.status)
+    ) {
+      setConnectionMessage('扫描或页面读取清理完成后才能更换 Bridge token。');
+      return;
+    }
     const settings = BridgeSettingsSchema.safeParse({ bridgeToken: tokenDraft });
     if (!settings.success) {
       setConnectionState('offline');
@@ -355,8 +382,23 @@ export function App() {
       setConnectionMessage('请先保存有效的 Bridge token。');
       return;
     }
+    if (browserSessionOwner.current !== null) {
+      setConnectionMessage('当前页面 session 正在使用或清理，请稍后再开始。');
+      return;
+    }
+    browserSessionOwner.current = 'scan';
+    setBrowserSessionBusy(true);
     setCandidateMessage('');
-    await controller.run();
+    try {
+      await controller.run();
+    } catch (error) {
+      setConnectionMessage(messageFromError(error));
+    } finally {
+      if (browserSessionOwner.current === 'scan') {
+        browserSessionOwner.current = null;
+        setBrowserSessionBusy(false);
+      }
+    }
     await Promise.all([
       refreshPage(),
       refreshHistory(),
@@ -365,7 +407,28 @@ export function App() {
   };
 
   const cancelScan = async () => {
-    await controller?.cancel();
+    if (
+      browserSessionOwner.current !== null &&
+      browserSessionOwner.current !== 'scan'
+    ) {
+      setConnectionMessage('当前页面 session 清理完成后才能取消恢复任务。');
+      return;
+    }
+    const ownsControl =
+      browserSessionOwner.current === null ||
+      browserSessionOwner.current === 'scan';
+    if (ownsControl) {
+      browserSessionOwner.current = 'cancel';
+      setBrowserSessionBusy(true);
+    }
+    try {
+      await controller?.cancel();
+    } finally {
+      if (ownsControl && browserSessionOwner.current === 'cancel') {
+        browserSessionOwner.current = null;
+        setBrowserSessionBusy(false);
+      }
+    }
   };
 
   const saveCandidate = async () => {
@@ -438,6 +501,8 @@ export function App() {
       exportMessage={exportMessage}
       diagnostics={diagnostics}
       diagnosticsError={diagnosticsError}
+      browserSessionBusy={browserSessionBusy}
+      localScanSessionActive={browserSessionOwner.current === 'scan'}
       onTokenChange={(value) => {
         setTokenDraft(value);
         setConnectionMessage('');

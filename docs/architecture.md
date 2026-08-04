@@ -8,28 +8,31 @@
 
 - Side Panel 启动时查询 `GET /scan-runs/latest`，用 Bridge 返回的 run 和本轮职位重建阶段、页数、详情/AI 成败、缓存命中、停止原因、硬规则、评估和候选池记录。
 - `ScanController` 负责浏览器侧执行顺序：创建 scan run、读取页面、请求 Bridge 增量判断、串行抓取需要更新的详情、触发筛选/评估，并把绝对计数持续回写 Bridge。
-- 用户取消先在 Bridge 写入取消标志，再中止 Content Script 与 evaluator；控制器在后续进度回写中也会读取取消标志。
-- 标签页或 Content Script 断开会把 run 标记为 `interrupted`。Side Panel 关闭时使用 keepalive 请求中断 run；重新开始只新建一轮，不精确恢复到某个 DOM 元素。
-- 普通扫描固定预算为最多 3 页、60 个本轮新职位、30 次实际评估尝试和约 10 分钟；详情并发固定为 1。没有每日 AI 调用上限。
+- 用户取消先同步中止本地 Content Script 与 evaluator，再并发执行有 2 秒上限的 Content/Bridge best-effort 控制请求；控制器在后续进度回写中也会读取取消标志。
+- 每轮开始时只查询一次活动标签页，并把扫描固定到 `{sessionId, tabId, queryScope, generation}`。用户切换活动标签页不会改变目标；原标签页查询条件改变、reload、关闭或 Content Script 断开会把 run 标记为 `interrupted`。Side Panel 关闭时使用 keepalive 请求中断 run；旧轮次 teardown 完成前 run lifecycle lock 拒绝重启，扫描或清理期间也不能替换 Bridge token/controller。
+- Side Panel 的页面状态预览使用独占的短 content session，并在成功或失败后结束；它不会在无 session 时调用 session-only API，也不会与正式扫描共享 locator 所有权。
+- 搜索扫描固定为当前页，预算为最多 60 个本轮新职位、30 次实际评估尝试和约 10 分钟；详情并发固定为 1。`maxPages` 兼容字段只接受 `1`。没有每日 AI 调用上限。
 - 候选池读取 `GET /jobs`，在本地执行用户判断/投递状态筛选与最近发现/AI 分数/职位名称排序；CSV/JSON 导出只序列化当前筛选结果，不触发 BOSS 或 evaluator 操作。
 - Background 只负责扩展生命周期，不保存业务状态，也不承载长任务；模型 API Key 不进入 Extension。
 
 ### Content Script
 
-- 只识别 BOSS 页面、解析当前页卡片、读取当前或目标职位详情、滚动/点击下一页，并返回经过 shared Zod 契约校验的结果。目标详情先同源 fetch；动态壳、缺详情容器或缺 description 时，按 Job ID、标准化 URL、标题与公司定位卡片，点击后等待右侧面板身份或内容变化并再次校验。
+- 只识别 BOSS 页面、解析当前页卡片、读取独立详情页或受控 direct fetch 结果，并返回经过 shared Zod 契约校验的结果。搜索扫描不 dispatch 合成交互、不点击职位卡片或分页控件，也不读取 live detail panel 兜底。
+- 搜索卡片的 query-bearing 原始请求 URL 只保存在 content session 内存 Map，以 `sessionId + sourceJobId` 解析；跨 context 的消息、Bridge、diagnostics 和 SQLite 只接收无 query/hash 的 canonical URL。搜索详情必须走 strict identity：Job ID 精确匹配且标题/公司没有明确冲突；独立详情页保留兼容身份校验。
 - BOSS Selector 全部位于 `packages/boss-adapter`；Bridge 不读取或操作 DOM。
-- 相邻 BOSS 请求以 1800ms 为基础加入不超过 ±20% 抖动；单职位临时网络失败最多重试 1 次。
-- `detailTimeoutMs` 分别控制详情 `fetch` 和实时面板等待。每次尝试只回传脱敏 URL、HTTP 状态、页面类型、详情容器、缺失字段、读取来源和有限身份信号；不保存整页 HTML。用户取消、超时、普通网络错误、身份失败和页面阻断是不同契约结果。
+- 每次真实 BOSS fetch 都由 content session 内同一个 gate 控制：并发 1，以 1800ms 为基础加入不超过 ±20% 抖动，接受 AbortSignal 和绝对 round deadline；单职位临时网络失败的唯一一次 retry 必须重新取得许可。
+- `detailTimeoutMs` 控制单次 direct fetch。每次尝试只回传脱敏 URL、HTTP 状态、页面类型、详情容器、缺失字段、读取来源和有限身份信号；不保存整页 HTML。用户取消、round deadline、超时、普通网络错误、身份失败和页面阻断是不同契约结果。
+- `login_required`、`challenge` 和 `account_risk` 在 Content Script 与 ScanController 两端都是 sticky fatal latch。DOM 监控覆盖节点、属性和 Text.data 变化。Content Script 通过最小 runtime event 主动通知，立即中止 gate 等待或在途操作并清空 locator；cancel/end 在清理前最后校验 fatal 与 queryScope，迟到的旧 end 不能清除新 session。直到 endSession 都不能继续保存、筛选或调用 AI。`unsupported_layout` 和 `empty_page` 不伪装为账号风险事件。
 
 ## 扫描流程
 
-1. ScanController 在 Bridge 创建 `running` scan run，再识别当前页面和搜索来源摘要。
+1. ScanController 先在初始标签页建立 content session，再在 Bridge 创建 `running` scan run 并识别当前页面；后续所有 content 消息固定发送到该标签页。
 2. 登录失效、challenge、账号风险和搜索页整体无法识别会立即停止；其他单职位错误隔离后继续。详情 Parser 至少尝试 8 个样本且同类错误比例达到 75% 才判定整体失效；停止前已成功保存且通过完整硬规则的职位仍执行 AI 评估。
 3. Content Script 读取卡片，ScanController 仅做本轮页内去重；Bridge 的 `/jobs/observe` 根据 SQLite 判断职位是新职位、卡片变化/详情缺失需要重读，还是输入未变化可直接复用。
 4. Bridge 对已存在职位更新 `last_seen_at`、`last_scan_run_id` 和 `source_query`。可复用职位不重复读取详情；当前完整硬规则记录与 cache key 命中时直接返回已保存结果。
 5. 新职位或需要更新的职位先做列表预筛，再由 Content Script 串行读取详情并校验身份。Bridge 保存详情时维护 `first_seen_at`、`last_seen_at` 和 `jd_hash`。
 6. 完整硬规则结果独立写入 `screenings`。详情输入变化后重新筛选和评估；未变化但规则变化时先用已保存详情重建硬规则，阻断后不调用 AI；profile、Prompt、模型或评估结构版本变化时允许重新评估，不要求再次读取 DOM。
-7. 达到页数/新增职位预算、连续两页无新增、没有下一页、用户取消或 10 分钟轮次上限时结束。预算型停止为 `completed`；用户取消为 `cancelled`；上下文断开为 `interrupted`；安全阻断、Parser 整体失效或不可恢复错误为 `failed`。
+7. 当前页全部职位处理完成时使用 `completed/current_page_complete`；达到新增职位预算或 10 分钟绝对截止时间时使用对应预算原因提前 `completed`。用户取消为 `cancelled`；scope/generation/标签页上下文断开为 `interrupted`；账号安全阻断、Parser 整体失效或不可恢复错误为 `failed`。
 
 ## Bridge 与 SQLite
 
@@ -57,7 +60,8 @@ Bridge 只绑定 `127.0.0.1`，启动时读取 `CAREER_OPS_CN_TOKEN`。`GET /hea
 - `evaluations` 保存结果以及 `jd_hash`、`profile_hash`、`rules_hash`、`prompt_version`、`model_id`、`evaluation_schema_version`、`input_hash/cache_key`、创建时间和可靠测得的延迟。
 - `candidate_records` 每职位保存可为空的用户判断、备注、投递状态和更新时间；旧 `decisions` 表在启动迁移后删除。
 - cache key 来自实际 JobDetail 与全部版本元数据；相同 key 直接复用。JD、规则、profile、Prompt、模型或输出结构任一变化都会形成新 key。
-- diagnostics 写入失败不得改变职位保存、筛选、评估或 run 业务结果。
+- diagnostics 写入失败不得改变职位保存、筛选、评估或 run 业务结果；最终 run 写入失败同样不得把本地账号 fatal 从 `failed` 降级为 `interrupted`。
+- 初始化迁移会在幂等事务内清除旧 `jobs.url/normalized_url` 的 userinfo/query/hash，并重新脱敏历史 diagnostics 的文本和 details；新旧数据遵守同一隐私边界。
 
 ### 固定清理规则
 
@@ -74,5 +78,7 @@ Prompt 只使用已经通过 shared Schema 的 BOSS JobDetail，要求模型生�
 ## 边界与非目标
 
 当前只支持 BOSS 直聘，不包含自动投递、自动打招呼、自动聊天、联系方式操作、验证码绕过、真人轨迹模拟、其他招聘平台、跨设备同步、用户系统、简历生成、任务队列、插件系统或远程 Bridge。
+
+仓库当前缺少经过审查的 `fixtures/boss/network/` 证据，因此没有 MAIN-world network observer、通用响应分类器、模板学习或模板重放 entrypoint。这些能力只能在后续证据门通过后单独设计；当前实现不得猜测 endpoint 或响应字段。
 
 BOSS 列表不暴露完整 JD，因此卡片输入完全不变时会优先满足“不重复读取”；若站点只修改远端 JD 而不改变任何列表字段，只能在后续显式获得新详情时识别 `jd_hash` 变化。
