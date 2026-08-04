@@ -55,7 +55,7 @@ export interface DetailScanGovernance {
 
 export interface ContentClient {
   beginSession(signal?: AbortSignal): Promise<BossScanSession>;
-  endSession(): Promise<boolean>;
+  endSession(signal?: AbortSignal): Promise<boolean>;
   onFatalBlock(listener: (event: BossFatalBlockEvent) => void): () => void;
   onSessionInvalidated(
     listener: (event: BossSessionInvalidatedEvent) => void,
@@ -71,7 +71,7 @@ export interface ContentClient {
     signal?: AbortSignal,
     governance?: DetailScanGovernance,
   ): Promise<StartDetailScanResponse>;
-  cancelDetailScan(): Promise<boolean>;
+  cancelDetailScan(signal?: AbortSignal): Promise<boolean>;
 }
 
 export class ContentClientError extends Error {
@@ -412,33 +412,42 @@ export function createContentClient(
       }
     },
 
-    async endSession() {
+    async endSession(signal) {
       const session = activeSession;
       if (session === null) {
         return false;
       }
       try {
-        const response = await tabs.sendMessage(
-          session.tabId,
-          EndBossSessionRequestSchema.parse({
-            type: 'boss/end-session/request',
-            sessionId: session.sessionId,
-            generation: session.generation,
-          }),
+        const response = await withAbort(
+          tabs.sendMessage(
+            session.tabId,
+            EndBossSessionRequestSchema.parse({
+              type: 'boss/end-session/request',
+              sessionId: session.sessionId,
+              generation: session.generation,
+            }),
+          ),
+          signal,
         );
-        const sessionError = BossSessionErrorResponseSchema.safeParse(response);
-        if (sessionError.success) {
-          return false;
-        }
+        parseSessionControlResponse(response);
         return EndBossSessionResponseSchema.parse(response).ended;
-      } catch {
+      } catch (error) {
+        if (
+          isSignalAborted(signal) ||
+          error instanceof BossFatalBlockError ||
+          error instanceof ContentContextChangedError
+        ) {
+          throw isSignalAborted(signal) ? abortReason(signal) : error;
+        }
         return false;
       } finally {
-        activeSession = null;
-        stickyFatal = null;
-        pendingFatal = null;
-        stickyInvalidation = null;
-        pendingInvalidation = null;
+        if (matchesActiveSession(session)) {
+          activeSession = null;
+          stickyFatal = null;
+          pendingFatal = null;
+          stickyInvalidation = null;
+          pendingInvalidation = null;
+        }
         removeRuntimeListenerIfUnused();
       }
     },
@@ -546,23 +555,33 @@ export function createContentClient(
       }
     },
 
-    async cancelDetailScan() {
+    async cancelDetailScan(signal) {
       const session = activeSession;
       if (session === null) {
         return false;
       }
       try {
-        const response = await tabs.sendMessage(
-          session.tabId,
-          CancelDetailScanRequestSchema.parse({
-            type: 'boss/cancel-detail-scan/request',
-            sessionId: session.sessionId,
-            generation: session.generation,
-          }),
+        const response = await withAbort(
+          tabs.sendMessage(
+            session.tabId,
+            CancelDetailScanRequestSchema.parse({
+              type: 'boss/cancel-detail-scan/request',
+              sessionId: session.sessionId,
+              generation: session.generation,
+            }),
+          ),
+          signal,
         );
         parseSessionControlResponse(response);
         return CancelDetailScanResponseSchema.parse(response).cancelled;
-      } catch {
+      } catch (error) {
+        if (
+          isSignalAborted(signal) ||
+          error instanceof BossFatalBlockError ||
+          error instanceof ContentContextChangedError
+        ) {
+          throw isSignalAborted(signal) ? abortReason(signal) : error;
+        }
         return false;
       }
     },

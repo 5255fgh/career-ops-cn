@@ -148,11 +148,59 @@ describe('BossContentLocatorStore', () => {
       ),
     ).toBe(false);
 
-    expect(store.endSession(session)).toBe(true);
+    expect(store.endSession(session, 'boss:/web/geek/jobs')).toEqual({
+      status: 'fatal',
+      event: {
+        type: 'boss/fatal-block/event',
+        sessionId: 'session-1',
+        generation: 'generation-1',
+        reason: 'challenge',
+      },
+    });
     const next = store.beginSession('session-2', 'boss:/web/geek/jobs');
     expect(store.validate(next, 'boss:/web/geek/jobs')).toMatchObject({
       status: 'ok',
     });
+  });
+
+  it('endSession 原子校验 queryScope 后再清理，并返回最终 invalidation', () => {
+    const store = new BossContentLocatorStore(
+      'https://www.zhipin.com',
+      'generation-1',
+    );
+    const session = store.beginSession(
+      'session-1',
+      'boss:/web/geek/job?query=TypeScript',
+    );
+
+    expect(
+      store.endSession(session, 'boss:/web/geek/job?query=Java'),
+    ).toEqual({ status: 'context_changed' });
+    expect(
+      store.validate(session, 'boss:/web/geek/job?query=TypeScript'),
+    ).toEqual({ status: 'context_changed' });
+  });
+
+  it('迟到的旧 endSession 不会清除已经开始的新 session', () => {
+    const store = new BossContentLocatorStore(
+      'https://www.zhipin.com',
+      'generation-1',
+    );
+    const oldSession = store.beginSession(
+      'session-old',
+      'boss:/web/geek/jobs',
+    );
+    const currentSession = store.beginSession(
+      'session-current',
+      'boss:/web/geek/jobs',
+    );
+
+    expect(
+      store.endSession(oldSession, 'boss:/web/geek/jobs'),
+    ).toEqual({ status: 'stale' });
+    expect(
+      store.validate(currentSession, 'boss:/web/geek/jobs'),
+    ).toMatchObject({ status: 'ok' });
   });
 
   it.each([

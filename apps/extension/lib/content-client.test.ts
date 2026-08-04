@@ -353,6 +353,78 @@ describe('Content client', () => {
     expect(sendMessage).toHaveBeenCalledTimes(2);
   });
 
+  it('endSession 返回 fatal 时保留账号安全终态并释放本地 session', async () => {
+    const sendMessage = vi.fn<TabsClient['sendMessage']>(
+      async (_tabId, message) => {
+        if ((message as { type?: string }).type === 'boss/begin-session/request') {
+          return {
+            type: 'boss/begin-session/response',
+            sessionId: 'session-end-fatal',
+            generation: 'generation-end-fatal',
+            queryScope: 'boss:/web/geek/jobs',
+          };
+        }
+        return {
+          type: 'boss/fatal-block/event',
+          sessionId: 'session-end-fatal',
+          generation: 'generation-end-fatal',
+          reason: 'account_risk',
+        };
+      },
+    );
+    const client = createContentClient(
+      { query: async () => [{ id: 15 }], sendMessage },
+      noopRuntime,
+      () => 'session-end-fatal',
+    );
+    const fatalListener = vi.fn();
+    client.onFatalBlock(fatalListener);
+    await client.beginSession();
+
+    await expect(client.endSession()).rejects.toMatchObject({
+      name: 'BossFatalBlockError',
+      reason: 'account_risk',
+    });
+    expect(fatalListener).toHaveBeenCalledOnce();
+    await expect(client.beginSession()).resolves.toMatchObject({
+      sessionId: 'session-end-fatal',
+    });
+  });
+
+  it('endSession 返回 context_changed 时抛出明确中断并释放本地 session', async () => {
+    const sendMessage = vi.fn<TabsClient['sendMessage']>(
+      async (_tabId, message) => {
+        if ((message as { type?: string }).type === 'boss/begin-session/request') {
+          return {
+            type: 'boss/begin-session/response',
+            sessionId: 'session-end-context',
+            generation: 'generation-end-context',
+            queryScope: 'boss:/web/geek/jobs',
+          };
+        }
+        return {
+          type: 'boss/session-error/response',
+          sessionId: 'session-end-context',
+          generation: 'generation-end-context',
+          reason: 'context_changed',
+        };
+      },
+    );
+    const client = createContentClient(
+      { query: async () => [{ id: 16 }], sendMessage },
+      noopRuntime,
+      () => 'session-end-context',
+    );
+    await client.beginSession();
+
+    await expect(client.endSession()).rejects.toBeInstanceOf(
+      ContentContextChangedError,
+    );
+    await expect(client.beginSession()).resolves.toMatchObject({
+      sessionId: 'session-end-context',
+    });
+  });
+
   it('固定 tab reload 或断开时形成主动中断并禁止后续消息', async () => {
     const runtime = runtimeHarness();
     const sendMessage = vi.fn<TabsClient['sendMessage']>(async (_tabId, message) => {

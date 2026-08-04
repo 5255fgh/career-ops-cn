@@ -45,6 +45,7 @@ export const DEFAULT_SCAN_CONFIG: ScanConfig = Object.freeze({
 const PARSER_FAILURE_MIN_ATTEMPTS = 8;
 const PARSER_FAILURE_RATIO = 0.75;
 const DIAGNOSTIC_TIMEOUT_MS = 2_000;
+const CONTROL_TIMEOUT_MS = 2_000;
 
 export type ScanStatus =
   | 'idle'
@@ -159,6 +160,20 @@ function roundTimeoutError(): DOMException {
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : '扫描流程发生未知错误。';
+}
+
+async function withControlTimeout<T>(
+  operation: (signal: AbortSignal) => Promise<T>,
+): Promise<T> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => {
+    controller.abort(new DOMException('控制请求超时。', 'TimeoutError'));
+  }, CONTROL_TIMEOUT_MS);
+  try {
+    return await operation(controller.signal);
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 function visibleCardFromDetail(detail: JobDetail): VisibleJobCard {
@@ -328,7 +343,10 @@ export class ScanController {
   private readonly content: ContentClient;
   private readonly bridge: BridgeClient;
   private readonly listeners = new Set<ScanStateListener>();
+  private activeRunToken: symbol | null = null;
   private abortController: AbortController | null = null;
+  private pendingContentCancellation: Promise<void> | null = null;
+  private pendingControlOperation: Promise<void> | null = null;
   private currentScanId: string | null = null;
   private sourceQuery = 'boss:unknown';
   private diagnosticError: string | null = null;
@@ -366,7 +384,11 @@ export class ScanController {
   }
 
   restore(snapshot: ScanRunSnapshot): void {
-    if (ACTIVE_STATUSES.has(this.currentState.status)) {
+    if (
+      this.activeRunToken !== null ||
+      this.pendingControlOperation !== null ||
+      ACTIVE_STATUSES.has(this.currentState.status)
+    ) {
       return;
     }
     this.currentScanId = snapshot.run.status === 'running' ? snapshot.run.id : null;
@@ -407,31 +429,38 @@ export class ScanController {
   private async persistRun(
     phase: ScanRunPhase,
     status: ScanRunStatus = 'running',
+    runId: string | null = this.currentScanId,
+    signal?: AbortSignal,
   ): Promise<void> {
-    if (this.currentScanId === null) {
+    if (runId === null) {
       return;
     }
     const progress = this.currentState.progress;
-    const run = await this.bridge.updateScanRun(this.currentScanId, {
-      status,
-      phase: status === 'running' ? phase : 'finished',
-      pageCount: progress.pagesVisited,
-      discoveredCount: progress.listJobs,
-      newJobCount: progress.newJobs,
-      detailSuccessCount: progress.detailSuccess,
-      detailFailureCount: progress.detailFailure,
-      aiSuccessCount: progress.aiSuccess,
-      aiFailureCount: progress.aiFailure,
-      cacheHitCount: progress.cacheHits,
-      ...(this.currentState.stopReason === null
-        ? { stopReason: null }
-        : { stopReason: this.currentState.stopReason }),
-      ...(this.runErrorSummary() === null
-        ? { errorSummary: null }
-        : { errorSummary: this.runErrorSummary() }),
-    });
+    const run = await this.bridge.updateScanRun(
+      runId,
+      {
+        status,
+        phase: status === 'running' ? phase : 'finished',
+        pageCount: progress.pagesVisited,
+        discoveredCount: progress.listJobs,
+        newJobCount: progress.newJobs,
+        detailSuccessCount: progress.detailSuccess,
+        detailFailureCount: progress.detailFailure,
+        aiSuccessCount: progress.aiSuccess,
+        aiFailureCount: progress.aiFailure,
+        cacheHitCount: progress.cacheHits,
+        ...(this.currentState.stopReason === null
+          ? { stopReason: null }
+          : { stopReason: this.currentState.stopReason }),
+        ...(this.runErrorSummary() === null
+          ? { errorSummary: null }
+          : { errorSummary: this.runErrorSummary() }),
+      },
+      signal ?? (status === 'running' ? this.abortController?.signal : undefined),
+    );
     if (
       status === 'running' &&
+      this.currentScanId === runId &&
       this.abortController !== null &&
       !this.abortController.signal.aborted &&
       (run.cancelRequested || run.status !== 'running')
@@ -443,10 +472,7 @@ export class ScanController {
     }
   }
 
-  private async finalizeRun(): Promise<void> {
-    if (this.currentScanId === null) {
-      return;
-    }
+  private async finalizeRun(runId: string): Promise<void> {
     const status: ScanRunStatus =
       this.currentState.status === 'completed'
         ? 'completed'
@@ -456,13 +482,11 @@ export class ScanController {
             ? 'interrupted'
             : 'failed';
     try {
-      await this.persistRun('finished', status);
+      await withControlTimeout((signal) =>
+        this.persistRun('finished', status, runId, signal),
+      );
     } catch (error) {
       this.addWarning(`scan run 最终状态写入失败：${errorMessage(error)}`);
-      this.update({
-        status: 'interrupted',
-        error: `Bridge 权威状态写入失败：${errorMessage(error)}`,
-      });
     }
   }
 
@@ -512,7 +536,8 @@ export class ScanController {
   private async diagnose(
     event: Omit<DiagnosticEventRequest, 'source' | 'scanId'>,
   ): Promise<void> {
-    if (this.currentScanId === null || this.diagnosticError !== null) {
+    const scanId = this.currentScanId;
+    if (scanId === null || this.diagnosticError !== null) {
       return;
     }
 
@@ -530,7 +555,7 @@ export class ScanController {
         this.bridge.recordDiagnostic(
           {
             source: 'extension',
-            scanId: this.currentScanId,
+            scanId,
             ...event,
           },
           controller.signal,
@@ -544,6 +569,47 @@ export class ScanController {
       clearTimeout(timer);
       rejectTimeout = undefined;
     }
+  }
+
+  private async endContentSession(): Promise<boolean> {
+    try {
+      return await withControlTimeout((signal) =>
+        this.content.endSession(signal),
+      );
+    } catch (error) {
+      if (error instanceof BossFatalBlockError) {
+        this.latchFatal(error.reason);
+      } else if (error instanceof ContentContextChangedError) {
+        this.interruptionRequested = true;
+      } else {
+        this.addWarning(`Content session 清理失败：${errorMessage(error)}`);
+      }
+      return false;
+    }
+  }
+
+  private async cancelContentDetail(): Promise<void> {
+    try {
+      await withControlTimeout((signal) =>
+        this.content.cancelDetailScan(signal),
+      );
+    } catch (error) {
+      if (error instanceof BossFatalBlockError) {
+        this.latchFatal(error.reason);
+      } else if (error instanceof ContentContextChangedError) {
+        this.interruptionRequested = true;
+      } else {
+        this.addWarning(`Content 取消请求失败：${errorMessage(error)}`);
+      }
+    }
+  }
+
+  private requestContentCancellation(): Promise<void> {
+    if (this.pendingContentCancellation !== null) {
+      return this.pendingContentCancellation;
+    }
+    this.pendingContentCancellation = this.cancelContentDetail();
+    return this.pendingContentCancellation;
   }
 
   private async readDetailWithRetry(
@@ -796,6 +862,24 @@ export class ScanController {
   }
 
   async run(options: ScanRunOptions = {}): Promise<ScanState> {
+    if (
+      this.activeRunToken !== null ||
+      this.pendingControlOperation !== null
+    ) {
+      throw new Error('上一轮扫描仍在清理中。');
+    }
+    const token = Symbol('scan-run');
+    this.activeRunToken = token;
+    try {
+      return await this.executeRun(options);
+    } finally {
+      if (this.activeRunToken === token) {
+        this.activeRunToken = null;
+      }
+    }
+  }
+
+  private async executeRun(options: ScanRunOptions): Promise<ScanState> {
     if (ACTIVE_STATUSES.has(this.currentState.status)) {
       throw new Error('扫描已在进行中。');
     }
@@ -807,6 +891,7 @@ export class ScanController {
 
     const controller = new AbortController();
     this.abortController = controller;
+    this.pendingContentCancellation = null;
     this.currentScanId = null;
     this.sourceQuery = 'boss:unknown';
     this.diagnosticError = null;
@@ -847,7 +932,7 @@ export class ScanController {
       this.assertRoundSafe(controller.signal);
     } catch (error) {
       clearTimeout(deadlineTimer);
-      await this.content.endSession().catch(() => false);
+      await this.endContentSession();
       removeFatalListener();
       removeSessionInvalidatedListener();
       if (
@@ -882,16 +967,19 @@ export class ScanController {
       if (this.abortController === controller) {
         this.abortController = null;
       }
+      this.pendingContentCancellation = null;
       return this.currentState;
     }
 
+    let runId: string | null = null;
     try {
       const createdRun = await this.bridge.createScanRun(controller.signal);
-      this.currentScanId = createdRun.id;
-      this.update({ runId: createdRun.id });
+      runId = createdRun.id;
+      this.currentScanId = runId;
+      this.update({ runId });
     } catch (error) {
       clearTimeout(deadlineTimer);
-      await this.content.endSession().catch(() => false);
+      await this.endContentSession();
       removeFatalListener();
       removeSessionInvalidatedListener();
       if (
@@ -923,6 +1011,7 @@ export class ScanController {
         });
       }
       this.abortController = null;
+      this.pendingContentCancellation = null;
       return this.currentState;
     }
 
@@ -1544,7 +1633,15 @@ export class ScanController {
       }
     } finally {
       clearTimeout(deadlineTimer);
-      const sessionEnded = await this.content.endSession().catch(() => false);
+      if (
+        this.currentState.status === 'cancelled' ||
+        this.currentState.status === 'interrupted'
+      ) {
+        await this.requestContentCancellation();
+      } else {
+        await this.pendingContentCancellation;
+      }
+      const sessionEnded = await this.endContentSession();
       if (this.fatalReason !== null) {
         this.stop(
           this.fatalReason,
@@ -1559,13 +1656,17 @@ export class ScanController {
           stopReason: null,
         });
       }
-      await this.finalizeRun();
+      if (runId !== null) {
+        await this.finalizeRun(runId);
+      }
       removeFatalListener();
       removeSessionInvalidatedListener();
       if (this.abortController === controller) {
         this.abortController = null;
       }
-      this.currentScanId = null;
+      if (this.currentScanId === runId) {
+        this.currentScanId = null;
+      }
     }
     return this.currentState;
   }
@@ -1575,28 +1676,58 @@ export class ScanController {
       return;
     }
     const runId = this.currentScanId ?? this.currentState.runId;
+    const hadActiveController = this.abortController !== null;
+    this.abortController?.abort(abortError());
+    if (this.fatalReason === null) {
+      this.update({ status: 'cancelled', error: null, stopReason: null });
+    }
+
     const diagnostic = this.diagnose({
       level: 'warning',
       event: 'cancel_requested',
       outcome: 'requested',
     });
-    if (runId !== null) {
-      try {
-        await this.bridge.requestScanRunCancel(runId);
-      } catch (error) {
-        this.addWarning(`取消标志写入失败：${errorMessage(error)}`);
+    const persistCancellation =
+      runId === null
+        ? Promise.resolve()
+        : withControlTimeout((signal) =>
+            this.bridge.requestScanRunCancel(runId, signal),
+          )
+            .then(() => undefined)
+            .catch((error: unknown) => {
+              this.addWarning(`取消标志写入失败：${errorMessage(error)}`);
+            });
+    const controlOperation = Promise.all([
+      diagnostic,
+      persistCancellation,
+      this.requestContentCancellation(),
+    ]).then(() => undefined);
+    this.pendingControlOperation = controlOperation;
+    try {
+      await controlOperation;
+    } finally {
+      if (this.pendingControlOperation === controlOperation) {
+        this.pendingControlOperation = null;
       }
     }
-    const hadActiveController = this.abortController !== null;
-    this.abortController?.abort(abortError());
-    this.update({ status: 'cancelled', error: null, stopReason: null });
-    await Promise.all([
-      diagnostic,
-      this.content.cancelDetailScan().catch(() => undefined),
-    ]);
-    if (!hadActiveController && this.currentScanId !== null) {
-      await this.finalizeRun();
-      this.currentScanId = null;
+    if (this.fatalReason !== null) {
+      this.stop(
+        this.fatalReason,
+        `页面已停止扫描：${this.fatalReason}`,
+      );
+    } else if (this.interruptionRequested) {
+      this.update({
+        status: 'interrupted',
+        error: '扫描上下文已改变。',
+        stopReason: null,
+      });
+    }
+    if (!hadActiveController && runId !== null) {
+      await this.finalizeRun(runId);
+      if (this.currentScanId === runId) {
+        this.currentScanId = null;
+      }
+      this.pendingContentCancellation = null;
     }
   }
 
@@ -1615,20 +1746,39 @@ export class ScanController {
     const persistInterruption =
       runId === null
         ? Promise.resolve()
-        : this.bridge
-            .interruptScanRun(runId, {
-              reason,
-              errorSummary:
-                this.runErrorSummary() ?? '浏览器侧扫描上下文已关闭。',
-            })
+        : withControlTimeout((signal) =>
+            this.bridge.interruptScanRun(
+              runId,
+              {
+                reason,
+                errorSummary:
+                  this.runErrorSummary() ?? '浏览器侧扫描上下文已关闭。',
+              },
+              signal,
+            ),
+          )
             .then(() => undefined)
             .catch((error: unknown) => {
               this.addWarning(`interrupted 状态写入失败：${errorMessage(error)}`);
             });
-    await Promise.all([
+    const controlOperation = Promise.all([
       persistInterruption,
-      this.content.cancelDetailScan().catch(() => undefined),
-    ]);
+      this.requestContentCancellation(),
+    ]).then(() => undefined);
+    this.pendingControlOperation = controlOperation;
+    try {
+      await controlOperation;
+    } finally {
+      if (this.pendingControlOperation === controlOperation) {
+        this.pendingControlOperation = null;
+      }
+    }
+    if (this.fatalReason !== null) {
+      this.stop(
+        this.fatalReason,
+        `页面已停止扫描：${this.fatalReason}`,
+      );
+    }
   }
 
   recordCandidate(candidate: CandidateRecord): void {

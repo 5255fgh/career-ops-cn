@@ -74,7 +74,7 @@ describe("SQLite migration", () => {
       ) VALUES (
         'legacy-job', 'boss', 'legacy-1', '前端工程师', '示例科技',
         '20-30K', '上海', '负责 TypeScript 与 React 开发。',
-        'https://www.zhipin.com/job_detail/legacy-1.html?ka=legacy'
+        'https://legacy-user:legacy-pass@www.zhipin.com/job_detail/legacy-1.html?ka=legacy'
       );
 
       INSERT INTO evaluations (
@@ -91,8 +91,18 @@ describe("SQLite migration", () => {
 
       INSERT INTO decisions (job_id, decision, reason, outcome)
       VALUES ('legacy-job', 'apply', '旧备注', 'applied');
+
+      INSERT INTO diagnostics (
+        id, created_at, source, level, event, message, details_json
+      ) VALUES (
+        'legacy-diagnostic', '2026-08-01T10:00:00.000Z', 'extension',
+        'warning', 'legacy locator',
+        'legacy https://legacy-user:legacy-pass@www.zhipin.com/job_detail/legacy-1.html?securityId=legacy-secret Cookie: sid=legacy-cookie',
+        '{"originalDetailUrl":"https://legacy-user:legacy-pass@www.zhipin.com/job_detail/legacy-1.html?securityId=legacy-secret","securityId":"legacy-secret","note":"Cookie: sid=legacy-cookie","nested":{"token":"legacy-token"}}'
+      );
     `);
 
+    expect(() => initializeDatabase(database)).not.toThrow();
     expect(() => initializeDatabase(database)).not.toThrow();
 
     const tables = database
@@ -136,6 +146,7 @@ describe("SQLite migration", () => {
 
     expect(findJob(database, "legacy-job")).toMatchObject({
       id: "legacy-job",
+      url: "https://www.zhipin.com/job_detail/legacy-1.html",
       firstSeenAt: expect.any(String),
       lastSeenAt: expect.any(String),
       jdHash: expect.stringMatching(/^[a-f0-9]{64}$/u),
@@ -157,6 +168,17 @@ describe("SQLite migration", () => {
         .prepare("SELECT count(*) AS count FROM evaluations WHERE job_id = ?")
         .get("legacy-job"),
     ).toEqual({ count: 3 });
+    const legacyDiagnostic = database
+      .prepare(
+        "SELECT event, message, details_json FROM diagnostics WHERE id = ?",
+      )
+      .get("legacy-diagnostic");
+    expect(JSON.stringify(legacyDiagnostic)).toContain(
+      "https://www.zhipin.com/job_detail/legacy-1.html",
+    );
+    expect(JSON.stringify(legacyDiagnostic)).not.toMatch(
+      /legacy-user|legacy-pass|securityId|legacy-secret|legacy-cookie|legacy-token/iu,
+    );
   });
 });
 
@@ -167,7 +189,8 @@ describe("SQLite 隐私边界", () => {
     initializeDatabase(database);
     const canonicalUrl =
       "https://www.zhipin.com/job_detail/boss-safe-1.html";
-    const rawUrl = `${canonicalUrl}?securityId=volatile#detail`;
+    const rawUrl =
+      "https://user:password@www.zhipin.com/job_detail/boss-safe-1.html?securityId=volatile#detail";
 
     saveJob(database, {
       source: "boss",
@@ -200,7 +223,7 @@ describe("SQLite 隐私边界", () => {
       .get() as { message: string; details_json: string };
     expect(JSON.stringify(diagnostic)).toContain(canonicalUrl);
     expect(JSON.stringify(diagnostic)).not.toMatch(
-      /securityId|sid=secret|secret response|token-secret/iu,
+      /user|password|securityId|sid=secret|secret response|token-secret/iu,
     );
   });
 });

@@ -46,6 +46,8 @@ export interface SidePanelViewProps {
   exportMessage: string;
   diagnostics: DiagnosticEvent[];
   diagnosticsError: string;
+  browserSessionBusy: boolean;
+  localScanSessionActive: boolean;
   onTokenChange(value: string): void;
   onSaveConnection: FormEventHandler<HTMLFormElement>;
   onRefreshPage(): void;
@@ -158,6 +160,8 @@ function stopReasonLabel(
       return '页面布局不支持';
     case 'empty_page':
       return '当前页为空';
+    default:
+      return value;
   }
 }
 
@@ -201,9 +205,14 @@ export function SidePanelView(props: SidePanelViewProps) {
               value={props.tokenDraft}
               autoComplete="off"
               placeholder="输入本机 Bridge token"
+              disabled={isScanning || props.browserSessionBusy}
               onChange={(event) => props.onTokenChange(event.target.value)}
             />
-            <button className="button button-secondary" type="submit">
+            <button
+              className="button button-secondary"
+              type="submit"
+              disabled={isScanning || props.browserSessionBusy}
+            >
               保存并检查
             </button>
           </div>
@@ -221,7 +230,12 @@ export function SidePanelView(props: SidePanelViewProps) {
             <span className="section-index">02</span>
             <h2 id="page-heading">当前页面状态</h2>
           </div>
-          <button className="text-button" type="button" onClick={props.onRefreshPage}>
+          <button
+            className="text-button"
+            type="button"
+            disabled={isScanning || props.browserSessionBusy}
+            onClick={props.onRefreshPage}
+          >
             刷新
           </button>
         </div>
@@ -264,7 +278,11 @@ export function SidePanelView(props: SidePanelViewProps) {
           <button
             className="button button-primary"
             type="button"
-            disabled={isScanning || props.connectionState !== 'online'}
+            disabled={
+              isScanning ||
+              props.browserSessionBusy ||
+              props.connectionState !== 'online'
+            }
             onClick={props.onStartScan}
           >
             {props.scanState.status === 'interrupted' ? '重新开始' : '开始扫描'}
@@ -272,7 +290,10 @@ export function SidePanelView(props: SidePanelViewProps) {
           <button
             className="button button-danger"
             type="button"
-            disabled={!isScanning}
+            disabled={
+              !isScanning ||
+              (props.browserSessionBusy && !props.localScanSessionActive)
+            }
             onClick={props.onCancelScan}
           >
             取消

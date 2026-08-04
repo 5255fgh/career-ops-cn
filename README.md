@@ -21,7 +21,8 @@
 - 职位再次出现会更新 `last_seen_at`、本轮 run 和搜索来源；JD 变化后生成新的 `jd_hash` 并重新执行详情筛选和 AI 评估，不因暂时未出现而删除职位。
 - 候选池分开展示硬规则结果与 AI score、recommendation、结构化摘要字段和完整 raw report。
 - 候选池支持用户判断、备注、投递状态、筛选和排序；当前筛选结果可导出为带 UTF-8 BOM 的 CSV 或完整 JSON。
-- 支持用户取消当前扫描；登录失效、challenge 或账号风险会由 Content Script 主动通知并立即终止整轮，之后不再保存、筛选或调用 AI。
+- 支持用户取消当前扫描；取消会先中止本地 BOSS 请求和 evaluator，再用有界的 best-effort 请求同步 Bridge。旧轮次的 content session 与最终状态清理完成前不能开始新轮次或更换 Bridge token。
+- 登录失效、challenge 或账号风险会由 Content Script 主动通知并立即终止整轮，之后不再保存、筛选或调用 AI；即使最终 Bridge 写入失败，本地账号安全终态也只追加警告，不会降级为普通中断。
 - 扫描过程、职位/JD 映射、取消和错误会尽力写入 SQLite diagnostics；diagnostics 失败只显示警告，不会反转已完成的扫描结果。当前页正常处理完使用 `completed/current_page_complete`，新职位或轮次时间预算提前结束使用各自原因。
 - 单职位超时、字段缺失、身份校验、布局、保存或 AI 失败只影响该职位；详情进度仍继续，所有成功保存且通过完整硬规则的职位仍进入 AI。登录失效、challenge、账号风险和搜索页整体无法识别会立即停止；详情 Parser 只有在至少尝试 8 个职位且同一种错误达到 75% 时才视为整体失效。
 
@@ -114,7 +115,7 @@ pnpm build
 2. 在 BOSS 直聘中完成登录。
 3. 打开一个职位详情页，或打开包含当前可见职位的搜索结果页。
 4. 打开 Career Ops CN Side Panel，输入与 Bridge 一致的 token，点击“保存并检查”。
-5. 点击“刷新”确认页面类型和阻断状态。
+5. 点击“刷新”确认页面类型和阻断状态。“刷新”使用一次独占的短 content session；扫描执行或 session 清理期间，刷新和 Bridge token 重配会暂时禁用。
 6. 点击“开始扫描”。单职位详情页会校验并评估当前职位；搜索页只处理当前可见结果页，不点击职位卡片或翻页。当前页处理完为正常完成；达到 60 个本轮新职位或 10 分钟预算会以对应预算原因提前完成。过程中可随时点击“取消”。
 7. 在“候选池”中分开查看完整硬规则结果和 AI 原始结果；可按用户判断与投递状态筛选，并按最近发现、AI 分数或职位名称排序。
 8. 选择职位后记录 Apply、Review 或 Skip、备注和投递状态，再点击“保存候选池记录”。这些操作只写本机 SQLite，不会在 BOSS 上投递或联系任何人。
@@ -132,7 +133,7 @@ pnpm build
 - 扫描配置：扩展的 `chrome.storage.local`
 - AI 请求：由 Bridge 内置 evaluator 直接发往配置的 OpenAI-compatible endpoint，不落地临时 JobDetail 文件
 
-SQLite 中会保存职位描述和完整 raw report。不要把真实数据库、`.env` 或任何模型凭据提交到仓库。
+SQLite 中会保存职位描述和完整 raw report。不要把真实数据库、`.env` 或任何模型凭据提交到仓库。Bridge 启动迁移会幂等清除旧职位 URL 的 userinfo/query/hash，并重新脱敏历史 diagnostics 中的 URL、Cookie、token、`securityId` 和敏感 details。
 
 固定清理规则：diagnostics 只保留最近 5000 条；成功 run 只保留最近 100 次；失败、取消或中断 run 约 30 天后清理；同一职位只保留最近 3 个评估版本。系统不保存整页原始 HTML。
 

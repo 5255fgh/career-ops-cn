@@ -49,6 +49,12 @@ export type BossContentSessionValidation =
   | { status: 'context_changed' }
   | { status: 'fatal'; event: BossFatalBlockEvent };
 
+export type BossContentSessionTermination =
+  | { status: 'ended' }
+  | { status: 'stale' }
+  | { status: 'context_changed' }
+  | { status: 'fatal'; event: BossFatalBlockEvent };
+
 /*
  * 不要把该结构扩展成通用 URL 注册中心；这里只接受仓库 fixture 已证明的
  * BOSS 详情 URL 形态。
@@ -182,12 +188,26 @@ export class BossContentLocatorStore {
     this.locators.clear();
   }
 
-  endSession(session: BossLocatorSessionRef): boolean {
-    if (!this.matchesActiveSession(session)) {
-      return false;
+  endSession(
+    session: BossLocatorSessionRef,
+    currentQueryScope: string,
+  ): BossContentSessionTermination {
+    const active = this.activeSession;
+    if (!this.matchesActiveSession(session) || active === null) {
+      return { status: 'stale' };
     }
+
+    const result: BossContentSessionTermination =
+      active.invalidated || active.queryScope !== currentQueryScope
+        ? { status: 'context_changed' }
+        : active.fatalReason === null
+          ? { status: 'ended' }
+          : {
+              status: 'fatal',
+              event: this.fatalEvent(active, active.fatalReason),
+            };
     this.clear();
-    return true;
+    return result;
   }
 
   clear(): void {

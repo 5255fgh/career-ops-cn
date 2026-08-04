@@ -45,6 +45,7 @@ import {
   type BossLocatorSessionRef,
 } from '../lib/boss-content-session';
 import { BossRequestGate } from '../lib/boss-request-gate';
+import { observeBossSessionChanges } from '../lib/boss-session-monitor';
 
 function currentSourceQuery(): string {
   const url = new URL(window.location.href);
@@ -214,12 +215,10 @@ export default defineContentScript({
           broadcastFatal(validation.event);
         }
       };
-      fatalObserver = new MutationObserver(check);
-      fatalObserver.observe(document.documentElement, {
-        childList: true,
-        subtree: true,
-        attributes: true,
-      });
+      fatalObserver = observeBossSessionChanges(
+        document.documentElement,
+        check,
+      );
       pageHideListener = () => {
         broadcastSessionInvalidated(session);
       };
@@ -248,8 +247,12 @@ export default defineContentScript({
 
       const endRequest = EndBossSessionRequestSchema.safeParse(message);
       if (endRequest.success) {
-        const ended = locatorStore.endSession(endRequest.data);
-        if (!ended) {
+        latchVisibleFatal();
+        const termination = locatorStore.endSession(
+          endRequest.data,
+          currentSourceQuery(),
+        );
+        if (termination.status === 'stale') {
           return BossSessionErrorResponseSchema.parse({
             type: 'boss/session-error/response',
             sessionId: endRequest.data.sessionId,
@@ -261,6 +264,17 @@ export default defineContentScript({
         requestGate = null;
         activeOperationController?.abort();
         activeOperationController = null;
+        if (termination.status === 'fatal') {
+          return termination.event;
+        }
+        if (termination.status === 'context_changed') {
+          return BossSessionErrorResponseSchema.parse({
+            type: 'boss/session-error/response',
+            sessionId: endRequest.data.sessionId,
+            generation: endRequest.data.generation,
+            reason: 'context_changed',
+          });
+        }
         return EndBossSessionResponseSchema.parse({
           type: 'boss/end-session/response',
           ended: true,
@@ -423,17 +437,9 @@ export default defineContentScript({
 
       const cancelRequest = CancelDetailScanRequestSchema.safeParse(message);
       if (cancelRequest.success) {
-        const validation = locatorStore.validate(
-          cancelRequest.data,
-          currentSourceQuery(),
-        );
-        if (validation.status === 'context_changed') {
-          return BossSessionErrorResponseSchema.parse({
-            type: 'boss/session-error/response',
-            sessionId: cancelRequest.data.sessionId,
-            generation: cancelRequest.data.generation,
-            reason: 'context_changed',
-          });
+        const control = sessionControlResponse(cancelRequest.data);
+        if (control !== null) {
+          return control;
         }
         const cancelled = activeOperationController !== null;
         activeOperationController?.abort();

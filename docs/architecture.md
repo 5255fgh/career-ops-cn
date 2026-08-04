@@ -8,8 +8,9 @@
 
 - Side Panel 启动时查询 `GET /scan-runs/latest`，用 Bridge 返回的 run 和本轮职位重建阶段、页数、详情/AI 成败、缓存命中、停止原因、硬规则、评估和候选池记录。
 - `ScanController` 负责浏览器侧执行顺序：创建 scan run、读取页面、请求 Bridge 增量判断、串行抓取需要更新的详情、触发筛选/评估，并把绝对计数持续回写 Bridge。
-- 用户取消先在 Bridge 写入取消标志，再中止 Content Script 与 evaluator；控制器在后续进度回写中也会读取取消标志。
-- 每轮开始时只查询一次活动标签页，并把扫描固定到 `{sessionId, tabId, queryScope, generation}`。用户切换活动标签页不会改变目标；原标签页查询条件改变、reload、关闭或 Content Script 断开会把 run 标记为 `interrupted`。Side Panel 关闭时使用 keepalive 请求中断 run；重新开始只新建一轮。
+- 用户取消先同步中止本地 Content Script 与 evaluator，再并发执行有 2 秒上限的 Content/Bridge best-effort 控制请求；控制器在后续进度回写中也会读取取消标志。
+- 每轮开始时只查询一次活动标签页，并把扫描固定到 `{sessionId, tabId, queryScope, generation}`。用户切换活动标签页不会改变目标；原标签页查询条件改变、reload、关闭或 Content Script 断开会把 run 标记为 `interrupted`。Side Panel 关闭时使用 keepalive 请求中断 run；旧轮次 teardown 完成前 run lifecycle lock 拒绝重启，扫描或清理期间也不能替换 Bridge token/controller。
+- Side Panel 的页面状态预览使用独占的短 content session，并在成功或失败后结束；它不会在无 session 时调用 session-only API，也不会与正式扫描共享 locator 所有权。
 - 搜索扫描固定为当前页，预算为最多 60 个本轮新职位、30 次实际评估尝试和约 10 分钟；详情并发固定为 1。`maxPages` 兼容字段只接受 `1`。没有每日 AI 调用上限。
 - 候选池读取 `GET /jobs`，在本地执行用户判断/投递状态筛选与最近发现/AI 分数/职位名称排序；CSV/JSON 导出只序列化当前筛选结果，不触发 BOSS 或 evaluator 操作。
 - Background 只负责扩展生命周期，不保存业务状态，也不承载长任务；模型 API Key 不进入 Extension。
@@ -21,7 +22,7 @@
 - BOSS Selector 全部位于 `packages/boss-adapter`；Bridge 不读取或操作 DOM。
 - 每次真实 BOSS fetch 都由 content session 内同一个 gate 控制：并发 1，以 1800ms 为基础加入不超过 ±20% 抖动，接受 AbortSignal 和绝对 round deadline；单职位临时网络失败的唯一一次 retry 必须重新取得许可。
 - `detailTimeoutMs` 控制单次 direct fetch。每次尝试只回传脱敏 URL、HTTP 状态、页面类型、详情容器、缺失字段、读取来源和有限身份信号；不保存整页 HTML。用户取消、round deadline、超时、普通网络错误、身份失败和页面阻断是不同契约结果。
-- `login_required`、`challenge` 和 `account_risk` 在 Content Script 与 ScanController 两端都是 sticky fatal latch。Content Script 通过最小 runtime event 主动通知，立即中止 gate 等待或在途操作并清空 locator；直到 endSession 都不能继续保存、筛选或调用 AI。`unsupported_layout` 和 `empty_page` 不伪装为账号风险事件。
+- `login_required`、`challenge` 和 `account_risk` 在 Content Script 与 ScanController 两端都是 sticky fatal latch。DOM 监控覆盖节点、属性和 Text.data 变化。Content Script 通过最小 runtime event 主动通知，立即中止 gate 等待或在途操作并清空 locator；cancel/end 在清理前最后校验 fatal 与 queryScope，迟到的旧 end 不能清除新 session。直到 endSession 都不能继续保存、筛选或调用 AI。`unsupported_layout` 和 `empty_page` 不伪装为账号风险事件。
 
 ## 扫描流程
 
@@ -59,7 +60,8 @@ Bridge 只绑定 `127.0.0.1`，启动时读取 `CAREER_OPS_CN_TOKEN`。`GET /hea
 - `evaluations` 保存结果以及 `jd_hash`、`profile_hash`、`rules_hash`、`prompt_version`、`model_id`、`evaluation_schema_version`、`input_hash/cache_key`、创建时间和可靠测得的延迟。
 - `candidate_records` 每职位保存可为空的用户判断、备注、投递状态和更新时间；旧 `decisions` 表在启动迁移后删除。
 - cache key 来自实际 JobDetail 与全部版本元数据；相同 key 直接复用。JD、规则、profile、Prompt、模型或输出结构任一变化都会形成新 key。
-- diagnostics 写入失败不得改变职位保存、筛选、评估或 run 业务结果。
+- diagnostics 写入失败不得改变职位保存、筛选、评估或 run 业务结果；最终 run 写入失败同样不得把本地账号 fatal 从 `failed` 降级为 `interrupted`。
+- 初始化迁移会在幂等事务内清除旧 `jobs.url/normalized_url` 的 userinfo/query/hash，并重新脱敏历史 diagnostics 的文本和 details；新旧数据遵守同一隐私边界。
 
 ### 固定清理规则
 

@@ -14,6 +14,7 @@ import { describe, expect, it, vi } from 'vitest';
 
 import type { BridgeClient } from './bridge-client';
 import {
+  BossFatalBlockError,
   ContentContextChangedError,
   createContentClient,
   type ContentClient,
@@ -409,6 +410,7 @@ describe('ScanController', () => {
     expect(bridge.updateScanRun).toHaveBeenLastCalledWith(
       'scan-1',
       expect.objectContaining({ status: 'interrupted', phase: 'finished' }),
+      expect.any(AbortSignal),
     );
   });
 
@@ -1013,6 +1015,45 @@ describe('ScanController', () => {
     expect(state.stopReason).toBe('account_risk');
   });
 
+  it('endSession 最终返回 fatal 时覆盖普通完成终态', async () => {
+    const content = contentMock([[]]);
+    vi.mocked(content.endSession).mockRejectedValueOnce(
+      new BossFatalBlockError('login_required'),
+    );
+    const bridge = bridgeMock();
+
+    const state = await controller(content, bridge).run();
+
+    expect(state.status).toBe('failed');
+    expect(state.stopReason).toBe('login_required');
+  });
+
+  it('fatal 终态写回 Bridge 失败时只追加警告，不降级为 interrupted', async () => {
+    const content = contentMock([[]]);
+    vi.mocked(content.detectPage).mockResolvedValue({
+      type: 'boss/detect-page/response',
+      pageType: 'challenge',
+      block: { reason: 'challenge', pageType: 'challenge' },
+    });
+    const bridge = bridgeMock();
+    vi.mocked(bridge.updateScanRun).mockImplementation(
+      async (_runId, update) => {
+        if (update.status === 'failed') {
+          throw new Error('Bridge write failed');
+        }
+        return scanRun();
+      },
+    );
+
+    const state = await controller(content, bridge).run();
+
+    expect(state.status).toBe('failed');
+    expect(state.stopReason).toBe('challenge');
+    expect(state.warnings).toContain(
+      'scan run 最终状态写入失败：Bridge write failed',
+    );
+  });
+
   it('旧职位 cache miss 时重建完整硬规则，阻断后不调用 AI', async () => {
     const card = visibleCard(0);
     const content = contentMock([[card]]);
@@ -1158,6 +1199,73 @@ describe('ScanController', () => {
     expect(state.results[1]?.savedJob).toBeUndefined();
   });
 
+  it('用户取消先中止本地详情，再等待 Bridge 的 best-effort 标志', async () => {
+    const card = visibleCard(0);
+    const content = contentMock([[card]]);
+    let detailAborted = false;
+    vi.mocked(content.startDetailScan).mockImplementation(
+      async (_card, _timeout, signal) =>
+        await new Promise((resolve) => {
+          signal?.addEventListener(
+            'abort',
+            () => {
+              detailAborted = true;
+              resolve({
+                type: 'boss/start-detail-scan/response',
+                outcome: 'cancelled',
+              });
+            },
+            { once: true },
+          );
+        }),
+    );
+    const bridge = bridgeMock();
+    let finishBridgeCancellation: (() => void) | undefined;
+    vi.mocked(bridge.requestScanRunCancel).mockImplementation(
+      async () =>
+        await new Promise((resolve) => {
+          finishBridgeCancellation = () =>
+            resolve({ ...scanRun(), cancelRequested: true });
+        }),
+    );
+    const scan = controller(content, bridge);
+    const running = scan.run();
+    await vi.waitFor(() =>
+      expect(content.startDetailScan).toHaveBeenCalledOnce(),
+    );
+
+    const cancelling = scan.cancel();
+
+    expect(detailAborted).toBe(true);
+    expect(scan.state.status).toBe('cancelled');
+    await expect(running).resolves.toMatchObject({ status: 'cancelled' });
+    await expect(scan.run()).rejects.toThrow('上一轮扫描仍在清理中');
+    finishBridgeCancellation?.();
+    await cancelling;
+  });
+
+  it('旧轮次 endSession 完成前拒绝启动新轮次', async () => {
+    const content = contentMock([[]]);
+    let finishEndSession: (() => void) | undefined;
+    vi.mocked(content.endSession)
+      .mockImplementationOnce(
+        async () =>
+          await new Promise<boolean>((resolve) => {
+            finishEndSession = () => resolve(true);
+          }),
+      )
+      .mockResolvedValue(true);
+    const scan = controller(content, bridgeMock());
+    const running = scan.run();
+    await vi.waitFor(() => expect(content.endSession).toHaveBeenCalledOnce());
+
+    await expect(scan.run()).rejects.toThrow('上一轮扫描仍在清理中');
+    finishEndSession?.();
+    await running;
+
+    await expect(scan.run()).resolves.toMatchObject({ status: 'completed' });
+  });
+
   it('Side Panel 关闭时不等待 Content Script 即发出 keepalive 中断写入', async () => {
     const content = contentMock([[]]);
     let finishContentCancellation: (() => void) | undefined;
@@ -1173,10 +1281,14 @@ describe('ScanController', () => {
 
     const interrupted = scan.interrupt('side-panel-closed');
 
-    expect(bridge.interruptScanRun).toHaveBeenCalledWith('scan-1', {
-      reason: 'side-panel-closed',
-      errorSummary: '扫描上下文已关闭，可重新开始并复用已完成结果。',
-    });
+    expect(bridge.interruptScanRun).toHaveBeenCalledWith(
+      'scan-1',
+      {
+        reason: 'side-panel-closed',
+        errorSummary: '扫描上下文已关闭，可重新开始并复用已完成结果。',
+      },
+      expect.any(AbortSignal),
+    );
     finishContentCancellation?.();
     await interrupted;
     expect(scan.state.status).toBe('interrupted');
