@@ -179,7 +179,7 @@ describe('Content client', () => {
     expect(JSON.stringify(startMessage)).not.toContain('securityId');
   });
 
-  it('AbortSignal 会立即结束悬挂消息，并通知 Content Script 停止当前 MutationObserver', async () => {
+  it('AbortSignal 会立即结束悬挂消息，并通知 Content Script 停止当前详情请求', async () => {
     const sendMessage = vi.fn<TabsClient['sendMessage']>(async (_tabId, message) => {
       const type = (message as { type?: string }).type;
       if (type === 'boss/begin-session/request') {
@@ -320,7 +320,7 @@ describe('Content client', () => {
     expect(sendMessage.mock.calls.every(([tabId]) => tabId === 41)).toBe(true);
   });
 
-  it('content 返回 context_changed 或固定 tab 断开时使用明确中断错误', async () => {
+  it('content 返回 context_changed 时使用明确中断错误并形成 sticky latch', async () => {
     const sendMessage = vi.fn<TabsClient['sendMessage']>(async (_tabId, message) => {
       if ((message as { type?: string }).type === 'boss/begin-session/request') {
         return {
@@ -347,11 +347,42 @@ describe('Content client', () => {
     await expect(client.detectPage()).rejects.toBeInstanceOf(
       ContentContextChangedError,
     );
-
-    sendMessage.mockRejectedValueOnce(new Error('Receiving end does not exist'));
     await expect(client.detectPage()).rejects.toBeInstanceOf(
       ContentContextChangedError,
     );
+    expect(sendMessage).toHaveBeenCalledTimes(2);
+  });
+
+  it('固定 tab reload 或断开时形成主动中断并禁止后续消息', async () => {
+    const runtime = runtimeHarness();
+    const sendMessage = vi.fn<TabsClient['sendMessage']>(async (_tabId, message) => {
+      if ((message as { type?: string }).type === 'boss/begin-session/request') {
+        return {
+          type: 'boss/begin-session/response',
+          sessionId: 'session-disconnected',
+          generation: 'generation-disconnected',
+          queryScope: 'boss:/web/geek/jobs',
+        };
+      }
+      throw new Error('Receiving end does not exist');
+    });
+    const client = createContentClient(
+      { query: async () => [{ id: 14 }], sendMessage },
+      runtime.runtime,
+      () => 'session-disconnected',
+    );
+    const invalidatedListener = vi.fn();
+    client.onSessionInvalidated(invalidatedListener);
+    await client.beginSession();
+
+    await expect(client.detectPage()).rejects.toBeInstanceOf(
+      ContentContextChangedError,
+    );
+    await expect(client.detectPage()).rejects.toBeInstanceOf(
+      ContentContextChangedError,
+    );
+    expect(invalidatedListener).toHaveBeenCalledOnce();
+    expect(sendMessage).toHaveBeenCalledTimes(2);
   });
 
   it('匹配 session 的主动 fatal event 形成 client sticky latch', async () => {
@@ -390,5 +421,74 @@ describe('Content client', () => {
     });
     expect(sendMessage).toHaveBeenCalledTimes(1);
     expect(new BossFatalBlockError('challenge')).toBeInstanceOf(ContentClientError);
+  });
+
+  it('匹配 session 的主动 invalidated event 会通知 listener 并形成 sticky latch', async () => {
+    const runtime = runtimeHarness();
+    const sendMessage = vi.fn<TabsClient['sendMessage']>(async (_tabId, message) => {
+      if ((message as { type?: string }).type === 'boss/begin-session/request') {
+        return {
+          type: 'boss/begin-session/response',
+          sessionId: 'session-invalidated',
+          generation: 'generation-invalidated',
+          queryScope: 'boss:/web/geek/jobs',
+        };
+      }
+      return undefined;
+    });
+    const client = createContentClient(
+      { query: async () => [{ id: 12 }], sendMessage },
+      runtime.runtime,
+      () => 'session-invalidated',
+    );
+    const invalidatedListener = vi.fn();
+    client.onSessionInvalidated(invalidatedListener);
+    await client.beginSession();
+
+    runtime.emit({
+      type: 'boss/session-invalidated/event',
+      sessionId: 'session-invalidated',
+      generation: 'generation-invalidated',
+      reason: 'context_changed',
+    });
+
+    expect(invalidatedListener).toHaveBeenCalledOnce();
+    await expect(client.detectPage()).rejects.toBeInstanceOf(
+      ContentContextChangedError,
+    );
+    expect(sendMessage).toHaveBeenCalledTimes(1);
+  });
+
+  it('begin response 返回前收到的匹配 invalidated event 会在 generation 核对后生效', async () => {
+    const runtime = runtimeHarness();
+    let finishBegin: ((response: unknown) => void) | undefined;
+    const sendMessage = vi.fn<TabsClient['sendMessage']>(
+      async () =>
+        await new Promise<unknown>((resolve) => {
+          finishBegin = resolve;
+        }),
+    );
+    const client = createContentClient(
+      { query: async () => [{ id: 13 }], sendMessage },
+      runtime.runtime,
+      () => 'session-pending',
+    );
+    const beginning = client.beginSession();
+    await vi.waitFor(() => expect(sendMessage).toHaveBeenCalledOnce());
+
+    runtime.emit({
+      type: 'boss/session-invalidated/event',
+      sessionId: 'session-pending',
+      generation: 'generation-pending',
+      reason: 'context_changed',
+    });
+    finishBegin?.({
+      type: 'boss/begin-session/response',
+      sessionId: 'session-pending',
+      generation: 'generation-pending',
+      queryScope: 'boss:/web/geek/jobs',
+    });
+
+    await expect(beginning).rejects.toBeInstanceOf(ContentContextChangedError);
   });
 });

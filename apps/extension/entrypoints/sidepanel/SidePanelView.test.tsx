@@ -8,7 +8,7 @@ const completedState: ScanState = {
   runId: 'scan-1',
   status: 'completed',
   progress: {
-    pagesVisited: 2,
+    pagesVisited: 1,
     listJobs: 12,
     newJobs: 8,
     screenedJobs: 12,
@@ -22,7 +22,7 @@ const completedState: ScanState = {
     aiFailure: 0,
     cacheHits: 0,
   },
-  stopReason: null,
+  stopReason: 'current_page_complete',
   error: null,
   warnings: [],
   results: [
@@ -194,6 +194,9 @@ describe('SidePanelView', () => {
     expect(html).toContain('导出 JSON');
     expect(html).toContain('detail_mapping');
     expect(html).toContain('boss-1');
+    expect(html).toContain('每轮只读取当前页，不点击职位或分页');
+    expect(html).toContain('完成原因：当前页处理完成');
+    expect(html).toContain('本轮读取页数');
     expect(html).not.toContain('strengths');
     expect(html).not.toContain('gaps');
   });

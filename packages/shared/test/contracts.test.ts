@@ -8,6 +8,7 @@ import {
   BeginBossSessionRequestSchema,
   BeginBossSessionResponseSchema,
   BossFatalBlockEventSchema,
+  BossSessionInvalidatedEventSchema,
   BossSessionErrorResponseSchema,
   BridgeErrorResponseSchema,
   BridgeSettingsSchema,
@@ -401,6 +402,19 @@ describe("其余边界对象", () => {
         reason: "context_changed",
       }),
     ).toMatchObject({ reason: "context_changed" });
+    expect(
+      BossSessionInvalidatedEventSchema.parse({
+        type: "boss/session-invalidated/event",
+        sessionId: "session-1",
+        generation: "generation-1",
+        reason: "context_changed",
+      }),
+    ).toEqual({
+      type: "boss/session-invalidated/event",
+      sessionId: "session-1",
+      generation: "generation-1",
+      reason: "context_changed",
+    });
     expect(
       BossFatalBlockEventSchema.parse({
         type: "boss/fatal-block/event",

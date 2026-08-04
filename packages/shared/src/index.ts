@@ -629,6 +629,17 @@ export type BossSessionErrorResponse = z.infer<
   typeof BossSessionErrorResponseSchema
 >;
 
+export const BossSessionInvalidatedEventSchema = z.strictObject({
+  type: z.literal("boss/session-invalidated/event"),
+  sessionId: NonEmptyTextSchema,
+  generation: NonEmptyTextSchema,
+  reason: z.literal("context_changed"),
+});
+
+export type BossSessionInvalidatedEvent = z.infer<
+  typeof BossSessionInvalidatedEventSchema
+>;
+
 export const BossFatalBlockEventSchema = z.strictObject({
   type: z.literal("boss/fatal-block/event"),
   sessionId: NonEmptyTextSchema,
@@ -822,6 +833,7 @@ export const ExtensionMessageSchema = z.union([
   EndBossSessionRequestSchema,
   EndBossSessionResponseSchema,
   BossSessionErrorResponseSchema,
+  BossSessionInvalidatedEventSchema,
   BossFatalBlockEventSchema,
   DetectPageRequestSchema,
   DetectPageResponseSchema,

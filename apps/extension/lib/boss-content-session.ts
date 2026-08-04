@@ -1,3 +1,4 @@
+import { sourceJobIdFromUrl } from '@career-ops-cn/boss-adapter';
 import type {
   BossAccountFatalReason,
   BossFatalBlockEvent,
@@ -17,13 +18,19 @@ export type BossContentSessionValidation =
   | { status: 'context_changed' }
   | { status: 'fatal'; event: BossFatalBlockEvent };
 
-function isBossDetailLocator(value: string): boolean {
+function isBossDetailLocator(
+  value: string,
+  expectedOrigin: string,
+  sourceJobId: string,
+): boolean {
   try {
     const url = new URL(value);
     const hostname = url.hostname.toLowerCase();
     return (
       url.protocol === 'https:' &&
-      (hostname === 'zhipin.com' || hostname.endsWith('.zhipin.com'))
+      (hostname === 'zhipin.com' || hostname.endsWith('.zhipin.com')) &&
+      url.origin === expectedOrigin &&
+      sourceJobIdFromUrl(value) === sourceJobId
     );
   } catch {
     return false;
@@ -39,7 +46,22 @@ export class BossContentLocatorStore {
     | null = null;
   private readonly locators = new Map<string, string>();
 
-  constructor(private readonly generation: string = crypto.randomUUID()) {}
+  private readonly expectedOrigin: string;
+
+  constructor(
+    expectedOrigin: string,
+    private readonly generation: string = crypto.randomUUID(),
+  ) {
+    const parsedOrigin = new URL(expectedOrigin);
+    const hostname = parsedOrigin.hostname.toLowerCase();
+    if (
+      parsedOrigin.protocol !== 'https:' ||
+      (hostname !== 'zhipin.com' && !hostname.endsWith('.zhipin.com'))
+    ) {
+      throw new TypeError('BOSS locator store 需要可信的 zhipin.com HTTPS origin。');
+    }
+    this.expectedOrigin = parsedOrigin.origin;
+  }
 
   beginSession(sessionId: string, queryScope: string): BossContentSession {
     this.clear();
@@ -86,6 +108,16 @@ export class BossContentLocatorStore {
     return this.fatalEvent(active, reason);
   }
 
+  invalidate(session: BossLocatorSessionRef): boolean {
+    const active = this.activeSession;
+    if (!this.matchesActiveSession(session) || active === null) {
+      return false;
+    }
+    active.invalidated = true;
+    this.locators.clear();
+    return true;
+  }
+
   register(
     session: BossLocatorSessionRef,
     sourceJobId: string,
@@ -93,7 +125,7 @@ export class BossContentLocatorStore {
   ): boolean {
     if (
       !this.isUsableSession(session) ||
-      !isBossDetailLocator(rawDetailUrl)
+      !isBossDetailLocator(rawDetailUrl, this.expectedOrigin, sourceJobId)
     ) {
       return false;
     }

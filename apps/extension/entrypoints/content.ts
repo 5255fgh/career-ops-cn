@@ -11,6 +11,7 @@ import {
   BeginBossSessionResponseSchema,
   BossAccountFatalReasonSchema,
   BossFatalBlockEventSchema,
+  BossSessionInvalidatedEventSchema,
   BossSessionErrorResponseSchema,
   CancelDetailScanRequestSchema,
   CancelDetailScanResponseSchema,
@@ -26,6 +27,7 @@ import {
   StartDetailScanRequestSchema,
   StartDetailScanResponseSchema,
   type BossFatalBlockEvent,
+  type BossSessionInvalidatedEvent,
   type VisibleJobCard,
 } from '@career-ops-cn/shared';
 import { browser } from 'wxt/browser';
@@ -104,16 +106,22 @@ export default defineContentScript({
     let activeOperationController: AbortController | null = null;
     let monitoredSession: BossContentSession | null = null;
     let fatalObserver: MutationObserver | null = null;
+    let pageHideListener: (() => void) | null = null;
     let requestGate: { intervalMs: number; gate: BossRequestGate } | null = null;
-    const locatorStore = new BossContentLocatorStore();
+    const locatorStore = new BossContentLocatorStore(window.location.origin);
 
     const stopFatalMonitoring = (): void => {
       fatalObserver?.disconnect();
       fatalObserver = null;
+      if (pageHideListener !== null) {
+        window.removeEventListener('pagehide', pageHideListener);
+        pageHideListener = null;
+      }
       monitoredSession = null;
     };
 
     const broadcastFatal = (event: BossFatalBlockEvent): void => {
+      stopFatalMonitoring();
       requestGate = null;
       activeOperationController?.abort(
         new DOMException(`页面已停止扫描：${event.reason}`, 'AbortError'),
@@ -121,6 +129,31 @@ export default defineContentScript({
       void browser.runtime
         .sendMessage(BossFatalBlockEventSchema.parse(event))
         .catch(() => undefined);
+    };
+
+    const broadcastSessionInvalidated = (
+      session: BossLocatorSessionRef,
+    ): void => {
+      if (
+        monitoredSession?.sessionId !== session.sessionId ||
+        monitoredSession.generation !== session.generation
+      ) {
+        return;
+      }
+      locatorStore.invalidate(session);
+      const event: BossSessionInvalidatedEvent =
+        BossSessionInvalidatedEventSchema.parse({
+          type: 'boss/session-invalidated/event',
+          sessionId: session.sessionId,
+          generation: session.generation,
+          reason: 'context_changed',
+        });
+      stopFatalMonitoring();
+      requestGate = null;
+      activeOperationController?.abort(
+        new DOMException('BOSS 查询上下文已改变。', 'AbortError'),
+      );
+      void browser.runtime.sendMessage(event).catch(() => undefined);
     };
 
     const latchVisibleFatal = (): BossFatalBlockEvent | null => {
@@ -139,9 +172,13 @@ export default defineContentScript({
     const sessionControlResponse = (
       session: BossLocatorSessionRef,
     ): BossFatalBlockEvent | ReturnType<typeof BossSessionErrorResponseSchema.parse> | null => {
+      const visibleFatal = latchVisibleFatal();
+      if (visibleFatal !== null) {
+        return visibleFatal;
+      }
       const validation = locatorStore.validate(session, currentSourceQuery());
       if (validation.status === 'context_changed') {
-        requestGate = null;
+        broadcastSessionInvalidated(session);
         return BossSessionErrorResponseSchema.parse({
           type: 'boss/session-error/response',
           sessionId: session.sessionId,
@@ -152,12 +189,7 @@ export default defineContentScript({
       if (validation.status === 'fatal') {
         return validation.event;
       }
-      latchVisibleFatal();
-      const afterFatalCheck = locatorStore.validate(
-        session,
-        currentSourceQuery(),
-      );
-      return afterFatalCheck.status === 'fatal' ? afterFatalCheck.event : null;
+      return null;
     };
 
     const monitorSession = (session: BossContentSession): void => {
@@ -167,20 +199,20 @@ export default defineContentScript({
         if (monitoredSession === null) {
           return;
         }
+        if (latchVisibleFatal() !== null) {
+          return;
+        }
         const validation = locatorStore.validate(
           monitoredSession,
           currentSourceQuery(),
         );
         if (validation.status === 'context_changed') {
-          requestGate = null;
-          activeOperationController?.abort(
-            new DOMException('BOSS 查询上下文已改变。', 'AbortError'),
-          );
-          fatalObserver?.disconnect();
-          fatalObserver = null;
+          broadcastSessionInvalidated(monitoredSession);
           return;
         }
-        latchVisibleFatal();
+        if (validation.status === 'fatal') {
+          broadcastFatal(validation.event);
+        }
       };
       fatalObserver = new MutationObserver(check);
       fatalObserver.observe(document.documentElement, {
@@ -188,6 +220,10 @@ export default defineContentScript({
         subtree: true,
         attributes: true,
       });
+      pageHideListener = () => {
+        broadcastSessionInvalidated(session);
+      };
+      window.addEventListener('pagehide', pageHideListener, { once: true });
       queueMicrotask(check);
     };
 

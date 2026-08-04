@@ -134,6 +134,33 @@ function screeningLabel(job: JobHistoryEntry): string {
   return job.latestScreening.matched ? '通过' : '阻断';
 }
 
+function stopReasonLabel(
+  value: NonNullable<ScanState['stopReason']>,
+): string {
+  switch (value) {
+    case 'current_page_complete':
+      return '当前页处理完成';
+    case 'new_job_limit':
+      return '达到本轮新职位预算';
+    case 'round_time_limit':
+      return '达到本轮时间预算';
+    case 'end_of_results':
+      return '当前详情处理完成';
+    case 'parser_failure_limit':
+      return '详情解析整体失效';
+    case 'login_required':
+      return '登录失效';
+    case 'challenge':
+      return 'challenge';
+    case 'account_risk':
+      return '账号风险';
+    case 'unsupported_layout':
+      return '页面布局不支持';
+    case 'empty_page':
+      return '当前页为空';
+  }
+}
+
 function resultError(result: ScannedJob): string | null {
   return result.detailError ?? result.evaluationError ?? null;
 }
@@ -152,7 +179,7 @@ export function SidePanelView(props: SidePanelViewProps) {
       <header className="panel-header">
         <p className="eyebrow">Career Ops CN</p>
         <h1>BOSS 只读职位扫描</h1>
-        <p>一次点击最多连续处理 3 页；不投递、不联系招聘方。</p>
+        <p>每轮只读取当前页，不点击职位或分页；不投递、不联系招聘方。</p>
       </header>
 
       <section className="panel-section" aria-labelledby="connection-heading">
@@ -255,7 +282,10 @@ export function SidePanelView(props: SidePanelViewProps) {
           <p className="error-message" role="alert">{props.scanState.error}</p>
         )}
         {props.scanState.stopReason === null ? null : (
-          <p className="stop-reason">停止原因：{props.scanState.stopReason}</p>
+          <p className="stop-reason">
+            {props.scanState.status === 'completed' ? '完成原因' : '停止原因'}：
+            {stopReasonLabel(props.scanState.stopReason)}
+          </p>
         )}
         {props.scanState.warnings.map((warning) => (
           <p className="inline-message" role="status" key={warning}>
@@ -273,7 +303,7 @@ export function SidePanelView(props: SidePanelViewProps) {
         </div>
         <dl className="metric-grid progress-grid">
           <div>
-            <dt>已处理页数</dt>
+            <dt>本轮读取页数</dt>
             <dd>{props.scanState.progress.pagesVisited}</dd>
           </div>
           <div>

@@ -2,6 +2,7 @@ import {
   BeginBossSessionRequestSchema,
   BeginBossSessionResponseSchema,
   BossFatalBlockEventSchema,
+  BossSessionInvalidatedEventSchema,
   BossSessionErrorResponseSchema,
   CancelDetailScanRequestSchema,
   CancelDetailScanResponseSchema,
@@ -17,6 +18,7 @@ import {
   StartDetailScanResponseSchema,
   type BossAccountFatalReason,
   type BossFatalBlockEvent,
+  type BossSessionInvalidatedEvent,
   type DetectPageResponse,
   type ExtractVisibleCardsResponse,
   type JobDetail,
@@ -55,6 +57,9 @@ export interface ContentClient {
   beginSession(signal?: AbortSignal): Promise<BossScanSession>;
   endSession(): Promise<boolean>;
   onFatalBlock(listener: (event: BossFatalBlockEvent) => void): () => void;
+  onSessionInvalidated(
+    listener: (event: BossSessionInvalidatedEvent) => void,
+  ): () => void;
   detectPage(signal?: AbortSignal): Promise<DetectPageResponse>;
   extractCurrentDetail(signal?: AbortSignal): Promise<JobDetail | null>;
   extractVisibleCards(
@@ -173,10 +178,18 @@ export function createContentClient(
   let pendingSessionId: string | null = null;
   let stickyFatal: BossFatalBlockEvent | null = null;
   let pendingFatal: BossFatalBlockEvent | null = null;
+  let stickyInvalidation: BossSessionInvalidatedEvent | null = null;
+  let pendingInvalidation: BossSessionInvalidatedEvent | null = null;
   let removeRuntimeListener: (() => void) | null = null;
   const fatalListeners = new Set<(event: BossFatalBlockEvent) => void>();
+  const invalidationListeners = new Set<
+    (event: BossSessionInvalidatedEvent) => void
+  >();
 
-  function matchesActiveSession(event: BossFatalBlockEvent): boolean {
+  function matchesActiveSession(event: {
+    sessionId: string;
+    generation: string;
+  }): boolean {
     return (
       activeSession?.sessionId === event.sessionId &&
       activeSession.generation === event.generation
@@ -197,6 +210,22 @@ export function createContentClient(
     }
   }
 
+  function acceptSessionInvalidatedEvent(
+    event: BossSessionInvalidatedEvent,
+  ): void {
+    if (!matchesActiveSession(event) && pendingSessionId !== event.sessionId) {
+      return;
+    }
+    if (activeSession === null) {
+      pendingInvalidation = event;
+    } else {
+      stickyInvalidation ??= event;
+    }
+    for (const listener of invalidationListeners) {
+      listener(event);
+    }
+  }
+
   function ensureRuntimeListener(): void {
     if (removeRuntimeListener !== null) {
       return;
@@ -206,7 +235,22 @@ export function createContentClient(
       if (parsed.success) {
         acceptFatalEvent(parsed.data);
       }
+      const invalidated = BossSessionInvalidatedEventSchema.safeParse(message);
+      if (invalidated.success) {
+        acceptSessionInvalidatedEvent(invalidated.data);
+      }
     });
+  }
+
+  function removeRuntimeListenerIfUnused(): void {
+    if (
+      fatalListeners.size === 0 &&
+      invalidationListeners.size === 0 &&
+      removeRuntimeListener !== null
+    ) {
+      removeRuntimeListener();
+      removeRuntimeListener = null;
+    }
   }
 
   function sessionOrThrow(): BossScanSession {
@@ -222,6 +266,12 @@ export function createContentClient(
     }
   }
 
+  function throwIfSessionInvalidated(): void {
+    if (stickyInvalidation !== null) {
+      throw new ContentContextChangedError();
+    }
+  }
+
   function parseSessionControlResponse(response: unknown): void {
     const fatal = BossFatalBlockEventSchema.safeParse(response);
     if (fatal.success) {
@@ -230,6 +280,14 @@ export function createContentClient(
     }
     const sessionError = BossSessionErrorResponseSchema.safeParse(response);
     if (sessionError.success) {
+      acceptSessionInvalidatedEvent(
+        BossSessionInvalidatedEventSchema.parse({
+          type: 'boss/session-invalidated/event',
+          sessionId: sessionError.data.sessionId,
+          generation: sessionError.data.generation,
+          reason: sessionError.data.reason,
+        }),
+      );
       throw new ContentContextChangedError();
     }
   }
@@ -240,6 +298,7 @@ export function createContentClient(
   ): Promise<unknown> {
     const session = sessionOrThrow();
     throwIfFatal();
+    throwIfSessionInvalidated();
     try {
       const response = await withAbort(
         tabs.sendMessage(session.tabId, message),
@@ -247,6 +306,7 @@ export function createContentClient(
       );
       parseSessionControlResponse(response);
       throwIfFatal();
+      throwIfSessionInvalidated();
       return response;
     } catch (error) {
       if (
@@ -256,6 +316,14 @@ export function createContentClient(
       ) {
         throw isSignalAborted(signal) ? abortReason(signal) : error;
       }
+      acceptSessionInvalidatedEvent(
+        BossSessionInvalidatedEventSchema.parse({
+          type: 'boss/session-invalidated/event',
+          sessionId: session.sessionId,
+          generation: session.generation,
+          reason: 'context_changed',
+        }),
+      );
       throw new ContentContextChangedError(
         '固定的 BOSS 标签页已 reload、关闭或无法连接。',
         { cause: error },
@@ -268,7 +336,6 @@ export function createContentClient(
       if (activeSession !== null || pendingSessionId !== null) {
         throw new ContentClientError('BOSS 扫描 session 已经开始。');
       }
-      ensureRuntimeListener();
       const [tab] = await withAbort(
         tabs.query({ active: true, currentWindow: true }),
         signal,
@@ -280,6 +347,8 @@ export function createContentClient(
       const sessionId = createSessionId();
       pendingSessionId = sessionId;
       pendingFatal = null;
+      pendingInvalidation = null;
+      ensureRuntimeListener();
       try {
         const response = await withAbort(
           tabs.sendMessage(
@@ -308,7 +377,16 @@ export function createContentClient(
         ) {
           stickyFatal = fatalDuringBegin;
         }
+        const invalidationDuringBegin =
+          pendingInvalidation as BossSessionInvalidatedEvent | null;
+        if (
+          invalidationDuringBegin !== null &&
+          invalidationDuringBegin.generation === activeSession.generation
+        ) {
+          stickyInvalidation = invalidationDuringBegin;
+        }
         throwIfFatal();
+        throwIfSessionInvalidated();
         return { ...activeSession };
       } catch (error) {
         if (isSignalAborted(signal)) {
@@ -327,6 +405,10 @@ export function createContentClient(
       } finally {
         pendingSessionId = null;
         pendingFatal = null;
+        pendingInvalidation = null;
+        if (activeSession === null) {
+          removeRuntimeListenerIfUnused();
+        }
       }
     },
 
@@ -355,6 +437,9 @@ export function createContentClient(
         activeSession = null;
         stickyFatal = null;
         pendingFatal = null;
+        stickyInvalidation = null;
+        pendingInvalidation = null;
+        removeRuntimeListenerIfUnused();
       }
     },
 
@@ -363,10 +448,16 @@ export function createContentClient(
       ensureRuntimeListener();
       return () => {
         fatalListeners.delete(listener);
-        if (fatalListeners.size === 0 && removeRuntimeListener !== null) {
-          removeRuntimeListener();
-          removeRuntimeListener = null;
-        }
+        removeRuntimeListenerIfUnused();
+      };
+    },
+
+    onSessionInvalidated(listener) {
+      invalidationListeners.add(listener);
+      ensureRuntimeListener();
+      return () => {
+        invalidationListeners.delete(listener);
+        removeRuntimeListenerIfUnused();
       };
     },
 

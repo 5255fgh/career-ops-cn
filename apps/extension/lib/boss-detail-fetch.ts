@@ -9,6 +9,7 @@ import {
   type BossJobDetail,
 } from '@career-ops-cn/boss-adapter';
 import {
+  BossAccountFatalReasonSchema,
   DetailReadDiagnosticSchema,
   JobCardSchema,
   JobDetailSchema,
@@ -26,11 +27,6 @@ import {
 } from './boss-request-gate';
 
 const TRANSIENT_HTTP_STATUSES = new Set([408, 425, 429, 500, 502, 503, 504]);
-const FATAL_DETAIL_BLOCKS = new Set([
-  'login_required',
-  'challenge',
-  'account_risk',
-]);
 
 export const JOB_CARD_FIELDS = [
   'jobId',
@@ -131,22 +127,6 @@ function failed(
   });
 }
 
-function sanitizeDiagnosticUrl(value: string | null): string | null {
-  if (value === null || value === '') {
-    return null;
-  }
-  try {
-    const url = new URL(value);
-    url.username = '';
-    url.password = '';
-    url.search = '';
-    url.hash = '';
-    return url.toString();
-  } catch {
-    return null;
-  }
-}
-
 function hasDetailContainer(document: Document): boolean {
   return bossSelectors.page.detailContainers.some(
     (selector) => document.querySelector(selector) !== null,
@@ -169,7 +149,7 @@ function missingDetailFields(
 }
 
 function createDiagnostic(input: {
-  source: 'fetch' | 'live-panel';
+  source: 'fetch';
   card: VisibleJobCard;
   responseUrl: string | null;
   httpStatus: number | null;
@@ -178,14 +158,11 @@ function createDiagnostic(input: {
   missingFields: readonly string[];
   outcome: string;
 }): DetailReadDiagnostic {
-  const detailUrl =
-    sanitizeDiagnosticUrl(input.card.job.detailUrl) ??
-    input.card.job.detailUrl;
   return DetailReadDiagnosticSchema.parse({
     source: input.source,
     sourceJobId: input.card.job.jobId,
-    detailUrl,
-    responseUrl: sanitizeDiagnosticUrl(input.responseUrl),
+    detailUrl: input.card.job.detailUrl,
+    responseUrl: input.responseUrl,
     httpStatus: input.httpStatus,
     detectedPageType: input.detectedPageType,
     hasDetailContainer: input.hasDetailContainer,
@@ -271,7 +248,7 @@ export async function fetchBossDetail({
           fetchImpl(rawDetailUrl, {
             method: 'GET',
             credentials: 'include',
-            redirect: 'follow',
+            redirect: 'error',
             signal: requestController.signal,
           }),
           interrupted,
@@ -297,7 +274,10 @@ export async function fetchBossDetail({
         outcome,
       });
 
-    if (block !== null && FATAL_DETAIL_BLOCKS.has(block.reason)) {
+    if (
+      block !== null &&
+      BossAccountFatalReasonSchema.safeParse(block.reason).success
+    ) {
       return StartDetailScanResponseSchema.parse({
         type: 'boss/start-detail-scan/response',
         outcome: 'blocked',

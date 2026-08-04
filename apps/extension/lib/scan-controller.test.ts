@@ -3,6 +3,7 @@ import {
   JobResponseSchema,
   type BossAccountFatalReason,
   type BossFatalBlockEvent,
+  type BossSessionInvalidatedEvent,
   type JobCard,
   type JobDetail,
   type ScanRunSnapshot,
@@ -28,12 +29,17 @@ const contentFatalEmitters = new WeakMap<
   ContentClient,
   (reason: BossAccountFatalReason) => void
 >();
+const contentInvalidationEmitters = new WeakMap<ContentClient, () => void>();
 
 function emitContentFatal(
   content: ContentClient,
   reason: BossAccountFatalReason,
 ): void {
   contentFatalEmitters.get(content)?.(reason);
+}
+
+function emitContentInvalidation(content: ContentClient): void {
+  contentInvalidationEmitters.get(content)?.();
 }
 
 function visibleCard(index: number, page = 0): VisibleJobCard {
@@ -102,6 +108,9 @@ function scanRun(status: 'running' | 'cancelled' | 'interrupted' = 'running') {
 
 function contentMock(pages: VisibleJobCard[][]): ContentClient {
   const fatalListeners = new Set<(event: BossFatalBlockEvent) => void>();
+  const invalidationListeners = new Set<
+    (event: BossSessionInvalidatedEvent) => void
+  >();
   const content: ContentClient = {
     beginSession: vi.fn(async () => ({
       sessionId: 'session-1',
@@ -113,6 +122,10 @@ function contentMock(pages: VisibleJobCard[][]): ContentClient {
     onFatalBlock(listener) {
       fatalListeners.add(listener);
       return () => fatalListeners.delete(listener);
+    },
+    onSessionInvalidated(listener) {
+      invalidationListeners.add(listener);
+      return () => invalidationListeners.delete(listener);
     },
     detectPage: vi.fn(async () => ({
       type: 'boss/detect-page/response' as const,
@@ -146,6 +159,17 @@ function contentMock(pages: VisibleJobCard[][]): ContentClient {
       reason,
     };
     for (const listener of fatalListeners) {
+      listener(event);
+    }
+  });
+  contentInvalidationEmitters.set(content, () => {
+    const event: BossSessionInvalidatedEvent = {
+      type: 'boss/session-invalidated/event',
+      sessionId: 'session-1',
+      generation: 'generation-1',
+      reason: 'context_changed',
+    };
+    for (const listener of invalidationListeners) {
       listener(event);
     }
   });
@@ -309,6 +333,30 @@ describe('ScanController', () => {
     expect(content.endSession).toHaveBeenCalledOnce();
   });
 
+  it('maxNewJobs 恰好覆盖当前页全部新职位时仍是 current_page_complete', async () => {
+    const cards = [visibleCard(0), visibleCard(1)];
+    const content = contentMock([cards]);
+    const bridge = bridgeMock();
+
+    const state = await controller(content, bridge).run({ maxNewJobs: 2 });
+
+    expect(state.status).toBe('completed');
+    expect(state.stopReason).toBe('current_page_complete');
+    expect(content.startDetailScan).toHaveBeenCalledTimes(2);
+  });
+
+  it('当前页有新职位因 maxNewJobs 被跳过时才使用 new_job_limit', async () => {
+    const cards = [visibleCard(0), visibleCard(1), visibleCard(2)];
+    const content = contentMock([cards]);
+    const bridge = bridgeMock();
+
+    const state = await controller(content, bridge).run({ maxNewJobs: 2 });
+
+    expect(state.status).toBe('completed');
+    expect(state.stopReason).toBe('new_job_limit');
+    expect(content.startDetailScan).toHaveBeenCalledTimes(2);
+  });
+
   it('queryScope 或 content generation 改变时整轮进入 interrupted', async () => {
     const content = contentMock([[visibleCard(0)]]);
     vi.mocked(content.detectPage).mockRejectedValue(
@@ -323,6 +371,107 @@ describe('ScanController', () => {
     expect(bridge.saveJob).not.toHaveBeenCalled();
     expect(bridge.evaluateJob).not.toHaveBeenCalled();
     expect(content.endSession).toHaveBeenCalledOnce();
+  });
+
+  it('Bridge 阶段收到主动 session invalidation 时立即 interrupted 且不保存或调用 AI', async () => {
+    const content = contentMock([[visibleCard(0)]]);
+    const bridge = bridgeMock();
+    vi.mocked(bridge.observeJobs).mockImplementation(async () => {
+      emitContentInvalidation(content);
+      return [
+        {
+          sourceJobId: 'boss-0',
+          action: 'read-detail',
+          reason: 'new',
+        },
+      ];
+    });
+
+    const state = await controller(content, bridge).run();
+
+    expect(state.status).toBe('interrupted');
+    expect(state.stopReason).toBeNull();
+    expect(content.startDetailScan).not.toHaveBeenCalled();
+    expect(bridge.saveJob).not.toHaveBeenCalled();
+    expect(bridge.evaluateJob).not.toHaveBeenCalled();
+  });
+
+  it('正常处理结束但固定 tab 在 endSession 前断开时最终仍返回 interrupted', async () => {
+    const content = contentMock([[visibleCard(0)]]);
+    vi.mocked(content.endSession).mockResolvedValue(false);
+    const bridge = bridgeMock();
+
+    const state = await controller(content, bridge).run();
+
+    expect(state.status).toBe('interrupted');
+    expect(state.stopReason).toBeNull();
+    expect(state.error).toContain('页面 generation');
+    expect(bridge.updateScanRun).toHaveBeenLastCalledWith(
+      'scan-1',
+      expect.objectContaining({ status: 'interrupted', phase: 'finished' }),
+    );
+  });
+
+  it('beginSession pending 期间主动 invalidation 保持 interrupted', async () => {
+    const content = contentMock([[visibleCard(0)]]);
+    vi.mocked(content.beginSession).mockImplementation(async () => {
+      emitContentInvalidation(content);
+      return {
+        sessionId: 'session-1',
+        tabId: 42,
+        generation: 'generation-1',
+        queryScope: 'boss:/web/geek/job?query=TypeScript',
+      };
+    });
+    const bridge = bridgeMock();
+
+    const state = await controller(content, bridge).run();
+
+    expect(state.status).toBe('interrupted');
+    expect(bridge.createScanRun).not.toHaveBeenCalled();
+  });
+
+  it('beginSession 超过 round deadline 时归类为 completed/round_time_limit', async () => {
+    vi.useFakeTimers();
+    try {
+      const content = contentMock([[visibleCard(0)]]);
+      vi.mocked(content.beginSession).mockImplementation(
+        async (signal) =>
+          await new Promise((_resolve, reject) => {
+            signal?.addEventListener(
+              'abort',
+              () => reject(signal.reason),
+              { once: true },
+            );
+          }),
+      );
+      const bridge = bridgeMock();
+
+      const running = controller(content, bridge).run({ maxRoundMs: 20 });
+      await vi.advanceTimersByTimeAsync(20);
+      const state = await running;
+
+      expect(state.status).toBe('completed');
+      expect(state.stopReason).toBe('round_time_limit');
+      expect(bridge.createScanRun).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('createScanRun 期间 fatal 不会被普通 Bridge 错误覆盖', async () => {
+    const content = contentMock([[visibleCard(0)]]);
+    const bridge = bridgeMock();
+    vi.mocked(bridge.createScanRun).mockImplementation(async () => {
+      emitContentFatal(content, 'challenge');
+      throw new Error('create response lost');
+    });
+
+    const state = await controller(content, bridge).run();
+
+    expect(state.status).toBe('failed');
+    expect(state.stopReason).toBe('challenge');
+    expect(state.error).toContain('challenge');
   });
 
   it('maxPages 不为 1 时在创建 run 前明确拒绝', async () => {
@@ -840,6 +989,28 @@ describe('ScanController', () => {
     expect(state.stopReason).toBe('login_required');
     expect(bridge.saveJob).toHaveBeenCalledOnce();
     expect(bridge.evaluateJob).not.toHaveBeenCalled();
+  });
+
+  it('最后一次 evaluating 状态写入期间发生 fatal 时不能覆盖为 completed', async () => {
+    const card = visibleCard(0);
+    const content = contentMock([[card]]);
+    const bridge = bridgeMock();
+    let evaluatingWrites = 0;
+    vi.mocked(bridge.updateScanRun).mockImplementation(async (_runId, update) => {
+      if (update.phase === 'evaluating') {
+        evaluatingWrites += 1;
+        if (evaluatingWrites === 2) {
+          emitContentFatal(content, 'account_risk');
+        }
+      }
+      return scanRun();
+    });
+
+    const state = await controller(content, bridge).run();
+
+    expect(bridge.evaluateJob).toHaveBeenCalledOnce();
+    expect(state.status).toBe('failed');
+    expect(state.stopReason).toBe('account_risk');
   });
 
   it('旧职位 cache miss 时重建完整硬规则，阻断后不调用 AI', async () => {

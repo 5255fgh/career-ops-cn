@@ -266,7 +266,10 @@ describe('fetchBossDetail', () => {
     });
     expect(fetchImpl).toHaveBeenCalledWith(
       rawDetailUrl,
-      expect.objectContaining({ credentials: 'include' }),
+      expect.objectContaining({
+        credentials: 'include',
+        redirect: 'error',
+      }),
     );
     expect(JSON.stringify(result)).not.toContain('secret');
     expect(JSON.stringify(result)).not.toContain('request-only');
