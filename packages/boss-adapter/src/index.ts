@@ -5,18 +5,11 @@ export {
   normalizeBossDetailUrl,
   parseBossDetail,
   parseVisibleBossCards,
-  scanSelectedBossDetails,
   sourceJobIdFromUrl,
   verifyDetailIdentity,
-  waitForBossDetail,
 } from "./adapter.js";
 export { bossSelectors } from "./selectors.js";
 export type {
-  BossDetailPredicate,
-  BossDetailPredicateContext,
-  BossDetailScanEntry,
-  BossDetailScanResult,
-  BossDetailSelection,
   BossCardElementMatch,
   BossCardMatchMethod,
   BossIdentitySignal,
@@ -28,8 +21,5 @@ export type {
   BossPageBlock,
   BossPageBlockReason,
   BossPageType,
-  ScanSelectedBossDetailsOptions,
   VerifyDetailIdentityInput,
-  WaitForBossDetailOptions,
-  WaitForBossDetailResult,
 } from "./types.js";

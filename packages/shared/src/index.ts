@@ -315,7 +315,7 @@ export const BridgeSettingsSchema = z.strictObject({
 export type BridgeSettings = z.infer<typeof BridgeSettingsSchema>;
 
 export const ScanConfigSchema = z.strictObject({
-  maxPages: z.number().int().positive(),
+  maxPages: z.literal(1),
   maxNewJobs: z.number().int().positive(),
   maxAiJobs: z.number().int().positive(),
   detailTimeoutMs: z.number().int().positive(),
@@ -631,40 +631,6 @@ export type StartDetailScanResponse = z.infer<
   typeof StartDetailScanResponseSchema
 >;
 
-export const AdvanceSearchPageRequestSchema = z.strictObject({
-  type: z.literal("boss/advance-search-page/request"),
-  timeoutMs: z.number().int().positive(),
-});
-
-export const AdvanceSearchPageResponseSchema = z.discriminatedUnion("outcome", [
-  z.strictObject({
-    type: z.literal("boss/advance-search-page/response"),
-    outcome: z.literal("advanced"),
-  }),
-  z.strictObject({
-    type: z.literal("boss/advance-search-page/response"),
-    outcome: z.literal("end"),
-  }),
-  z.strictObject({
-    type: z.literal("boss/advance-search-page/response"),
-    outcome: z.literal("blocked"),
-    reason: BossPageBlockReasonSchema,
-  }),
-  z.strictObject({
-    type: z.literal("boss/advance-search-page/response"),
-    outcome: z.literal("cancelled"),
-  }),
-  z.strictObject({
-    type: z.literal("boss/advance-search-page/response"),
-    outcome: z.literal("failed"),
-    message: NonEmptyTextSchema,
-  }),
-]);
-
-export type AdvanceSearchPageResponse = z.infer<
-  typeof AdvanceSearchPageResponseSchema
->;
-
 export const CancelDetailScanRequestSchema = z.strictObject({
   type: z.literal("boss/cancel-detail-scan/request"),
 });
@@ -683,8 +649,6 @@ export const ExtensionMessageSchema = z.union([
   ExtractVisibleCardsResponseSchema,
   StartDetailScanRequestSchema,
   StartDetailScanResponseSchema,
-  AdvanceSearchPageRequestSchema,
-  AdvanceSearchPageResponseSchema,
   CancelDetailScanRequestSchema,
   CancelDetailScanResponseSchema,
 ]);

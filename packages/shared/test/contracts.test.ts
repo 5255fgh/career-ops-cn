@@ -4,8 +4,6 @@ import { describe, expect, it } from "vitest";
 import type { ZodType } from "zod";
 
 import {
-  AdvanceSearchPageRequestSchema,
-  AdvanceSearchPageResponseSchema,
   ApplicationStatusSchema,
   BridgeErrorResponseSchema,
   BridgeSettingsSchema,
@@ -68,16 +66,6 @@ const otherStrictContracts: Array<{
   schema: ZodType;
   value: Record<string, unknown>;
 }> = [
-  {
-    name: "AdvanceSearchPageRequest",
-    schema: AdvanceSearchPageRequestSchema,
-    value: { type: "boss/advance-search-page/request", timeoutMs: 8_000 },
-  },
-  {
-    name: "AdvanceSearchPageResponse",
-    schema: AdvanceSearchPageResponseSchema,
-    value: { type: "boss/advance-search-page/response", outcome: "advanced" },
-  },
   {
     name: "Preferences",
     schema: PreferencesSchema,

@@ -18,7 +18,6 @@ export interface BossPageBlock {
   reason: BossPageBlockReason;
   pageType: BossPageType;
 }
-
 export interface BossJobIdentity {
   sourceJobId: string | null;
   url: string | null;
@@ -71,49 +70,6 @@ export interface BossIdentityVerification {
   detailHash: string;
 }
 
-export interface BossDetailPredicateContext {
-  detail: BossJobDetail;
-  identity: BossIdentityVerification;
-}
-
-export type BossDetailPredicate = (
-  context: BossDetailPredicateContext,
-) => boolean;
-
-export interface WaitForBossDetailOptions {
-  document: Document;
-  url: string;
-  expected: BossJobIdentity;
-  previousDetail?: BossJobDetail | null;
-  previousDetailHash?: string | null;
-  predicate?: BossDetailPredicate;
-  timeoutMs?: number;
-  signal?: AbortSignal;
-}
-
-export type WaitForBossDetailResult =
-  | {
-      status: "verified";
-      detail: BossJobDetail;
-      identity: BossIdentityVerification;
-    }
-  | {
-      status: "blocked";
-      block: BossPageBlock;
-    }
-  | {
-      status: "aborted";
-    }
-  | {
-      status: "timeout";
-      lastIdentity: BossIdentityVerification | null;
-    };
-
-export interface BossDetailSelection {
-  element: Element;
-  expected?: BossJobIdentity;
-}
-
 export type BossCardMatchMethod =
   | "source_job_id"
   | "detail_url"
@@ -123,29 +79,4 @@ export interface BossCardElementMatch {
   element: Element;
   card: BossJobCard;
   matchedBy: BossCardMatchMethod;
-}
-
-export interface ScanSelectedBossDetailsOptions {
-  document: Document;
-  url: string;
-  selections: readonly BossDetailSelection[];
-  activate?: (
-    selection: BossDetailSelection,
-    index: number,
-  ) => void | Promise<void>;
-  predicate?: BossDetailPredicate;
-  timeoutMs?: number;
-  signal?: AbortSignal;
-}
-
-export interface BossDetailScanEntry {
-  index: number;
-  expected: BossJobIdentity;
-  result: WaitForBossDetailResult;
-}
-
-export interface BossDetailScanResult {
-  entries: BossDetailScanEntry[];
-  details: BossJobDetail[];
-  block: BossPageBlock | null;
 }

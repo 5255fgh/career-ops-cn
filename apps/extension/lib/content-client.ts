@@ -1,6 +1,4 @@
 import {
-  AdvanceSearchPageRequestSchema,
-  AdvanceSearchPageResponseSchema,
   CancelDetailScanRequestSchema,
   CancelDetailScanResponseSchema,
   DetectPageRequestSchema,
@@ -11,7 +9,6 @@ import {
   ExtractVisibleCardsResponseSchema,
   StartDetailScanRequestSchema,
   StartDetailScanResponseSchema,
-  type AdvanceSearchPageResponse,
   type DetectPageResponse,
   type ExtractVisibleCardsResponse,
   type JobDetail,
@@ -30,7 +27,6 @@ export interface ContentClient {
   extractCurrentDetail(signal?: AbortSignal): Promise<JobDetail | null>;
   extractVisibleCards(signal?: AbortSignal): Promise<ExtractVisibleCardsResponse>;
   startDetailScan(card: VisibleJobCard, timeoutMs: number, signal?: AbortSignal): Promise<StartDetailScanResponse>;
-  advanceSearchPage(timeoutMs: number, signal?: AbortSignal): Promise<AdvanceSearchPageResponse>;
   cancelDetailScan(): Promise<boolean>;
 }
 
@@ -83,27 +79,6 @@ async function withAbort<T>(
       (value) => finish(() => resolve(value)),
       (error: unknown) => finish(() => reject(error)),
     );
-  });
-}
-
-async function waitForRetry(
-  milliseconds: number,
-  signal: AbortSignal | undefined,
-): Promise<void> {
-  if (isSignalAborted(signal)) {
-    throw abortError();
-  }
-  await new Promise<void>((resolve, reject) => {
-    const onAbort = (): void => {
-      clearTimeout(timer);
-      signal?.removeEventListener('abort', onAbort);
-      reject(abortError());
-    };
-    const timer = setTimeout(() => {
-      signal?.removeEventListener('abort', onAbort);
-      resolve();
-    }, milliseconds);
-    signal?.addEventListener('abort', onAbort, { once: true });
   });
 }
 
@@ -202,71 +177,6 @@ export function createContentClient(tabs: TabsClient = browserTabs): ContentClie
           throw abortReason(signal);
         }
         throw new ContentClientError('职位详情扫描消息失败。', { cause: error });
-      } finally {
-        signal?.removeEventListener('abort', onAbort);
-      }
-    },
-
-    async advanceSearchPage(timeoutMs, signal) {
-      if (isSignalAborted(signal)) {
-        throw abortReason(signal);
-      }
-
-      const tabId = await activeTabId(signal);
-      const message = AdvanceSearchPageRequestSchema.parse({
-        type: 'boss/advance-search-page/request',
-        timeoutMs,
-      });
-      const onAbort = (): void => {
-        const cancelMessage = CancelDetailScanRequestSchema.parse({
-          type: 'boss/cancel-detail-scan/request',
-        });
-        void tabs.sendMessage(tabId, cancelMessage).catch(() => undefined);
-      };
-      signal?.addEventListener('abort', onAbort, { once: true });
-
-      try {
-        const response = await withAbort(tabs.sendMessage(tabId, message), signal);
-        return AdvanceSearchPageResponseSchema.parse(response);
-      } catch (error) {
-        if (isSignalAborted(signal)) {
-          throw abortReason(signal);
-        }
-        const deadline = Date.now() + timeoutMs;
-        while (Date.now() < deadline) {
-          await waitForRetry(
-            Math.min(100, Math.max(1, deadline - Date.now())),
-            signal,
-          );
-          try {
-            const page = DetectPageResponseSchema.parse(
-              await withAbort(
-                tabs.sendMessage(
-                  tabId,
-                  DetectPageRequestSchema.parse({
-                    type: 'boss/detect-page/request',
-                  }),
-                ),
-                signal,
-              ),
-            );
-            return AdvanceSearchPageResponseSchema.parse(
-              page.block === null
-                ? {
-                    type: 'boss/advance-search-page/response',
-                    outcome: 'advanced',
-                  }
-                : {
-                    type: 'boss/advance-search-page/response',
-                    outcome: 'blocked',
-                    reason: page.block.reason,
-                  },
-            );
-          } catch {
-            // 完整页面跳转时 Content Script 会短暂不可达，继续等待其重新注入。
-          }
-        }
-        throw new ContentClientError('搜索页翻页消息失败。', { cause: error });
       } finally {
         signal?.removeEventListener('abort', onAbort);
       }

@@ -1,7 +1,5 @@
 import { bossSelectors } from "./selectors.js";
 import type {
-  BossDetailScanResult,
-  BossDetailSelection,
   BossCardElementMatch,
   BossIdentitySignal,
   BossIdentityVerification,
@@ -10,13 +8,8 @@ import type {
   BossJobIdentity,
   BossPageBlock,
   BossPageType,
-  ScanSelectedBossDetailsOptions,
   VerifyDetailIdentityInput,
-  WaitForBossDetailOptions,
-  WaitForBossDetailResult,
 } from "./types.js";
-
-const DEFAULT_DETAIL_TIMEOUT_MS = 5_000;
 
 type QueryRoot = Document | Element;
 
@@ -28,7 +21,6 @@ const normalizeText = (value: string | null | undefined): string | null => {
   const normalized = value.replace(/\s+/gu, " ").trim();
   return normalized.length > 0 ? normalized : null;
 };
-
 const queryFirst = (
   root: QueryRoot,
   selectors: readonly string[],
@@ -185,14 +177,6 @@ const parseCardElement = (element: Element, pageUrl: string): BossJobCard => {
     education: readText(element, bossSelectors.card.education),
     tags: readTexts(element, bossSelectors.card.tags),
   };
-};
-
-const findActiveCard = (
-  document: Document,
-  pageUrl: string,
-): BossJobCard | null => {
-  const element = queryFirst(document, bossSelectors.activeCard);
-  return element === null ? null : parseCardElement(element, pageUrl);
 };
 
 const isEmptyPage = (document: Document): boolean => {
@@ -602,207 +586,4 @@ export const verifyDetailIdentity = (
     matchedSignals,
     detailHash: currentDetailHash,
   };
-};
-
-const previousHashFromOptions = (
-  options: WaitForBossDetailOptions,
-): string | null =>
-  options.previousDetailHash ??
-  (options.previousDetail === null || options.previousDetail === undefined
-    ? null
-    : detailHash(options.previousDetail));
-
-export const waitForBossDetail = async (
-  options: WaitForBossDetailOptions,
-): Promise<WaitForBossDetailResult> => {
-  if (options.signal?.aborted === true) {
-    return { status: "aborted" };
-  }
-
-  const initialBlock = detectBossPageBlock(options.document, options.url);
-  if (initialBlock !== null) {
-    return { status: "blocked", block: initialBlock };
-  }
-
-  const timeoutMs = Math.max(0, options.timeoutMs ?? DEFAULT_DETAIL_TIMEOUT_MS);
-  const previousHash = previousHashFromOptions(options);
-  const MutationObserverConstructor =
-    options.document.defaultView?.MutationObserver;
-
-  return await new Promise<WaitForBossDetailResult>((resolve) => {
-    let settled = false;
-    let observer: MutationObserver | null = null;
-    let lastIdentity: BossIdentityVerification | null = null;
-
-    const finish = (result: WaitForBossDetailResult): void => {
-      if (settled) {
-        return;
-      }
-
-      settled = true;
-      observer?.disconnect();
-      clearTimeout(timer);
-      options.signal?.removeEventListener("abort", onAbort);
-      resolve(result);
-    };
-
-    const onAbort = (): void => {
-      finish({ status: "aborted" });
-    };
-
-    const evaluate = (): void => {
-      const block = detectBossPageBlock(options.document, options.url);
-      if (block !== null) {
-        finish({ status: "blocked", block });
-        return;
-      }
-
-      const detail = parseBossDetail(options.document, options.url);
-      if (detail === null) {
-        return;
-      }
-      const identity = verifyDetailIdentity({
-        expected: options.expected,
-        detail,
-        activeCard: findActiveCard(options.document, options.url),
-        ...(options.previousDetail === undefined
-          ? {}
-          : { previousDetail: options.previousDetail }),
-        ...(options.previousDetailHash === undefined
-          ? {}
-          : { previousDetailHash: options.previousDetailHash }),
-      });
-      lastIdentity = identity;
-      const contentUpdated =
-        previousHash === null || identity.signals.contentChanged === true;
-      const predicateMatched =
-        options.predicate?.({ detail, identity }) ?? detail.description !== null;
-
-      if (identity.verified && contentUpdated && predicateMatched) {
-        finish({ status: "verified", detail, identity });
-      }
-    };
-
-    const timer = setTimeout(() => {
-      finish({ status: "timeout", lastIdentity });
-    }, timeoutMs);
-
-    options.signal?.addEventListener("abort", onAbort, { once: true });
-
-    if (MutationObserverConstructor !== undefined) {
-      observer = new MutationObserverConstructor(evaluate);
-      observer.observe(options.document.documentElement, {
-        attributes: true,
-        childList: true,
-        characterData: true,
-        subtree: true,
-      });
-    }
-
-    evaluate();
-  });
-};
-
-const identityFromSelection = (
-  selection: BossDetailSelection,
-  url: string,
-): BossJobIdentity => selection.expected ?? parseCardElement(selection.element, url);
-
-const activateSelection = (selection: BossDetailSelection): void => {
-  const view = selection.element.ownerDocument.defaultView;
-  if (view === null) {
-    return;
-  }
-
-  const target =
-    queryFirstWithAttribute(selection.element, bossSelectors.card.links, "href") ??
-    selection.element;
-  target.dispatchEvent(
-    new view.MouseEvent("click", { bubbles: true, cancelable: true }),
-  );
-};
-
-export const scanSelectedBossDetails = async (
-  options: ScanSelectedBossDetailsOptions,
-): Promise<BossDetailScanResult> => {
-  const entries: BossDetailScanResult["entries"] = [];
-  const details: BossJobDetail[] = [];
-  let block: BossPageBlock | null = null;
-  const initialBlock = detectBossPageBlock(options.document, options.url);
-  if (initialBlock !== null) {
-    return { entries, details, block: initialBlock };
-  }
-
-  for (const [index, selection] of options.selections.entries()) {
-    if (options.signal?.aborted === true) {
-      entries.push({
-        index,
-        expected: identityFromSelection(selection, options.url),
-        result: { status: "aborted" },
-      });
-      break;
-    }
-
-    const expected = identityFromSelection(selection, options.url);
-    const previousDetail = parseBossDetail(options.document, options.url);
-
-    if (previousDetail !== null) {
-      const currentIdentity = verifyDetailIdentity({
-        expected,
-        detail: previousDetail,
-        activeCard: findActiveCard(options.document, options.url),
-      });
-      const predicateMatched =
-        options.predicate?.({ detail: previousDetail, identity: currentIdentity }) ??
-        previousDetail.description !== null;
-
-      if (currentIdentity.verified && predicateMatched) {
-        const result: WaitForBossDetailResult = {
-          status: "verified",
-          detail: previousDetail,
-          identity: currentIdentity,
-        };
-        entries.push({ index, expected, result });
-        details.push(previousDetail);
-        continue;
-      }
-    }
-
-    if (options.activate === undefined) {
-      activateSelection(selection);
-    } else {
-      await options.activate(selection, index);
-    }
-
-    const result = await waitForBossDetail({
-      document: options.document,
-      url: options.url,
-      expected,
-      previousDetail,
-      ...(options.predicate === undefined
-        ? {}
-        : { predicate: options.predicate }),
-      ...(options.timeoutMs === undefined
-        ? {}
-        : { timeoutMs: options.timeoutMs }),
-      ...(options.signal === undefined ? {} : { signal: options.signal }),
-    });
-    entries.push({ index, expected, result });
-
-    if (result.status === "verified") {
-      details.push(result.detail);
-    } else if (result.status === "aborted") {
-      break;
-    } else if (result.status === "blocked") {
-      block = result.block;
-      if (
-        result.block.reason === "challenge" ||
-        result.block.reason === "account_risk"
-      ) {
-        break;
-      }
-    }
-  }
-
-  return { entries, details, block };
 };

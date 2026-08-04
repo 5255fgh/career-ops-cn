@@ -1,7 +1,7 @@
 import { readFileSync } from "node:fs";
 
 import { Window } from "happy-dom";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { describe, expect, it } from "vitest";
 
 import {
   bossSelectors,
@@ -10,13 +10,10 @@ import {
   findBossJobCardElement,
   parseBossDetail,
   parseVisibleBossCards,
-  scanSelectedBossDetails,
   sourceJobIdFromUrl,
   verifyDetailIdentity,
-  waitForBossDetail,
 } from "../src/index.js";
 import type {
-  BossJobIdentity,
   BossPageBlockReason,
   BossPageType,
 } from "../src/index.js";
@@ -64,10 +61,6 @@ const expectations = JSON.parse(readFixture("expectations.json")) as Record<
   string,
   { pageType: BossPageType; block: BossPageBlockReason | null }
 >;
-
-afterEach(() => {
-  vi.useRealTimers();
-});
 
 describe("fixture 页面识别和阻断", () => {
   for (const [filename, expected] of Object.entries(expectations)) {
@@ -206,18 +199,6 @@ describe("详情身份校验", () => {
 
     expect(result.verified).toBe(true);
     expect(result.matchedSignals).toEqual(["job_identity", "title"]);
-    window.close();
-  });
-
-  it("分页 Selector 能识别真实 fixture 中的下一页入口", () => {
-    const url = fixtureUrls["search-list.html"]!;
-    const { window, document } = createDocument("search-list.html", url);
-
-    expect(
-      bossSelectors.pagination.next.some(
-        (selector) => document.querySelector(selector) !== null,
-      ),
-    ).toBe(true);
     window.close();
   });
 
@@ -367,182 +348,7 @@ describe("详情身份校验", () => {
   });
 });
 
-describe("等待与批量扫描", () => {
-  const expectedA: BossJobIdentity = {
-    sourceJobId: "boss-a",
-    url: "https://www.zhipin.com/job_detail/boss-a.html",
-    title: "职位 A",
-  };
-
-  it("详情内容未变化时等待到可预测 timeout", async () => {
-    vi.useFakeTimers();
-    const url = fixtureUrls["detail-unchanged.html"]!;
-    const { window, document } = createDocument("detail-unchanged.html", url);
-    const previousDetail = parseBossDetail(document, url)!;
-    let settled = false;
-    const pending = waitForBossDetail({
-      document,
-      url,
-      expected: expectedA,
-      previousDetail,
-      timeoutMs: 250,
-    }).then((result) => {
-      settled = true;
-      return result;
-    });
-
-    await vi.advanceTimersByTimeAsync(249);
-    expect(settled).toBe(false);
-    await vi.advanceTimersByTimeAsync(1);
-    await expect(pending).resolves.toMatchObject({ status: "timeout" });
-    window.close();
-  });
-
-  it("MutationObserver 在详情变化并满足 predicate 后返回 verified", async () => {
-    const url = fixtureUrls["detail-unchanged.html"]!;
-    const { window, document } = createDocument("detail-unchanged.html", url);
-    const previousDetail = parseBossDetail(document, url)!;
-    const pending = waitForBossDetail({
-      document,
-      url,
-      expected: expectedA,
-      previousDetail,
-      timeoutMs: 1_000,
-      predicate: ({ detail }) => detail.description === "已经更新的职位 A 详情。",
-    });
-
-    document.getElementById("unchanged-description")!.textContent =
-      "已经更新的职位 A 详情。";
-
-    await expect(pending).resolves.toMatchObject({
-      status: "verified",
-      detail: { description: "已经更新的职位 A 详情。" },
-    });
-    window.close();
-  });
-
-  it("AbortSignal 可以中断等待", async () => {
-    const url = fixtureUrls["detail-unchanged.html"]!;
-    const { window, document } = createDocument("detail-unchanged.html", url);
-    const controller = new AbortController();
-    const pending = waitForBossDetail({
-      document,
-      url,
-      expected: expectedA,
-      previousDetail: parseBossDetail(document, url),
-      timeoutMs: 10_000,
-      signal: controller.signal,
-    });
-
-    controller.abort();
-    await expect(pending).resolves.toEqual({ status: "aborted" });
-    window.close();
-  });
-
-  it.each([
-    ["challenge.html", "challenge"],
-    ["account-risk.html", "account_risk"],
-  ] as const)("%s 命中后立即返回阻断结果", async (filename, reason) => {
-    const url = fixtureUrls[filename]!;
-    const { window, document } = createDocument(filename, url);
-
-    await expect(
-      waitForBossDetail({
-        document,
-        url,
-        expected: expectedA,
-        timeoutMs: 10_000,
-      }),
-    ).resolves.toMatchObject({ status: "blocked", block: { reason } });
-    window.close();
-  });
-
-  it("空 selections 扫描也会返回挑战阻断", async () => {
-    const filename = "challenge.html";
-    const url = fixtureUrls[filename]!;
-    const { window, document } = createDocument(filename, url);
-
-    await expect(
-      scanSelectedBossDetails({ document, url, selections: [] }),
-    ).resolves.toMatchObject({
-      entries: [],
-      details: [],
-      block: { reason: "challenge" },
-    });
-    window.close();
-  });
-
-  it("扫描选中卡片时只收集完成身份校验的详情", async () => {
-    const url = fixtureUrls["search-detail-panel.html"]!;
-    const { window, document } = createDocument(
-      "search-detail-panel.html",
-      url,
-    );
-    const cardB = document.getElementById("panel-card-b")!;
-    const cardBLink = cardB.querySelector("a.job-card-left")!;
-    const linkClicked = vi.fn();
-    cardBLink.addEventListener("click", linkClicked);
-    cardB.addEventListener("click", () => {
-      document
-        .getElementById("panel-detail")!
-        .setAttribute("data-jobid", "boss-3002");
-      document
-        .getElementById("panel-detail-link")!
-        .setAttribute("href", "/job_detail/boss-3002.html");
-      document.getElementById("panel-detail-title")!.textContent = "全栈工程师";
-      document.getElementById("panel-detail-company")!.textContent =
-        "示例戊科技";
-      document.getElementById("panel-description")!.textContent =
-        "负责全栈产品研发。";
-    });
-
-    const result = await scanSelectedBossDetails({
-      document,
-      url,
-      selections: [{ element: cardB }],
-      timeoutMs: 1_000,
-    });
-
-    expect(linkClicked).toHaveBeenCalledOnce();
-    expect(result.block).toBeNull();
-    expect(result.entries[0]?.result.status).toBe("verified");
-    expect(result.details).toHaveLength(1);
-    expect(result.details[0]).toMatchObject({
-      sourceJobId: "boss-3002",
-      title: "全栈工程师",
-      description: "负责全栈产品研发。",
-    });
-    window.close();
-  });
-
-  it("目标卡片的详情已加载时直接验证且不重复点击", async () => {
-    const url = fixtureUrls["search-detail-panel.html"]!;
-    const { window, document } = createDocument(
-      "search-detail-panel.html",
-      url,
-    );
-    const cardA = document.getElementById("panel-card-a")!;
-    const clicked = vi.fn();
-    cardA.addEventListener("click", clicked);
-
-    const result = await scanSelectedBossDetails({
-      document,
-      url,
-      selections: [{ element: cardA }],
-      timeoutMs: 1_000,
-    });
-
-    expect(clicked).not.toHaveBeenCalled();
-    expect(result.block).toBeNull();
-    expect(result.entries[0]?.result.status).toBe("verified");
-    expect(result.details[0]).toMatchObject({
-      sourceJobId: "boss-3001",
-      title: "Web 前端工程师",
-      description: "负责 Web 产品研发与维护。",
-    });
-    window.close();
-  });
-
+describe("搜索卡片定位", () => {
   it("按 Job ID、标准化 URL、标题与公司依次定位卡片，不依赖 index", () => {
     const url = fixtureUrls["search-detail-panel.html"]!;
     const { window, document } = createDocument(

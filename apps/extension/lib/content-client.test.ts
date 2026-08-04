@@ -61,11 +61,6 @@ describe('Content client', () => {
               },
             ],
           };
-        case 'boss/advance-search-page/request':
-          return {
-            type: 'boss/advance-search-page/response',
-            outcome: 'advanced',
-          };
         case 'boss/cancel-detail-scan/request':
           return { type: 'boss/cancel-detail-scan/response', cancelled: true };
         default:
@@ -94,9 +89,6 @@ describe('Content client', () => {
         }),
       ],
     });
-    await expect(client.advanceSearchPage(8_000)).resolves.toMatchObject({
-      outcome: 'advanced',
-    });
     await expect(client.cancelDetailScan()).resolves.toBe(true);
 
     expect(sendMessage.mock.calls.map(([, message]) => (message as { type: string }).type)).toEqual([
@@ -104,7 +96,6 @@ describe('Content client', () => {
       'boss/extract-current-detail/request',
       'boss/extract-visible-cards/request',
       'boss/start-detail-scan/request',
-      'boss/advance-search-page/request',
       'boss/cancel-detail-scan/request',
     ]);
   });
@@ -146,30 +137,6 @@ describe('Content client', () => {
     controller.abort(new DOMException('轮次超时。', 'TimeoutError'));
 
     await expect(detection).rejects.toMatchObject({ name: 'TimeoutError' });
-  });
-
-  it('传统整页翻页导致消息端口断开时，会等待新 Content Script 后继续', async () => {
-    const sendMessage = vi
-      .fn<TabsClient['sendMessage']>()
-      .mockRejectedValueOnce(new Error('The message port closed'))
-      .mockResolvedValueOnce({
-        type: 'boss/detect-page/response',
-        pageType: 'search-list',
-        block: null,
-      });
-    const client = createContentClient({
-      query: async () => [{ id: 9 }],
-      sendMessage,
-    });
-
-    await expect(client.advanceSearchPage(500)).resolves.toEqual({
-      type: 'boss/advance-search-page/response',
-      outcome: 'advanced',
-    });
-    expect(sendMessage.mock.calls.map(([, message]) => (message as { type: string }).type)).toEqual([
-      'boss/advance-search-page/request',
-      'boss/detect-page/request',
-    ]);
   });
 
   it('没有活动标签页时返回明确错误', async () => {

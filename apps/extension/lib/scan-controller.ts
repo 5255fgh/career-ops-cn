@@ -26,7 +26,7 @@ import {
 import { ContentClientError, type ContentClient } from './content-client';
 
 export const DEFAULT_SCAN_CONFIG: ScanConfig = Object.freeze({
-  maxPages: 3,
+  maxPages: 1,
   maxNewJobs: 60,
   maxAiJobs: 30,
   detailTimeoutMs: 8_000,
@@ -52,10 +52,8 @@ export type ScanStatus =
 export type ScanStopReason =
   | BossPageBlockReason
   | 'parser_failure_limit'
-  | 'page_navigation_failed'
-  | 'page_limit'
+  | 'current_page_complete'
   | 'new_job_limit'
-  | 'no_new_jobs'
   | 'end_of_results'
   | 'round_time_limit';
 
@@ -823,6 +821,11 @@ export class ScanController {
       throw new Error('扫描已在进行中。');
     }
 
+    const maxPages = options.maxPages ?? this.config.maxPages;
+    if (maxPages !== 1) {
+      throw new RangeError('BOSS 搜索扫描只允许处理当前页，maxPages 必须为 1。');
+    }
+
     const controller = new AbortController();
     this.abortController = controller;
     this.currentScanId = null;
@@ -830,7 +833,6 @@ export class ScanController {
     this.diagnosticError = null;
     this.hasIssuedBossRequest = false;
     this.interruptionRequested = false;
-    const maxPages = options.maxPages ?? this.config.maxPages;
     const maxNewJobs = options.maxNewJobs ?? this.config.maxNewJobs;
     const maxAiJobs = options.maxAiJobs ?? this.config.maxAiJobs;
     const maxRoundMs = options.maxRoundMs ?? this.config.maxRoundMs;
@@ -909,21 +911,17 @@ export class ScanController {
 
       const seenKeys = new Set<string>();
 
-      let consecutiveNoNewPages = 0;
       let detailAttempts = 0;
       const parserFailuresByKind = new Map<string, number>();
       let parserFailureMessage: string | null = null;
-      let discoveryStopReason: ScanStopReason = 'page_limit';
+      let discoveryStopReason: ScanStopReason = 'current_page_complete';
 
       discovery: while (this.currentState.progress.pagesVisited < maxPages) {
         if (controller.signal.aborted) {
           throw controller.signal.reason ?? abortError();
         }
 
-        const page =
-          this.currentState.progress.pagesVisited === 0
-            ? firstPage
-            : await this.content.detectPage(controller.signal);
+        const page = firstPage;
         this.sourceQuery = page.sourceQuery ?? this.sourceQuery;
         if (page.block !== null && FATAL_PAGE_BLOCKS.has(page.block.reason)) {
           this.stop(page.block.reason, `页面已停止扫描：${page.block.reason}`);
@@ -1080,8 +1078,6 @@ export class ScanController {
         });
         await this.persistRun('reading-list');
 
-        consecutiveNoNewPages =
-          pageNewJobs === 0 ? consecutiveNoNewPages + 1 : 0;
         if (pageCards.length > 0) {
           this.update({
             results: [
@@ -1282,41 +1278,7 @@ export class ScanController {
           discoveryStopReason = 'new_job_limit';
           break discovery;
         }
-        if (consecutiveNoNewPages >= 2) {
-          discoveryStopReason = 'no_new_jobs';
-          break discovery;
-        }
-        if (nextPagesVisited >= maxPages) {
-          discoveryStopReason = 'page_limit';
-          break discovery;
-        }
-
-        await this.beforeBossRequest(controller.signal);
-        const advance = await this.content.advanceSearchPage(
-          this.config.detailTimeoutMs,
-          controller.signal,
-        );
-        if (advance.outcome === 'cancelled') {
-          throw abortError();
-        }
-        if (advance.outcome === 'blocked') {
-          this.stop(advance.reason, `页面已停止扫描：${advance.reason}`);
-          await this.diagnose({
-            level: 'warning',
-            event: 'scan_stopped',
-            outcome: advance.reason,
-            message: `页面已停止扫描：${advance.reason}`,
-          });
-          return this.currentState;
-        }
-        if (advance.outcome === 'end') {
-          discoveryStopReason = 'end_of_results';
-          break discovery;
-        }
-        if (advance.outcome === 'failed') {
-          this.stop('page_navigation_failed', advance.message);
-          return this.currentState;
-        }
+        break discovery;
       }
 
       const evaluationTargets = this.currentState.results

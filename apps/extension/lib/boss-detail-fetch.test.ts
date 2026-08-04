@@ -4,11 +4,7 @@ import { JobCardSchema, type VisibleJobCard } from '@career-ops-cn/shared';
 import { Window } from 'happy-dom';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import {
-  fetchBossDetail,
-  readBossDetailFromLivePanel,
-  toJobCard,
-} from './boss-detail-fetch';
+import { fetchBossDetail, toJobCard } from './boss-detail-fetch';
 
 const card: VisibleJobCard = {
   index: 0,
@@ -227,7 +223,7 @@ describe('fetchBossDetail', () => {
     fixture.window.close();
   });
 
-  it('fetch 缺少详情容器时点击按 Job ID 找到的卡片并读取实时面板', async () => {
+  it('fetch 缺少详情容器时按单职位布局失败处理', async () => {
     const shell = createDocument(
       'fetch-detail-shell.html',
       panelCard.job.detailUrl,
@@ -262,129 +258,6 @@ describe('fetchBossDetail', () => {
       ],
     });
     expect(JSON.stringify(fetched)).not.toContain('do-not-log');
-
-    const searchUrl = 'https://www.zhipin.com/web/geek/job?query=frontend';
-    const panel = createDocument('search-detail-panel.html', searchUrl);
-    panel.document.getElementById('panel-card-b')!.addEventListener('click', () => {
-      panel.document
-        .getElementById('panel-detail')!
-        .setAttribute('data-jobid', 'boss-3002');
-      panel.document
-        .getElementById('panel-detail-link')!
-        .setAttribute('href', '/job_detail/boss-3002.html');
-      panel.document.getElementById('panel-detail-title')!.textContent =
-        '全栈工程师';
-      panel.document.getElementById('panel-detail-company')!.textContent =
-        '示例戊科技';
-      panel.document.getElementById('panel-description')!.textContent =
-        '负责全栈产品研发。';
-    });
-
-    const result = await readBossDetailFromLivePanel({
-      document: panel.document,
-      url: searchUrl,
-      card: panelCard,
-      timeoutMs: 1_000,
-      signal: new AbortController().signal,
-      previousDiagnostics: fetched.diagnostics ?? [],
-    });
-
-    expect(result).toMatchObject({
-      outcome: 'success',
-      job: {
-        jobId: 'boss-3002',
-        title: '全栈工程师',
-        description: '负责全栈产品研发。',
-        identityVerified: true,
-      },
-      diagnostics: [
-        expect.objectContaining({
-          source: 'fetch',
-          hasDetailContainer: false,
-        }),
-        expect.objectContaining({
-          source: 'live-panel',
-          matchedBy: 'source_job_id',
-          hasDetailContainer: true,
-          outcome: 'success',
-        }),
-      ],
-    });
     shell.window.close();
-    panel.window.close();
-  });
-
-  it('实时面板点击后身份仍不一致时拒绝详情结果', async () => {
-    vi.useFakeTimers();
-    const searchUrl = 'https://www.zhipin.com/web/geek/job?query=frontend';
-    const panel = createDocument('search-detail-panel.html', searchUrl);
-    const pending = readBossDetailFromLivePanel({
-      document: panel.document,
-      url: searchUrl,
-      card: panelCard,
-      timeoutMs: 250,
-      signal: new AbortController().signal,
-    });
-
-    await vi.advanceTimersByTimeAsync(250);
-
-    await expect(pending).resolves.toMatchObject({
-      outcome: 'identity_failure',
-      evidence: {
-        actualJobId: 'boss-3001',
-        signals: { jobIdentity: false },
-      },
-      diagnostics: [
-        expect.objectContaining({
-          source: 'live-panel',
-          matchedBy: 'source_job_id',
-          outcome: 'identity_failure',
-        }),
-      ],
-    });
-    panel.window.close();
-  });
-
-  it('实时面板身份匹配但仍缺少 description 时按单职位字段缺失处理', async () => {
-    vi.useFakeTimers();
-    const searchUrl = 'https://www.zhipin.com/web/geek/job?query=frontend';
-    const panel = createDocument('search-detail-panel.html', searchUrl);
-    panel.document.getElementById('panel-card-b')!.addEventListener('click', () => {
-      panel.document
-        .getElementById('panel-detail')!
-        .setAttribute('data-jobid', 'boss-3002');
-      panel.document
-        .getElementById('panel-detail-link')!
-        .setAttribute('href', '/job_detail/boss-3002.html');
-      panel.document.getElementById('panel-detail-title')!.textContent =
-        '全栈工程师';
-      panel.document.getElementById('panel-detail-company')!.textContent =
-        '示例戊科技';
-      panel.document.getElementById('panel-description')!.textContent = '';
-    });
-
-    const pending = readBossDetailFromLivePanel({
-      document: panel.document,
-      url: searchUrl,
-      card: panelCard,
-      timeoutMs: 250,
-      signal: new AbortController().signal,
-    });
-
-    await vi.advanceTimersByTimeAsync(250);
-
-    await expect(pending).resolves.toMatchObject({
-      outcome: 'failed',
-      failureKind: 'missing_fields',
-      diagnostics: [
-        expect.objectContaining({
-          source: 'live-panel',
-          matchedBy: 'source_job_id',
-          missingFields: expect.arrayContaining(['description']),
-          outcome: 'missing_fields',
-        }),
-      ],
-    });
-    panel.window.close();
   });
 });

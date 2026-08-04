@@ -86,7 +86,6 @@ function scanRun(status: 'running' | 'cancelled' | 'interrupted' = 'running') {
 }
 
 function contentMock(pages: VisibleJobCard[][]): ContentClient {
-  let pageIndex = 0;
   return {
     detectPage: vi.fn(async () => ({
       type: 'boss/detect-page/response' as const,
@@ -95,7 +94,7 @@ function contentMock(pages: VisibleJobCard[][]): ContentClient {
     })),
     extractCurrentDetail: vi.fn(async () => null),
     extractVisibleCards: vi.fn(async () => {
-      const cards = pages[pageIndex] ?? [];
+      const cards = pages[0] ?? [];
       return {
         type: 'boss/extract-visible-cards/response' as const,
         cards,
@@ -108,19 +107,6 @@ function contentMock(pages: VisibleJobCard[][]): ContentClient {
       outcome: 'success' as const,
       job: detailFor(card),
     })),
-    advanceSearchPage: vi.fn(async () => {
-      if (pageIndex + 1 >= pages.length) {
-        return {
-          type: 'boss/advance-search-page/response' as const,
-          outcome: 'end' as const,
-        };
-      }
-      pageIndex += 1;
-      return {
-        type: 'boss/advance-search-page/response' as const,
-        outcome: 'advanced' as const,
-      };
-    }),
     cancelDetailScan: vi.fn(async () => true),
   };
 }
@@ -245,9 +231,9 @@ describe('ScanController', () => {
     expect(restored.warnings[0]).toContain('可重新开始');
   });
 
-  it('固定默认预算支持 3 页、60 个新职位和至少 30 次 AI', () => {
+  it('默认只处理当前页，同时保留其他预算', () => {
     expect(DEFAULT_SCAN_CONFIG).toMatchObject({
-      maxPages: 3,
+      maxPages: 1,
       maxNewJobs: 60,
       maxAiJobs: 30,
       requestIntervalMs: 1_800,
@@ -255,8 +241,8 @@ describe('ScanController', () => {
     });
   });
 
-  it('一次点击自动处理多页，并在 60 个新职位预算处正常完成', async () => {
-    const pages = [0, 1, 2].map((page) =>
+  it('当前页存在后续页面时也只处理一次并正常完成', async () => {
+    const pages = [0, 1].map((page) =>
       Array.from({ length: 25 }, (_, index) => visibleCard(index, page)),
     );
     const content = contentMock(pages);
@@ -274,12 +260,21 @@ describe('ScanController', () => {
 
     expect(state.error).toBeNull();
     expect(state.status).toBe('completed');
-    expect(state.stopReason).toBe('new_job_limit');
-    expect(state.progress.pagesVisited).toBe(3);
-    expect(state.progress.newJobs).toBe(60);
-    expect(state.results).toHaveLength(60);
-    expect(content.advanceSearchPage).toHaveBeenCalledTimes(2);
+    expect(state.stopReason).toBe('current_page_complete');
+    expect(state.progress.pagesVisited).toBe(1);
+    expect(state.progress.newJobs).toBe(25);
+    expect(state.results).toHaveLength(25);
+    expect(content.extractVisibleCards).toHaveBeenCalledOnce();
     expect(content.startDetailScan).not.toHaveBeenCalled();
+  });
+
+  it('maxPages 不为 1 时在创建 run 前明确拒绝', async () => {
+    const content = contentMock([[visibleCard(0)]]);
+    const bridge = bridgeMock();
+    const scan = controller(content, bridge);
+
+    await expect(scan.run({ maxPages: 2 })).rejects.toThrow();
+    expect(bridge.createScanRun).not.toHaveBeenCalled();
   });
 
   it('单个职位超时只记录失败，下一个职位仍保存并评估', async () => {
@@ -558,22 +553,6 @@ describe('ScanController', () => {
     expect(bridge.evaluateJob).not.toHaveBeenCalled();
   });
 
-  it('翻页时出现 challenge 会立即停止，不再读取下一页', async () => {
-    const content = contentMock([[visibleCard(0)], [visibleCard(0, 1)]]);
-    vi.mocked(content.advanceSearchPage).mockResolvedValue({
-      type: 'boss/advance-search-page/response',
-      outcome: 'blocked',
-      reason: 'challenge',
-    });
-    const bridge = bridgeMock();
-
-    const state = await controller(content, bridge).run();
-
-    expect(state.status).toBe('failed');
-    expect(state.stopReason).toBe('challenge');
-    expect(content.extractVisibleCards).toHaveBeenCalledOnce();
-  });
-
   it('5 个详情成功、3 个 layout 失败时继续完成并评估所有成功职位', async () => {
     const cards = Array.from({ length: 8 }, (_, index) => visibleCard(index));
     const content = contentMock([cards]);
@@ -598,7 +577,7 @@ describe('ScanController', () => {
     const state = await controller(content, bridge).run({ maxPages: 1 });
 
     expect(state.status).toBe('completed');
-    expect(state.stopReason).toBe('page_limit');
+    expect(state.stopReason).toBe('current_page_complete');
     expect(state.progress).toMatchObject({
       detailCompleted: 8,
       detailSuccess: 5,
@@ -664,38 +643,6 @@ describe('ScanController', () => {
       expect(bridge.evaluateJob).not.toHaveBeenCalled();
     },
   );
-
-  it('连续两页没有新职位时正常完成', async () => {
-    const duplicate = visibleCard(0);
-    const content = contentMock([[duplicate], [duplicate], [visibleCard(1, 2)]]);
-    const bridge = bridgeMock();
-    const existing = savedFor(detailFor(duplicate));
-    vi.mocked(bridge.observeJobs).mockImplementation(
-      async (_runId, _sourceQuery, jobs) =>
-        jobs.map((job) => ({
-          sourceJobId: job.jobId,
-          action: 'reuse' as const,
-          job: existing,
-          evaluation: {
-            score: 88,
-            recommendation: 'apply',
-            rawReport: '缓存评估。',
-          },
-          cacheHit: true,
-        })),
-    );
-
-    const state = await controller(content, bridge).run();
-
-    expect(state.status).toBe('completed');
-    expect(state.stopReason).toBe('no_new_jobs');
-    expect(state.progress.pagesVisited).toBe(2);
-    expect(content.advanceSearchPage).toHaveBeenCalledOnce();
-    expect(state.results).toHaveLength(1);
-    expect(state.progress.cacheHits).toBe(1);
-    expect(content.startDetailScan).not.toHaveBeenCalled();
-    expect(bridge.evaluateJob).not.toHaveBeenCalled();
-  });
 
   it('旧职位 cache miss 时重建完整硬规则，阻断后不调用 AI', async () => {
     const card = visibleCard(0);
