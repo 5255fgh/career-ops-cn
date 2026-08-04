@@ -76,7 +76,7 @@ function extractVisibleCards(
     if (job !== null) {
       if (
         card.url !== null &&
-        locatorStore.register(session, job.jobId, card.url)
+        locatorStore.register(session, job.jobId, job.detailUrl, card.url)
       ) {
         cards.push({ index, job });
       } else {
@@ -332,6 +332,7 @@ export default defineContentScript({
         const rawDetailUrl = locatorStore.resolve(
           startRequest.data,
           startRequest.data.sourceJobId,
+          startRequest.data.detailUrl,
         );
         if (rawDetailUrl === null) {
           return StartDetailScanResponseSchema.parse({

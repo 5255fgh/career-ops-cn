@@ -1,9 +1,40 @@
 import { sourceJobIdFromUrl } from '@career-ops-cn/boss-adapter';
-import type {
-  BossAccountFatalReason,
-  BossFatalBlockEvent,
+import {
+  canonicalizeZhipinUrl,
+  type BossAccountFatalReason,
+  type BossFatalBlockEvent,
 } from '@career-ops-cn/shared';
 
+const BOSS_DETAIL_PATH_PATTERN = /^\/job_detail\/[^/.?#]+\.html$/u;
+
+function isBossDetailLocator(
+  rawDetailUrl: string,
+  canonicalDetailUrl: string,
+  expectedOrigin: string,
+  sourceJobId: string,
+): boolean {
+  try {
+    const url = new URL(rawDetailUrl);
+    const hostname = url.hostname.toLowerCase();
+    return (
+      url.protocol === 'https:' &&
+      url.username === '' &&
+      url.password === '' &&
+      (hostname === 'zhipin.com' || hostname.endsWith('.zhipin.com')) &&
+      url.origin === expectedOrigin &&
+      BOSS_DETAIL_PATH_PATTERN.test(url.pathname) &&
+      sourceJobIdFromUrl(rawDetailUrl) === sourceJobId &&
+      canonicalizeZhipinUrl(rawDetailUrl) === canonicalDetailUrl
+    );
+  } catch {
+    return false;
+  }
+}
+
+/*
+ * raw locator 只能存在于当前 content session；canonicalDetailUrl 则是允许跨
+ * context 的公开身份。两者在注册和解析时都必须保持一一对应。
+ */
 export interface BossLocatorSessionRef {
   sessionId: string;
   generation: string;
@@ -18,25 +49,10 @@ export type BossContentSessionValidation =
   | { status: 'context_changed' }
   | { status: 'fatal'; event: BossFatalBlockEvent };
 
-function isBossDetailLocator(
-  value: string,
-  expectedOrigin: string,
-  sourceJobId: string,
-): boolean {
-  try {
-    const url = new URL(value);
-    const hostname = url.hostname.toLowerCase();
-    return (
-      url.protocol === 'https:' &&
-      (hostname === 'zhipin.com' || hostname.endsWith('.zhipin.com')) &&
-      url.origin === expectedOrigin &&
-      sourceJobIdFromUrl(value) === sourceJobId
-    );
-  } catch {
-    return false;
-  }
-}
-
+/*
+ * 不要把该结构扩展成通用 URL 注册中心；这里只接受仓库 fixture 已证明的
+ * BOSS 详情 URL 形态。
+ */
 export class BossContentLocatorStore {
   private activeSession:
     | (BossContentSession & {
@@ -56,6 +72,8 @@ export class BossContentLocatorStore {
     const hostname = parsedOrigin.hostname.toLowerCase();
     if (
       parsedOrigin.protocol !== 'https:' ||
+      parsedOrigin.username !== '' ||
+      parsedOrigin.password !== '' ||
       (hostname !== 'zhipin.com' && !hostname.endsWith('.zhipin.com'))
     ) {
       throw new TypeError('BOSS locator store 需要可信的 zhipin.com HTTPS origin。');
@@ -121,11 +139,17 @@ export class BossContentLocatorStore {
   register(
     session: BossLocatorSessionRef,
     sourceJobId: string,
+    canonicalDetailUrl: string,
     rawDetailUrl: string,
   ): boolean {
     if (
       !this.isUsableSession(session) ||
-      !isBossDetailLocator(rawDetailUrl, this.expectedOrigin, sourceJobId)
+      !isBossDetailLocator(
+        rawDetailUrl,
+        canonicalDetailUrl,
+        this.expectedOrigin,
+        sourceJobId,
+      )
     ) {
       return false;
     }
@@ -136,11 +160,22 @@ export class BossContentLocatorStore {
   resolve(
     session: BossLocatorSessionRef,
     sourceJobId: string,
+    canonicalDetailUrl: string,
   ): string | null {
     if (!this.isUsableSession(session)) {
       return null;
     }
-    return this.locators.get(this.key(session.sessionId, sourceJobId)) ?? null;
+    const rawDetailUrl =
+      this.locators.get(this.key(session.sessionId, sourceJobId)) ?? null;
+    return rawDetailUrl !== null &&
+      isBossDetailLocator(
+        rawDetailUrl,
+        canonicalDetailUrl,
+        this.expectedOrigin,
+        sourceJobId,
+      )
+      ? rawDetailUrl
+      : null;
   }
 
   clearLocators(): void {

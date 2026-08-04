@@ -9,18 +9,35 @@ describe('BossContentLocatorStore', () => {
       'generation-1',
     );
     const first = store.beginSession('session-1', 'boss:/web/geek/jobs');
+    const canonicalUrl =
+      'https://www.zhipin.com/job_detail/boss-1.html';
     const rawUrl =
       'https://www.zhipin.com/job_detail/boss-1.html?securityId=volatile';
 
-    expect(store.register(first, 'boss-1', rawUrl)).toBe(true);
-    expect(store.resolve(first, 'boss-1')).toBe(rawUrl);
+    expect(store.register(first, 'boss-1', canonicalUrl, rawUrl)).toBe(true);
+    expect(store.resolve(first, 'boss-1', canonicalUrl)).toBe(rawUrl);
     expect(
-      store.resolve({ ...first, sessionId: 'session-other' }, 'boss-1'),
+      store.resolve(
+        { ...first, sessionId: 'session-other' },
+        'boss-1',
+        canonicalUrl,
+      ),
     ).toBeNull();
     expect(
-      store.resolve({ ...first, generation: 'generation-other' }, 'boss-1'),
+      store.resolve(
+        { ...first, generation: 'generation-other' },
+        'boss-1',
+        canonicalUrl,
+      ),
     ).toBeNull();
-    expect(store.resolve(first, 'boss-other')).toBeNull();
+    expect(store.resolve(first, 'boss-other', canonicalUrl)).toBeNull();
+    expect(
+      store.resolve(
+        first,
+        'boss-1',
+        'https://www.zhipin.com/job_detail/boss-other.html',
+      ),
+    ).toBeNull();
   });
 
   it('新 session 与显式 clear 都会清除旧 locator', () => {
@@ -32,18 +49,32 @@ describe('BossContentLocatorStore', () => {
     store.register(
       first,
       'boss-1',
+      'https://www.zhipin.com/job_detail/boss-1.html',
       'https://www.zhipin.com/job_detail/boss-1.html?securityId=first',
     );
 
     const second = store.beginSession('session-2', 'boss:/web/geek/jobs');
-    expect(store.resolve(first, 'boss-1')).toBeNull();
+    expect(
+      store.resolve(
+        first,
+        'boss-1',
+        'https://www.zhipin.com/job_detail/boss-1.html',
+      ),
+    ).toBeNull();
     store.register(
       second,
       'boss-2',
+      'https://www.zhipin.com/job_detail/boss-2.html',
       'https://www.zhipin.com/job_detail/boss-2.html?securityId=second',
     );
     store.clear();
-    expect(store.resolve(second, 'boss-2')).toBeNull();
+    expect(
+      store.resolve(
+        second,
+        'boss-2',
+        'https://www.zhipin.com/job_detail/boss-2.html',
+      ),
+    ).toBeNull();
   });
 
   it('queryScope 改变后 sticky context_changed 并清空 locator', () => {
@@ -58,6 +89,7 @@ describe('BossContentLocatorStore', () => {
     store.register(
       session,
       'boss-1',
+      'https://www.zhipin.com/job_detail/boss-1.html',
       'https://www.zhipin.com/job_detail/boss-1.html?securityId=volatile',
     );
 
@@ -67,7 +99,13 @@ describe('BossContentLocatorStore', () => {
     expect(
       store.validate(session, 'boss:/web/geek/job?query=TypeScript'),
     ).toEqual({ status: 'context_changed' });
-    expect(store.resolve(session, 'boss-1')).toBeNull();
+    expect(
+      store.resolve(
+        session,
+        'boss-1',
+        'https://www.zhipin.com/job_detail/boss-1.html',
+      ),
+    ).toBeNull();
   });
 
   it('account fatal 在 endSession 前保持 sticky 并禁止 locator 继续使用', () => {
@@ -79,6 +117,7 @@ describe('BossContentLocatorStore', () => {
     store.register(
       session,
       'boss-1',
+      'https://www.zhipin.com/job_detail/boss-1.html',
       'https://www.zhipin.com/job_detail/boss-1.html?securityId=volatile',
     );
 
@@ -93,11 +132,18 @@ describe('BossContentLocatorStore', () => {
       status: 'fatal',
       event: { reason: 'challenge' },
     });
-    expect(store.resolve(session, 'boss-1')).toBeNull();
+    expect(
+      store.resolve(
+        session,
+        'boss-1',
+        'https://www.zhipin.com/job_detail/boss-1.html',
+      ),
+    ).toBeNull();
     expect(
       store.register(
         session,
         'boss-2',
+        'https://www.zhipin.com/job_detail/boss-2.html',
         'https://www.zhipin.com/job_detail/boss-2.html?securityId=other',
       ),
     ).toBe(false);
@@ -122,6 +168,18 @@ describe('BossContentLocatorStore', () => {
       '非 BOSS host',
       'https://example.com/job_detail/boss-1.html?securityId=volatile',
     ],
+    [
+      '详情路径存在额外后缀',
+      'https://www.zhipin.com/job_detail/boss-1.html/extra?securityId=volatile',
+    ],
+    [
+      '详情路径缺少 .html',
+      'https://www.zhipin.com/job_detail/boss-1?securityId=volatile',
+    ],
+    [
+      'URL 内嵌身份信息',
+      'https://user:password@www.zhipin.com/job_detail/boss-1.html?securityId=volatile',
+    ],
   ])('%s 不能注册为 raw locator', (_label, rawUrl) => {
     const store = new BossContentLocatorStore(
       'https://www.zhipin.com',
@@ -129,8 +187,27 @@ describe('BossContentLocatorStore', () => {
     );
     const session = store.beginSession('session-1', 'boss:/web/geek/jobs');
 
-    expect(store.register(session, 'boss-1', rawUrl)).toBe(false);
-    expect(store.resolve(session, 'boss-1')).toBeNull();
+    const canonicalUrl =
+      'https://www.zhipin.com/job_detail/boss-1.html';
+    expect(store.register(session, 'boss-1', canonicalUrl, rawUrl)).toBe(false);
+    expect(store.resolve(session, 'boss-1', canonicalUrl)).toBeNull();
+  });
+
+  it('raw locator 与跨 context canonical detailUrl 不一致时拒绝注册', () => {
+    const store = new BossContentLocatorStore(
+      'https://www.zhipin.com',
+      'generation-1',
+    );
+    const session = store.beginSession('session-1', 'boss:/web/geek/jobs');
+
+    expect(
+      store.register(
+        session,
+        'boss-1',
+        'https://www.zhipin.com/job_detail/boss-other.html',
+        'https://www.zhipin.com/job_detail/boss-1.html?securityId=volatile',
+      ),
+    ).toBe(false);
   });
 
   it('不同 zhipin 子域也不能越过当前页面同源边界', () => {
@@ -144,6 +221,7 @@ describe('BossContentLocatorStore', () => {
       store.register(
         session,
         'boss-1',
+        'https://www.zhipin.com/job_detail/boss-1.html',
         'https://m.zhipin.com/job_detail/boss-1.html?securityId=volatile',
       ),
     ).toBe(false);
