@@ -91,6 +91,40 @@ describe('Bridge client', () => {
     expect(toCreateJobRequest(unverifiedJob).identityVerified).toBe(false);
   });
 
+  it('Bridge 请求会再次 canonicalize URL，并清理诊断敏感值', async () => {
+    const rawDetailUrl =
+      'https://www.zhipin.com/job_detail/123456789.html?securityId=volatile#detail';
+    expect(
+      toCreateJobRequest({ ...fixtureJob, detailUrl: rawDetailUrl }).url,
+    ).toBe(fixtureJob.detailUrl);
+
+    const fetchMock = vi.fn<FetchLike>(async (_input, init) => {
+      const payload = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      return jsonResponse({
+        ...payload,
+        id: 'diag-safe',
+        createdAt: '2026-08-01T10:00:00.000Z',
+      });
+    });
+    const client = createBridgeClient({ token: 'test-token', fetchImpl: fetchMock });
+
+    await client.recordDiagnostic({
+      source: 'extension',
+      level: 'warning',
+      event: 'detail_mapping',
+      message: `Cookie: sid=secret; ${rawDetailUrl}`,
+      details: {
+        originalDetailUrl: rawDetailUrl,
+        responseBody: '<html>secret response</html>',
+        accessToken: 'token-secret',
+      },
+    });
+
+    const body = String(fetchMock.mock.calls[0]?.[1]?.body);
+    expect(body).toContain(fixtureJob.detailUrl);
+    expect(body).not.toMatch(/securityId|sid=secret|secret response|token-secret/iu);
+  });
+
   it('通过 shared 契约创建、更新并恢复最近 scan run', async () => {
     const run = {
       id: 'scan-1',

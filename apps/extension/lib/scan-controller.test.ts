@@ -97,6 +97,8 @@ function contentMock(pages: VisibleJobCard[][]): ContentClient {
       const cards = pages[0] ?? [];
       return {
         type: 'boss/extract-visible-cards/response' as const,
+        sessionId: 'session-1',
+        generation: 'generation-1',
         cards,
         totalVisible: cards.length,
         invalidCount: 0,
@@ -326,6 +328,16 @@ describe('ScanController', () => {
         outcome: 'failed' as const,
         message: '单个职位详情布局无法识别。',
         failureKind: 'layout' as const,
+        retryable: false,
+      },
+    ],
+    [
+      'content locator 缺失',
+      {
+        type: 'boss/start-detail-scan/response' as const,
+        outcome: 'failed' as const,
+        message: '当前 content session 缺少该职位的请求定位信息。',
+        failureKind: 'locator' as const,
         retryable: false,
       },
     ],
@@ -697,6 +709,8 @@ describe('ScanController', () => {
           case 'boss/extract-visible-cards/request':
             return {
               type: 'boss/extract-visible-cards/response',
+              sessionId: 'session-11',
+              generation: 'generation-11',
               cards: [card],
               totalVisible: 1,
               invalidCount: 0,

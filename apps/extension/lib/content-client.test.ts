@@ -37,6 +37,8 @@ describe('Content client', () => {
         case 'boss/extract-visible-cards/request':
           return {
             type: 'boss/extract-visible-cards/response',
+            sessionId: 'session-1',
+            generation: 'generation-1',
             cards: [visibleCard],
             totalVisible: 1,
             invalidCount: 0,
@@ -48,7 +50,7 @@ describe('Content client', () => {
             job: detail,
             diagnostics: [
               {
-                source: 'live-panel',
+                source: 'fetch',
                 sourceJobId: job.jobId,
                 detailUrl: job.detailUrl,
                 responseUrl: 'https://www.zhipin.com/web/geek/jobs',
@@ -57,7 +59,6 @@ describe('Content client', () => {
                 hasDetailContainer: true,
                 missingFields: [],
                 outcome: 'success',
-                matchedBy: 'source_job_id',
               },
             ],
           };
@@ -84,8 +85,7 @@ describe('Content client', () => {
       outcome: 'success',
       diagnostics: [
         expect.objectContaining({
-          source: 'live-panel',
-          matchedBy: 'source_job_id',
+          source: 'fetch',
         }),
       ],
     });
@@ -98,6 +98,22 @@ describe('Content client', () => {
       'boss/start-detail-scan/request',
       'boss/cancel-detail-scan/request',
     ]);
+    const startMessage = sendMessage.mock.calls.find(
+      ([, message]) =>
+        (message as { type?: string }).type === 'boss/start-detail-scan/request',
+    )?.[1];
+    expect(startMessage).toEqual({
+      type: 'boss/start-detail-scan/request',
+      sessionId: 'session-1',
+      generation: 'generation-1',
+      sourceJobId: job.jobId,
+      detailUrl: job.detailUrl,
+      expectedTitle: job.title,
+      expectedCompany: job.companyName,
+      timeoutMs: 8_000,
+    });
+    expect(startMessage).not.toHaveProperty('card');
+    expect(JSON.stringify(startMessage)).not.toContain('securityId');
   });
 
   it('AbortSignal 会立即结束悬挂消息，并通知 Content Script 停止当前 MutationObserver', async () => {
@@ -105,6 +121,16 @@ describe('Content client', () => {
       const type = (message as { type?: string }).type;
       if (type === 'boss/start-detail-scan/request') {
         return await new Promise<unknown>(() => undefined);
+      }
+      if (type === 'boss/extract-visible-cards/request') {
+        return {
+          type: 'boss/extract-visible-cards/response',
+          sessionId: 'session-7',
+          generation: 'generation-7',
+          cards: [visibleCard],
+          totalVisible: 1,
+          invalidCount: 0,
+        };
       }
       if (type === 'boss/cancel-detail-scan/request') {
         return { type: 'boss/cancel-detail-scan/response', cancelled: true };
@@ -116,8 +142,9 @@ describe('Content client', () => {
       sendMessage,
     });
     const controller = new AbortController();
+    await client.extractVisibleCards();
     const scan = client.startDetailScan(visibleCard, 8_000, controller.signal);
-    await vi.waitFor(() => expect(sendMessage).toHaveBeenCalledOnce());
+    await vi.waitFor(() => expect(sendMessage).toHaveBeenCalledTimes(2));
     controller.abort();
 
     await expect(scan).rejects.toMatchObject({ name: 'AbortError' });
@@ -125,6 +152,19 @@ describe('Content client', () => {
       7,
       expect.objectContaining({ type: 'boss/cancel-detail-scan/request' }),
     );
+  });
+
+  it('没有 locator session 时拒绝详情请求，不猜测 canonical URL', async () => {
+    const sendMessage = vi.fn<TabsClient['sendMessage']>();
+    const client = createContentClient({
+      query: async () => [{ id: 9 }],
+      sendMessage,
+    });
+
+    await expect(client.startDetailScan(visibleCard, 8_000)).rejects.toThrow(
+      'locator session',
+    );
+    expect(sendMessage).not.toHaveBeenCalled();
   });
 
   it('页面检测消息悬挂时也会遵守外部轮次截止信号', async () => {

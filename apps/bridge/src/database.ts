@@ -8,6 +8,7 @@ import {
   EvaluationResultSchema,
   JobHistoryEntrySchema,
   JobResponseSchema,
+  sanitizeDiagnosticEventRequest,
   ScanRunSchema,
   ScreeningResultSchema,
   type CandidateRecord,
@@ -306,11 +307,12 @@ function backfillJobMetadata(database: DatabaseSync): void {
 
   const rows = database.prepare("SELECT * FROM jobs").all() as unknown as JobRow[];
   const update = database.prepare(
-    "UPDATE jobs SET jd_hash = ?, list_hash = ?, normalized_url = ? WHERE id = ?",
+    "UPDATE jobs SET jd_hash = ?, list_hash = ?, normalized_url = ?, url = ? WHERE id = ?",
   );
   for (const row of rows) {
+    const canonicalUrl = normalizeJobUrl(row.url ?? undefined);
     const normalizedUrl =
-      row.normalized_url ?? normalizeJobUrl(row.url ?? undefined);
+      canonicalUrl ?? normalizeJobUrl(row.normalized_url ?? undefined);
     const jdHash =
       row.jd_hash ??
       (row.description === null
@@ -331,7 +333,7 @@ function backfillJobMetadata(database: DatabaseSync): void {
         ...(row.education === null ? {} : { education: row.education }),
         ...(row.url === null ? {} : { url: row.url }),
       });
-    update.run(jdHash, listHash, normalizedUrl, row.id);
+    update.run(jdHash, listHash, normalizedUrl, canonicalUrl, row.id);
   }
 
   database
@@ -603,7 +605,7 @@ export function saveJob(
         input.experience ?? null,
         input.education ?? null,
         input.description ?? null,
-        input.url ?? null,
+        normalizedUrl,
         input.identityVerified ? 1 : 0,
         firstSeenAt,
         now,
@@ -1054,7 +1056,9 @@ export function saveDiagnostic(
   database: DatabaseSync,
   input: DiagnosticEventRequest,
 ): DiagnosticEvent {
-  const diagnostic = DiagnosticEventRequestSchema.parse(input);
+  const diagnostic = sanitizeDiagnosticEventRequest(
+    DiagnosticEventRequestSchema.parse(input),
+  );
   const row = database
     .prepare(
       `

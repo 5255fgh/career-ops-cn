@@ -12,6 +12,7 @@ import {
   parseVisibleBossCards,
   sourceJobIdFromUrl,
   verifyDetailIdentity,
+  verifyStrictDetailIdentity,
 } from "../src/index.js";
 import type {
   BossPageBlockReason,
@@ -344,6 +345,70 @@ describe("详情身份校验", () => {
     expect(detail.sourceJobId).toBeNull();
     expect(result.verified).toBe(true);
     expect(result.matchedSignals).toEqual(["title", "active_card"]);
+    window.close();
+  });
+});
+
+describe("搜索详情严格身份校验", () => {
+  it("标题和公司一致但预期缺少权威 Job ID 时拒绝", () => {
+    const url = fixtureUrls["job-detail.html"]!;
+    const { window, document } = createDocument("job-detail.html", url);
+    const detail = parseBossDetail(document, url)!;
+
+    const result = verifyStrictDetailIdentity({
+      expected: {
+        sourceJobId: null,
+        url: null,
+        title: detail.title,
+        company: detail.company,
+      },
+      detail,
+    });
+
+    expect(result.verified).toBe(false);
+    expect(result.signals.jobIdentity).toBeNull();
+    window.close();
+  });
+
+  it.each([
+    ["title", { title: "完全不同的职位", company: "示例科技有限公司" }],
+    ["company", { title: "高级前端开发工程师", company: "另一家公司" }],
+  ] as const)("Job ID 匹配但 %s 明确冲突时拒绝", (_field, expectedText) => {
+    const url = fixtureUrls["job-detail.html"]!;
+    const { window, document } = createDocument("job-detail.html", url);
+    const detail = parseBossDetail(document, url)!;
+
+    const result = verifyStrictDetailIdentity({
+      expected: {
+        sourceJobId: detail.sourceJobId,
+        url,
+        ...expectedText,
+      },
+      detail,
+    });
+
+    expect(result.signals.jobIdentity).toBe(true);
+    expect(result.verified).toBe(false);
+    window.close();
+  });
+
+  it("canonical URL pathname 的 Job ID 精确匹配时通过", () => {
+    const url = fixtureUrls["job-detail.html"]!;
+    const { window, document } = createDocument("job-detail.html", url);
+    const detail = parseBossDetail(document, url)!;
+
+    const result = verifyStrictDetailIdentity({
+      expected: {
+        sourceJobId: null,
+        url: `${url}?securityId=volatile#detail`,
+        title: detail.title,
+        company: detail.company,
+      },
+      detail,
+    });
+
+    expect(result.verified).toBe(true);
+    expect(result.matchedSignals).toContain("job_identity");
     window.close();
   });
 });

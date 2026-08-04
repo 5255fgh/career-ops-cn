@@ -119,6 +119,7 @@ describe('fetchBossDetail', () => {
     const fetchImpl = pendingFetch();
     const resultPromise = fetchBossDetail({
       card,
+      rawDetailUrl: card.job.detailUrl,
       timeoutMs: 250,
       signal: userController.signal,
       fetchImpl,
@@ -152,6 +153,7 @@ describe('fetchBossDetail', () => {
     const userController = new AbortController();
     const resultPromise = fetchBossDetail({
       card,
+      rawDetailUrl: card.job.detailUrl,
       timeoutMs: 10_000,
       signal: userController.signal,
       fetchImpl: pendingFetch(),
@@ -168,6 +170,7 @@ describe('fetchBossDetail', () => {
   it('普通网络错误可重试，但不会伪装成超时或页面阻断', async () => {
     const result = await fetchBossDetail({
       card,
+      rawDetailUrl: card.job.detailUrl,
       timeoutMs: 1_000,
       signal: new AbortController().signal,
       fetchImpl: vi.fn(async () => {
@@ -187,14 +190,16 @@ describe('fetchBossDetail', () => {
     const fixture = createDocument('job-detail.html', url);
     const responseUrl =
       'https://www.zhipin.com/job_detail/boss-2001.html?securityId=secret';
+    const rawDetailUrl =
+      'https://www.zhipin.com/job_detail/boss-2001.html?securityId=request-only';
+    const fetchImpl = vi.fn(async () => htmlResponse(fixture.html, responseUrl));
 
     const result = await fetchBossDetail({
       card: directCard,
+      rawDetailUrl,
       timeoutMs: 1_000,
       signal: new AbortController().signal,
-      fetchImpl: vi.fn(async () =>
-        htmlResponse(fixture.html, responseUrl),
-      ) as unknown as typeof fetch,
+      fetchImpl: fetchImpl as unknown as typeof fetch,
       parseDocument: () => fixture.document,
     });
 
@@ -219,7 +224,50 @@ describe('fetchBossDetail', () => {
         },
       ],
     });
+    expect(fetchImpl).toHaveBeenCalledWith(
+      rawDetailUrl,
+      expect.objectContaining({ credentials: 'include' }),
+    );
     expect(JSON.stringify(result)).not.toContain('secret');
+    expect(JSON.stringify(result)).not.toContain('request-only');
+    fixture.window.close();
+  });
+
+  it('标题公司一致但响应 Job ID 不同仍按严格身份失败', async () => {
+    const responseUrl =
+      'https://www.zhipin.com/job_detail/boss-2001.html?securityId=response-only';
+    const fixture = createDocument('job-detail.html', responseUrl);
+    const mismatchedCard: VisibleJobCard = {
+      index: 10,
+      job: JobCardSchema.parse({
+        jobId: 'boss-other',
+        title: '高级前端工程师',
+        companyName: '示例丙软件',
+        detailUrl: 'https://www.zhipin.com/job_detail/boss-other.html',
+      }),
+    };
+
+    const result = await fetchBossDetail({
+      card: mismatchedCard,
+      rawDetailUrl:
+        'https://www.zhipin.com/job_detail/boss-other.html?securityId=request-only',
+      timeoutMs: 1_000,
+      signal: new AbortController().signal,
+      fetchImpl: vi.fn(async () =>
+        htmlResponse(fixture.html, responseUrl),
+      ) as unknown as typeof fetch,
+      parseDocument: () => fixture.document,
+    });
+
+    expect(result).toMatchObject({
+      outcome: 'identity_failure',
+      evidence: {
+        detailFound: true,
+        actualJobId: 'boss-2001',
+        signals: { jobIdentity: false, title: true, company: true },
+      },
+    });
+    expect(JSON.stringify(result)).not.toContain('securityId');
     fixture.window.close();
   });
 
@@ -232,6 +280,7 @@ describe('fetchBossDetail', () => {
       'https://www.zhipin.com/web/passport/zp/security.html?seed=do-not-log';
     const fetched = await fetchBossDetail({
       card: panelCard,
+      rawDetailUrl: `${panelCard.job.detailUrl}?securityId=do-not-log`,
       timeoutMs: 1_000,
       signal: new AbortController().signal,
       fetchImpl: vi.fn(async () =>

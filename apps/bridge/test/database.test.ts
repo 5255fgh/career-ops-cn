@@ -6,6 +6,8 @@ import {
   findJob,
   findJobHistory,
   initializeDatabase,
+  saveDiagnostic,
+  saveJob,
 } from "../src/database.js";
 
 const databases: DatabaseSync[] = [];
@@ -155,5 +157,50 @@ describe("SQLite migration", () => {
         .prepare("SELECT count(*) AS count FROM evaluations WHERE job_id = ?")
         .get("legacy-job"),
     ).toEqual({ count: 3 });
+  });
+});
+
+describe("SQLite 隐私边界", () => {
+  it("职位 URL 与 diagnostics 在落库前移除 volatile locator 和敏感内容", () => {
+    const database = new DatabaseSync(":memory:");
+    databases.push(database);
+    initializeDatabase(database);
+    const canonicalUrl =
+      "https://www.zhipin.com/job_detail/boss-safe-1.html";
+    const rawUrl = `${canonicalUrl}?securityId=volatile#detail`;
+
+    saveJob(database, {
+      source: "boss",
+      sourceJobId: "boss-safe-1",
+      title: "前端工程师",
+      company: "示例科技",
+      description: "负责 TypeScript 与 React 产品开发。",
+      url: rawUrl,
+      identityVerified: true,
+    });
+    saveDiagnostic(database, {
+      source: "extension",
+      level: "warning",
+      event: "detail_mapping",
+      message: `Cookie: sid=secret; ${rawUrl}`,
+      details: {
+        originalDetailUrl: rawUrl,
+        responseBody: "<html>secret response</html>",
+        accessToken: "token-secret",
+      },
+    });
+
+    expect(
+      database
+        .prepare("SELECT url, normalized_url FROM jobs")
+        .get(),
+    ).toEqual({ url: canonicalUrl, normalized_url: canonicalUrl });
+    const diagnostic = database
+      .prepare("SELECT message, details_json FROM diagnostics")
+      .get() as { message: string; details_json: string };
+    expect(JSON.stringify(diagnostic)).toContain(canonicalUrl);
+    expect(JSON.stringify(diagnostic)).not.toMatch(
+      /securityId|sid=secret|secret response|token-secret/iu,
+    );
   });
 });

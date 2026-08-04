@@ -587,3 +587,54 @@ export const verifyDetailIdentity = (
     detailHash: currentDetailHash,
   };
 };
+
+const authoritativeJobId = (
+  identity: BossJobIdentity,
+): { value: string | null; conflict: boolean } => {
+  const sourceJobId = normalizeText(identity.sourceJobId);
+  const urlJobId = sourceJobIdFromUrl(identity.url);
+  return {
+    value: sourceJobId ?? urlJobId,
+    conflict:
+      sourceJobId !== null && urlJobId !== null && sourceJobId !== urlJobId,
+  };
+};
+
+export const verifyStrictDetailIdentity = (
+  input: VerifyDetailIdentityInput,
+): BossIdentityVerification => {
+  const expectedJobId = authoritativeJobId(input.expected);
+  const actualJobId = authoritativeJobId(input.detail);
+  const jobIdentity =
+    expectedJobId.conflict || actualJobId.conflict
+      ? false
+      : expectedJobId.value === null || actualJobId.value === null
+        ? null
+        : expectedJobId.value === actualJobId.value;
+  const title = titleMatches(input.expected, input.detail);
+  const company = companyMatches(input.expected, input.detail);
+  const signals = {
+    jobIdentity,
+    title,
+    company,
+    activeCard: null,
+    contentChanged: null,
+  };
+  const matchedSignals: BossIdentitySignal[] = [];
+  if (jobIdentity === true) {
+    matchedSignals.push("job_identity");
+  }
+  if (title === true) {
+    matchedSignals.push("title");
+  }
+  if (company === true) {
+    matchedSignals.push("company");
+  }
+
+  return {
+    verified: jobIdentity === true && title !== false && company !== false,
+    signals,
+    matchedSignals,
+    detailHash: detailHash(input.detail),
+  };
+};

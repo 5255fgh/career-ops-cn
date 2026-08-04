@@ -15,6 +15,7 @@ import {
   ExtractCurrentDetailResponseSchema,
   ExtractVisibleCardsRequestSchema,
   ExtractVisibleCardsResponseSchema,
+  JobCardSchema,
   StartDetailScanRequestSchema,
   StartDetailScanResponseSchema,
   type VisibleJobCard,
@@ -28,6 +29,7 @@ import {
   toJobDetail,
   type JobCardField,
 } from '../lib/boss-detail-fetch';
+import { BossContentLocatorStore } from '../lib/boss-content-session';
 
 function currentSourceQuery(): string {
   const url = new URL(window.location.href);
@@ -38,12 +40,15 @@ function currentSourceQuery(): string {
   return `boss:${url.pathname}${url.search}`.slice(0, 2_048);
 }
 
-function extractVisibleCards(): {
+function extractVisibleCards(locatorStore: BossContentLocatorStore): {
+  sessionId: string;
+  generation: string;
   cards: VisibleJobCard[];
   totalVisible: number;
   invalidCount: number;
   invalidFieldCounts: Partial<Record<JobCardField, number>>;
 } {
+  const locatorSession = locatorStore.beginCapture();
   const parsedCards = parseVisibleBossCards(document, window.location.href);
   const cards: VisibleJobCard[] = [];
   const invalidFieldCounts: Partial<Record<JobCardField, number>> = {};
@@ -51,7 +56,15 @@ function extractVisibleCards(): {
   parsedCards.forEach((card, index) => {
     const { job, invalidFields } = toJobCard(card);
     if (job !== null) {
-      cards.push({ index, job });
+      if (
+        card.url !== null &&
+        locatorStore.register(locatorSession, job.jobId, card.url)
+      ) {
+        cards.push({ index, job });
+      } else {
+        invalidFieldCounts.detailUrl =
+          (invalidFieldCounts.detailUrl ?? 0) + 1;
+      }
       return;
     }
     for (const field of invalidFields) {
@@ -60,6 +73,7 @@ function extractVisibleCards(): {
   });
 
   return {
+    ...locatorSession,
     cards,
     totalVisible: parsedCards.length,
     invalidCount: parsedCards.length - cards.length,
@@ -71,6 +85,7 @@ export default defineContentScript({
   matches: ['*://*.zhipin.com/*', '*://zhipin.com/*'],
   main() {
     let activeOperationController: AbortController | null = null;
+    const locatorStore = new BossContentLocatorStore();
 
     browser.runtime.onMessage.addListener(async (message: unknown) => {
       if (DetectPageRequestSchema.safeParse(message).success) {
@@ -108,22 +123,53 @@ export default defineContentScript({
       if (ExtractVisibleCardsRequestSchema.safeParse(message).success) {
         return ExtractVisibleCardsResponseSchema.parse({
           type: 'boss/extract-visible-cards/response',
-          ...extractVisibleCards(),
+          ...extractVisibleCards(locatorStore),
         });
       }
 
       const startRequest = StartDetailScanRequestSchema.safeParse(message);
       if (startRequest.success) {
+        const rawDetailUrl = locatorStore.resolve(
+          startRequest.data,
+          startRequest.data.sourceJobId,
+        );
+        if (rawDetailUrl === null) {
+          return StartDetailScanResponseSchema.parse({
+            type: 'boss/start-detail-scan/response',
+            outcome: 'failed',
+            message: '当前 content session 缺少该职位的请求定位信息。',
+            failureKind: 'locator',
+            retryable: false,
+          });
+        }
         activeOperationController?.abort();
         const controller = new AbortController();
         activeOperationController = controller;
 
         try {
-          return await fetchBossDetail({
-            card: startRequest.data.card,
+          const result = await fetchBossDetail({
+            card: {
+              index: 0,
+              job: JobCardSchema.parse({
+                jobId: startRequest.data.sourceJobId,
+                title: startRequest.data.expectedTitle,
+                companyName: startRequest.data.expectedCompany,
+                detailUrl: startRequest.data.detailUrl,
+              }),
+            },
+            rawDetailUrl,
             timeoutMs: startRequest.data.timeoutMs,
             signal: controller.signal,
           });
+          if (
+            result.outcome === 'blocked' &&
+            ['login_required', 'challenge', 'account_risk'].includes(
+              result.reason,
+            )
+          ) {
+            locatorStore.clear();
+          }
+          return result;
         } catch (error) {
           return StartDetailScanResponseSchema.parse({
             type: 'boss/start-detail-scan/response',
@@ -148,6 +194,7 @@ export default defineContentScript({
         const cancelled = activeOperationController !== null;
         activeOperationController?.abort();
         activeOperationController = null;
+        locatorStore.clear();
         return CancelDetailScanResponseSchema.parse({
           type: 'boss/cancel-detail-scan/response',
           cancelled,

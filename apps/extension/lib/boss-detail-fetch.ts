@@ -3,8 +3,7 @@ import {
   detectBossPage,
   detectBossPageBlock,
   parseBossDetail,
-  verifyDetailIdentity,
-  type BossCardMatchMethod,
+  verifyStrictDetailIdentity,
   type BossIdentityVerification,
   type BossJobCard,
   type BossJobDetail,
@@ -173,7 +172,6 @@ function createDiagnostic(input: {
   hasDetailContainer: boolean;
   missingFields: readonly string[];
   outcome: string;
-  matchedBy?: BossCardMatchMethod;
 }): DetailReadDiagnostic {
   const detailUrl =
     sanitizeDiagnosticUrl(input.card.job.detailUrl) ??
@@ -188,7 +186,6 @@ function createDiagnostic(input: {
     hasDetailContainer: input.hasDetailContainer,
     missingFields: [...input.missingFields],
     outcome: input.outcome,
-    ...(input.matchedBy === undefined ? {} : { matchedBy: input.matchedBy }),
   });
 }
 
@@ -202,6 +199,7 @@ function cancelError(): DOMException {
 
 export interface FetchBossDetailOptions {
   card: VisibleJobCard;
+  rawDetailUrl: string;
   timeoutMs: number;
   signal: AbortSignal;
   fetchImpl?: typeof fetch;
@@ -210,6 +208,7 @@ export interface FetchBossDetailOptions {
 
 export async function fetchBossDetail({
   card,
+  rawDetailUrl,
   timeoutMs,
   signal,
   fetchImpl = fetch,
@@ -255,7 +254,7 @@ export async function fetchBossDetail({
 
   try {
     const response = await Promise.race([
-      fetchImpl(card.job.detailUrl, {
+      fetchImpl(rawDetailUrl, {
         method: 'GET',
         credentials: 'include',
         redirect: 'follow',
@@ -264,7 +263,7 @@ export async function fetchBossDetail({
       interrupted,
     ]);
     const html = await Promise.race([response.text(), interrupted]);
-    const responseUrl = response.url === '' ? card.job.detailUrl : response.url;
+    const responseUrl = response.url === '' ? rawDetailUrl : response.url;
     const detailDocument = parseDocument(html);
     const pageType = detectBossPage(detailDocument, responseUrl);
     const block = detectBossPageBlock(detailDocument, responseUrl);
@@ -311,7 +310,7 @@ export async function fetchBossDetail({
         diagnosticFor('layout'),
       ]);
     }
-    const identity = verifyDetailIdentity({
+    const identity = verifyStrictDetailIdentity({
       expected: {
         sourceJobId: card.job.jobId,
         url: card.job.detailUrl,

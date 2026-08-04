@@ -788,6 +788,7 @@ describe("evaluate", () => {
         description: normalizedDescription.replace(/\n/gu, "\r\n"),
         url: `${JOB.url}?securityId=volatile-first`,
       });
+      expect(job.url).toBe(JOB.url);
       const first = EvaluationResponseSchema.parse(
         (
           await bridge.inject({
@@ -818,6 +819,7 @@ describe("evaluate", () => {
         description: normalizedDescription,
         url: `${JOB.url}?securityId=volatile-second`,
       });
+      expect(formattingOnly.url).toBe(JOB.url);
       expect(formattingOnly.jdHash).toBe(job.jdHash);
       const formattingOnlyEvaluation = EvaluationResponseSchema.parse(
         (

@@ -17,6 +17,7 @@ import {
   ObserveJobsRequestSchema,
   ObserveJobsResponseSchema,
   RequestScanRunCancelSchema,
+  sanitizeDiagnosticEventRequest,
   SaveJobRequestSchema,
   ScanRunSchema,
   ScreenRequestSchema,
@@ -449,7 +450,9 @@ export function createBridgeClient({
     },
 
     async recordDiagnostic(event, signal) {
-      const request = DiagnosticEventRequestSchema.parse(event);
+      const request = sanitizeDiagnosticEventRequest(
+        DiagnosticEventRequestSchema.parse(event),
+      );
       const response = await fetchBridge(
         fetchImpl,
         normalizedBaseUrl,

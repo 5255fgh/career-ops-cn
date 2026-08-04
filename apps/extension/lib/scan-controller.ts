@@ -639,7 +639,6 @@ export class ScanController {
               ? null
               : diagnostic.missingFields.join(','),
           readSource: diagnostic.source,
-          matchedBy: diagnostic.matchedBy ?? null,
         },
       });
     }

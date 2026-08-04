@@ -7,6 +7,7 @@ export {
   parseVisibleBossCards,
   sourceJobIdFromUrl,
   verifyDetailIdentity,
+  verifyStrictDetailIdentity,
 } from "./adapter.js";
 export { bossSelectors } from "./selectors.js";
 export type {

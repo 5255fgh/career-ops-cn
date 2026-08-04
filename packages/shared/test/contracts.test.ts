@@ -10,8 +10,10 @@ import {
   CandidateRecordSchema,
   CandidateUpdateRequestSchema,
   CreateJobRequestSchema,
+  DetailReadDiagnosticSchema,
   EvaluationResponseSchema,
   EvaluationResultSchema,
+  ExtractVisibleCardsResponseSchema,
   HealthBadRequestResponseSchema,
   HealthRequestSchema,
   HealthResponseSchema,
@@ -28,6 +30,7 @@ import {
   ScreenRequestSchema,
   ScreenResponseSchema,
   ScreeningResultSchema,
+  StartDetailScanRequestSchema,
 } from "../src/index.js";
 
 const readFixture = (filename: string): Record<string, unknown> =>
@@ -259,6 +262,88 @@ describe("其余边界对象", () => {
         detailUrl: "https://example.com/job/123456789",
       }),
     ).toThrow();
+  });
+
+  it("JobCard 和 JobDetail 对外统一移除 URL query 与 hash", () => {
+    const cardFixture = readFixture("job-card.json");
+    const detailFixture = readFixture("job-detail.json");
+    const volatileUrl =
+      "https://www.zhipin.com/job_detail/123456789.html?securityId=volatile#detail";
+
+    expect(
+      JobCardSchema.parse({ ...cardFixture, detailUrl: volatileUrl }).detailUrl,
+    ).toBe("https://www.zhipin.com/job_detail/123456789.html");
+    expect(
+      JobDetailSchema.parse({ ...detailFixture, detailUrl: volatileUrl })
+        .detailUrl,
+    ).toBe("https://www.zhipin.com/job_detail/123456789.html");
+  });
+
+  it("detail-scan 请求只携带稳定身份和 content locator session", () => {
+    const request = StartDetailScanRequestSchema.parse({
+      type: "boss/start-detail-scan/request",
+      sessionId: "session-1",
+      generation: "generation-1",
+      sourceJobId: "123456789",
+      detailUrl:
+        "https://www.zhipin.com/job_detail/123456789.html?securityId=volatile#detail",
+      expectedTitle: "前端开发工程师",
+      expectedCompany: "示例科技",
+      timeoutMs: 8_000,
+    });
+
+    expect(request).toEqual({
+      type: "boss/start-detail-scan/request",
+      sessionId: "session-1",
+      generation: "generation-1",
+      sourceJobId: "123456789",
+      detailUrl: "https://www.zhipin.com/job_detail/123456789.html",
+      expectedTitle: "前端开发工程师",
+      expectedCompany: "示例科技",
+      timeoutMs: 8_000,
+    });
+    expect(JSON.stringify(request)).not.toContain("securityId");
+    expect(() =>
+      StartDetailScanRequestSchema.parse({
+        ...request,
+        card: { index: 0, job: readFixture("job-card.json") },
+      }),
+    ).toThrow();
+  });
+
+  it("可见卡片响应绑定 locator session 与 content generation", () => {
+    const card = JobCardSchema.parse(readFixture("job-card.json"));
+    expect(
+      ExtractVisibleCardsResponseSchema.parse({
+        type: "boss/extract-visible-cards/response",
+        sessionId: "session-1",
+        generation: "generation-1",
+        cards: [{ index: 0, job: card }],
+        totalVisible: 1,
+        invalidCount: 0,
+      }),
+    ).toMatchObject({ sessionId: "session-1", generation: "generation-1" });
+  });
+
+  it("detail diagnostic 的请求与响应 URL 都不能携带 query/hash", () => {
+    expect(
+      DetailReadDiagnosticSchema.parse({
+        source: "fetch",
+        sourceJobId: "123456789",
+        detailUrl:
+          "https://www.zhipin.com/job_detail/123456789.html?securityId=request",
+        responseUrl:
+          "https://www.zhipin.com/job_detail/123456789.html?securityId=response#detail",
+        httpStatus: 200,
+        detectedPageType: "job-detail",
+        hasDetailContainer: true,
+        missingFields: [],
+        outcome: "success",
+      }),
+    ).toMatchObject({
+      detailUrl: "https://www.zhipin.com/job_detail/123456789.html",
+      responseUrl: "https://www.zhipin.com/job_detail/123456789.html",
+    });
   });
 
   it("JobCard 只要求身份与详情入口字段", () => {

@@ -92,6 +92,8 @@ const browserTabs: TabsClient = {
 };
 
 export function createContentClient(tabs: TabsClient = browserTabs): ContentClient {
+  let locatorSession: { sessionId: string; generation: string } | null = null;
+
   async function activeTabId(signal?: AbortSignal): Promise<number> {
     const [tab] = await withAbort(
       tabs.query({ active: true, currentWindow: true }),
@@ -147,18 +149,32 @@ export function createContentClient(tabs: TabsClient = browserTabs): ContentClie
         }),
         signal,
       );
-      return ExtractVisibleCardsResponseSchema.parse(response);
+      const parsed = ExtractVisibleCardsResponseSchema.parse(response);
+      locatorSession = {
+        sessionId: parsed.sessionId,
+        generation: parsed.generation,
+      };
+      return parsed;
     },
 
     async startDetailScan(card, timeoutMs, signal) {
       if (isSignalAborted(signal)) {
         throw abortReason(signal);
       }
+      if (locatorSession === null) {
+        throw new ContentClientError(
+          '当前页面没有可用的 detail locator session，已跳过该职位。',
+        );
+      }
 
       const tabId = await activeTabId(signal);
       const message = StartDetailScanRequestSchema.parse({
         type: 'boss/start-detail-scan/request',
-        card,
+        ...locatorSession,
+        sourceJobId: card.job.jobId,
+        detailUrl: card.job.detailUrl,
+        expectedTitle: card.job.title,
+        expectedCompany: card.job.companyName,
         timeoutMs,
       });
       const onAbort = (): void => {
@@ -183,6 +199,7 @@ export function createContentClient(tabs: TabsClient = browserTabs): ContentClie
     },
 
     async cancelDetailScan() {
+      locatorSession = null;
       const response = await request(
         CancelDetailScanRequestSchema.parse({
           type: 'boss/cancel-detail-scan/request',

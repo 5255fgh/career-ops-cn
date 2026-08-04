@@ -4,6 +4,24 @@ const NonEmptyTextSchema = z.string().trim().min(1);
 
 export const Sha256Schema = z.string().regex(/^[a-f0-9]{64}$/u);
 
+function canonicalizeUrl(value: string): string {
+  const url = new URL(value);
+  url.username = "";
+  url.password = "";
+  url.hostname = url.hostname.toLowerCase();
+  url.search = "";
+  url.hash = "";
+  if (url.port === "443") {
+    url.port = "";
+  }
+  if (url.pathname.length > 1) {
+    url.pathname = url.pathname.replace(/\/+$/u, "");
+  }
+  return url.toString();
+}
+
+export const canonicalizeZhipinUrl = canonicalizeUrl;
+
 export const SourceQuerySchema = NonEmptyTextSchema.max(2_048);
 
 const ZhipinUrlSchema = z
@@ -20,7 +38,10 @@ const ZhipinUrlSchema = z
     } catch {
       return false;
     }
-  }, "必须是 zhipin.com 域名下的 HTTPS URL");
+  }, "必须是 zhipin.com 域名下的 HTTPS URL")
+  .transform(canonicalizeZhipinUrl);
+
+const CanonicalUrlSchema = z.string().url().transform(canonicalizeUrl);
 
 export const JobCardSchema = z.strictObject({
   jobId: NonEmptyTextSchema,
@@ -295,6 +316,82 @@ export type DiagnosticEventRequest = z.infer<
   typeof DiagnosticEventRequestSchema
 >;
 
+const DiagnosticUrlPattern = /https?:\/\/[^\s<>"']+/giu;
+const SensitiveDiagnosticKeyPattern =
+  /cookie|authorization|security.?id|token|response.?body|raw.?response/iu;
+
+export function sanitizeDiagnosticText(value: string): string {
+  return value
+    .replace(DiagnosticUrlPattern, (candidate) => {
+      try {
+        const url = new URL(candidate);
+        url.username = "";
+        url.password = "";
+        url.search = "";
+        url.hash = "";
+        return url.toString();
+      } catch {
+        return "[REDACTED_URL]";
+      }
+    })
+    .replace(/\bsk-[A-Za-z0-9_-]+\b/gu, "[REDACTED]")
+    .replace(/(?:cookie|set-cookie)\s*:\s*[^\r\n]+/giu, "[REDACTED]")
+    .replace(
+      /authorization\s*:\s*bearer\s+\S+/giu,
+      "Authorization: Bearer [REDACTED]",
+    )
+    .replace(
+      /\b(?:securityId|access[_-]?token|id[_-]?token|token)\s*[=:]\s*[^&\s;]+/giu,
+      "[REDACTED]",
+    );
+}
+
+export function sanitizeDiagnosticEventRequest(
+  input: DiagnosticEventRequest,
+): DiagnosticEventRequest {
+  const details =
+    input.details === undefined
+      ? undefined
+      : Object.fromEntries(
+          Object.entries(input.details)
+            .filter(([key]) => !SensitiveDiagnosticKeyPattern.test(key))
+            .map(([key, value]) => [
+              key,
+              typeof value === "string" ? sanitizeDiagnosticText(value) : value,
+            ]),
+        );
+
+  return DiagnosticEventRequestSchema.parse({
+    ...input,
+    event: sanitizeDiagnosticText(input.event),
+    ...(input.scanId === undefined
+      ? {}
+      : { scanId: sanitizeDiagnosticText(input.scanId) }),
+    ...(input.jobId === undefined
+      ? {}
+      : { jobId: sanitizeDiagnosticText(input.jobId) }),
+    ...(input.expectedJobId === undefined
+      ? {}
+      : { expectedJobId: sanitizeDiagnosticText(input.expectedJobId) }),
+    ...(input.actualJobId === undefined
+      ? {}
+      : { actualJobId: sanitizeDiagnosticText(input.actualJobId) }),
+    ...(input.expectedTitle === undefined
+      ? {}
+      : { expectedTitle: sanitizeDiagnosticText(input.expectedTitle) }),
+    ...(input.actualTitle === undefined
+      ? {}
+      : { actualTitle: sanitizeDiagnosticText(input.actualTitle) }),
+    ...(input.outcome === undefined
+      ? {}
+      : { outcome: sanitizeDiagnosticText(input.outcome) }),
+    ...(input.message === undefined
+      ? {}
+      : { message: sanitizeDiagnosticText(input.message) }),
+    ...(details === undefined ? {} : { details }),
+  });
+}
+
 export const DiagnosticEventSchema = DiagnosticEventRequestSchema.extend({
   id: NonEmptyTextSchema,
   createdAt: z.string().datetime(),
@@ -514,6 +611,8 @@ export const ExtractVisibleCardsRequestSchema = z.strictObject({
 
 export const ExtractVisibleCardsResponseSchema = z.strictObject({
   type: z.literal("boss/extract-visible-cards/response"),
+  sessionId: NonEmptyTextSchema,
+  generation: NonEmptyTextSchema,
   cards: z.array(VisibleJobCardSchema),
   totalVisible: z.number().int().nonnegative(),
   invalidCount: z.number().int().nonnegative(),
@@ -537,23 +636,29 @@ export type ExtractVisibleCardsResponse = z.infer<
 
 export const StartDetailScanRequestSchema = z.strictObject({
   type: z.literal("boss/start-detail-scan/request"),
-  card: VisibleJobCardSchema,
+  sessionId: NonEmptyTextSchema,
+  generation: NonEmptyTextSchema,
+  sourceJobId: NonEmptyTextSchema,
+  detailUrl: ZhipinUrlSchema,
+  expectedTitle: NonEmptyTextSchema,
+  expectedCompany: NonEmptyTextSchema,
   timeoutMs: z.number().int().positive(),
 });
 
+export type StartDetailScanRequest = z.infer<
+  typeof StartDetailScanRequestSchema
+>;
+
 export const DetailReadDiagnosticSchema = z.strictObject({
-  source: z.enum(["fetch", "live-panel"]),
+  source: z.literal("fetch"),
   sourceJobId: NonEmptyTextSchema,
   detailUrl: ZhipinUrlSchema,
-  responseUrl: z.string().url().nullable(),
+  responseUrl: CanonicalUrlSchema.nullable(),
   httpStatus: z.number().int().min(100).max(599).nullable(),
   detectedPageType: BossPageTypeSchema.nullable(),
   hasDetailContainer: z.boolean(),
   missingFields: z.array(NonEmptyTextSchema).max(20),
   outcome: NonEmptyTextSchema,
-  matchedBy: z
-    .enum(["source_job_id", "detail_url", "title_company"])
-    .optional(),
 });
 
 export type DetailReadDiagnostic = z.infer<
@@ -620,6 +725,7 @@ export const StartDetailScanResponseSchema = z.discriminatedUnion("outcome", [
       "http",
       "missing_fields",
       "layout",
+      "locator",
       "unknown",
     ]),
     retryable: z.boolean(),
