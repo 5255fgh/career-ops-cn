@@ -1,6 +1,7 @@
 import {
   JobResponseSchema,
   ScanConfigSchema,
+  type BossAccountFatalReason,
   type BossPageBlockReason,
   type CandidateRecord,
   type DiagnosticEventRequest,
@@ -23,7 +24,11 @@ import {
   isAbortError,
   type BridgeClient,
 } from './bridge-client';
-import { ContentClientError, type ContentClient } from './content-client';
+import {
+  BossFatalBlockError,
+  ContentClientError,
+  type ContentClient,
+} from './content-client';
 
 export const DEFAULT_SCAN_CONFIG: ScanConfig = Object.freeze({
   maxPages: 1,
@@ -119,13 +124,23 @@ const ACTIVE_STATUSES = new Set<ScanStatus>([
   'evaluating',
 ]);
 
-const FATAL_PAGE_BLOCKS = new Set<BossPageBlockReason>([
+const ACCOUNT_FATAL_PAGE_BLOCKS = new Set<BossPageBlockReason>([
   'login_required',
   'challenge',
   'account_risk',
+]);
+
+const PAGE_STOP_BLOCKS = new Set<BossPageBlockReason>([
+  ...ACCOUNT_FATAL_PAGE_BLOCKS,
   'unsupported_layout',
   'empty_page',
 ]);
+
+function isAccountFatalBlock(
+  reason: BossPageBlockReason,
+): reason is BossAccountFatalReason {
+  return ACCOUNT_FATAL_PAGE_BLOCKS.has(reason);
+}
 
 function emptyProgress(): ScanProgress {
   return {
@@ -376,6 +391,7 @@ export class ScanController {
   private diagnosticError: string | null = null;
   private hasIssuedBossRequest = false;
   private interruptionRequested = false;
+  private fatalReason: BossAccountFatalReason | null = null;
   private currentState: ScanState = {
     runId: null,
     status: 'idle',
@@ -532,6 +548,23 @@ export class ScanController {
     this.update({ status: 'failed', stopReason: reason, error: message });
   }
 
+  private latchFatal(reason: BossAccountFatalReason): void {
+    if (this.fatalReason !== null) {
+      return;
+    }
+    this.fatalReason = reason;
+    this.abortController?.abort(new BossFatalBlockError(reason));
+  }
+
+  private assertRoundSafe(signal: AbortSignal): void {
+    if (this.fatalReason !== null) {
+      throw new BossFatalBlockError(this.fatalReason);
+    }
+    if (signal.aborted) {
+      throw signal.reason ?? abortError();
+    }
+  }
+
   private complete(reason: ScanStopReason): void {
     this.update({ status: 'completed', stopReason: reason, error: null });
   }
@@ -590,12 +623,15 @@ export class ScanController {
     signal: AbortSignal,
   ): Promise<StartDetailScanResponse> {
     for (let attempt = 1; attempt <= 2; attempt += 1) {
+      this.assertRoundSafe(signal);
       await this.beforeBossRequest(signal);
+      this.assertRoundSafe(signal);
       const result = await this.content.startDetailScan(
         card,
         this.config.detailTimeoutMs,
         signal,
       );
+      this.assertRoundSafe(signal);
       if (
         result.outcome !== 'failed' ||
         !result.retryable ||
@@ -701,6 +737,7 @@ export class ScanController {
     this.updateProgress({ pagesVisited: 1, detailTarget: 1 });
     await this.persistRun('reading-details');
     const detail = await this.content.extractCurrentDetail(controller.signal);
+    this.assertRoundSafe(controller.signal);
     this.updateProgress({
       listJobs: detail === null ? 0 : 1,
       detailCompleted: 1,
@@ -724,12 +761,14 @@ export class ScanController {
     if (this.currentScanId === null) {
       throw new Error('scan run 尚未创建。');
     }
+    this.assertRoundSafe(controller.signal);
     const [observation] = await this.bridge.observeJobs(
       this.currentScanId,
       this.sourceQuery,
       [card.job],
       controller.signal,
     );
+    this.assertRoundSafe(controller.signal);
     this.updateProgress({
       newJobs: observation?.action === 'read-detail' && observation.reason === 'new' ? 1 : 0,
     });
@@ -751,10 +790,12 @@ export class ScanController {
 
     let savedJob: JobResponse | undefined;
     try {
+      this.assertRoundSafe(controller.signal);
       savedJob = await this.bridge.saveJob(detail, controller.signal, {
         scanRunId: this.currentScanId,
         sourceQuery: this.sourceQuery,
       });
+      this.assertRoundSafe(controller.signal);
       this.updateResult(detail.jobId, { savedJob });
     } catch (error) {
       if (controller.signal.aborted || isAbortError(error)) {
@@ -765,12 +806,14 @@ export class ScanController {
 
     let screening: ScreeningResult | undefined;
     try {
+      this.assertRoundSafe(controller.signal);
       [screening] = await this.bridge.screenJobs(
         [detail],
         undefined,
         controller.signal,
         'detail',
       );
+      this.assertRoundSafe(controller.signal);
       if (screening !== undefined) {
         this.updateResult(detail.jobId, { screening });
         this.updateProgress({ screenedJobs: 1 });
@@ -790,11 +833,13 @@ export class ScanController {
       this.updateProgress({ aiTarget: 1 });
       await this.persistRun('evaluating');
       try {
+        this.assertRoundSafe(controller.signal);
         const response = await this.bridge.evaluateJob(
           savedJob.id,
           controller.signal,
           this.currentScanId,
         );
+        this.assertRoundSafe(controller.signal);
         this.updateResult(detail.jobId, { evaluation: response.evaluation });
         this.updateProgress({
           aiSuccess: 1,
@@ -832,6 +877,7 @@ export class ScanController {
     this.diagnosticError = null;
     this.hasIssuedBossRequest = false;
     this.interruptionRequested = false;
+    this.fatalReason = null;
     const maxNewJobs = options.maxNewJobs ?? this.config.maxNewJobs;
     const maxAiJobs = options.maxAiJobs ?? this.config.maxAiJobs;
     const maxRoundMs = options.maxRoundMs ?? this.config.maxRoundMs;
@@ -851,6 +897,42 @@ export class ScanController {
       warnings: [],
     });
 
+    const removeFatalListener = this.content.onFatalBlock((event) => {
+      this.latchFatal(event.reason);
+    });
+
+    try {
+      const session = await this.content.beginSession(controller.signal);
+      this.sourceQuery = session.queryScope;
+      this.assertRoundSafe(controller.signal);
+    } catch (error) {
+      clearTimeout(deadlineTimer);
+      await this.content.endSession().catch(() => false);
+      removeFatalListener();
+      if (
+        this.fatalReason !== null ||
+        error instanceof BossFatalBlockError
+      ) {
+        const reason =
+          this.fatalReason ?? (error as BossFatalBlockError).reason;
+        this.stop(reason, `页面已停止扫描：${reason}`);
+      } else if (error instanceof ContentClientError) {
+        this.update({
+          status: 'interrupted',
+          error: errorMessage(error),
+          stopReason: null,
+        });
+      } else if (controller.signal.aborted) {
+        this.update({ status: 'cancelled', error: null, stopReason: null });
+      } else {
+        this.update({ status: 'failed', error: errorMessage(error) });
+      }
+      if (this.abortController === controller) {
+        this.abortController = null;
+      }
+      return this.currentState;
+    }
+
     try {
       const createdRun = await this.bridge.createScanRun(controller.signal);
       this.currentScanId = createdRun.id;
@@ -862,6 +944,8 @@ export class ScanController {
         error: `无法创建 Bridge scan run：${errorMessage(error)}`,
       });
       clearTimeout(deadlineTimer);
+      await this.content.endSession().catch(() => false);
+      removeFatalListener();
       return this.currentState;
     }
 
@@ -872,8 +956,11 @@ export class ScanController {
       await this.persistRun('reading-list');
       if (
         firstPage.block !== null &&
-        FATAL_PAGE_BLOCKS.has(firstPage.block.reason)
+        PAGE_STOP_BLOCKS.has(firstPage.block.reason)
       ) {
+        if (isAccountFatalBlock(firstPage.block.reason)) {
+          this.fatalReason = firstPage.block.reason;
+        }
         this.stop(
           firstPage.block.reason,
           `页面已停止扫描：${firstPage.block.reason}`,
@@ -922,7 +1009,10 @@ export class ScanController {
 
         const page = firstPage;
         this.sourceQuery = page.sourceQuery ?? this.sourceQuery;
-        if (page.block !== null && FATAL_PAGE_BLOCKS.has(page.block.reason)) {
+        if (page.block !== null && PAGE_STOP_BLOCKS.has(page.block.reason)) {
+          if (isAccountFatalBlock(page.block.reason)) {
+            this.fatalReason = page.block.reason;
+          }
           this.stop(page.block.reason, `页面已停止扫描：${page.block.reason}`);
           await this.diagnose({
             level: 'warning',
@@ -998,12 +1088,17 @@ export class ScanController {
         const observations =
           uniqueCards.length === 0
             ? []
-            : await this.bridge.observeJobs(
-                this.currentScanId,
-                this.sourceQuery,
-                uniqueCards.map(({ job }) => job),
-                controller.signal,
-              );
+            : await (async () => {
+                this.assertRoundSafe(controller.signal);
+                const value = await this.bridge.observeJobs(
+                  this.currentScanId!,
+                  this.sourceQuery,
+                  uniqueCards.map(({ job }) => job),
+                  controller.signal,
+                );
+                this.assertRoundSafe(controller.signal);
+                return value;
+              })();
         const cardById = new Map(
           uniqueCards.map((card) => [card.job.jobId, card]),
         );
@@ -1041,12 +1136,14 @@ export class ScanController {
             continue;
           }
           try {
+            this.assertRoundSafe(controller.signal);
             const [screening] = await this.bridge.screenJobs(
               [result.detail],
               undefined,
               controller.signal,
               'detail',
             );
+            this.assertRoundSafe(controller.signal);
             if (screening === undefined) {
               result.detailError = '完整筛选未返回该职位结果。';
             } else {
@@ -1086,12 +1183,14 @@ export class ScanController {
           });
           this.update({ status: 'screening' });
           await this.persistRun('screening');
+          this.assertRoundSafe(controller.signal);
           const screenings = await this.bridge.screenJobs(
             pageCards.map(({ job }) => job),
             undefined,
             controller.signal,
             'list',
           );
+          this.assertRoundSafe(controller.signal);
           const screeningById = new Map(
             screenings.map((result) => [result.jobId, result]),
           );
@@ -1145,7 +1244,10 @@ export class ScanController {
               throw abortError();
             }
             if (detailResult.outcome === 'blocked') {
-              if (FATAL_PAGE_BLOCKS.has(detailResult.reason)) {
+              if (PAGE_STOP_BLOCKS.has(detailResult.reason)) {
+                if (isAccountFatalBlock(detailResult.reason)) {
+                  this.fatalReason = detailResult.reason;
+                }
                 this.stop(
                   detailResult.reason,
                   `页面已停止扫描：${detailResult.reason}`,
@@ -1173,6 +1275,7 @@ export class ScanController {
 
               let savedJob: JobResponse | undefined;
               try {
+                this.assertRoundSafe(controller.signal);
                 savedJob = await this.bridge.saveJob(
                   detailResult.job,
                   controller.signal,
@@ -1181,6 +1284,7 @@ export class ScanController {
                     sourceQuery: this.sourceQuery,
                   },
                 );
+                this.assertRoundSafe(controller.signal);
                 this.updateResult(card.job.jobId, { savedJob });
                 await this.diagnose({
                   level: 'info',
@@ -1211,12 +1315,14 @@ export class ScanController {
               }
 
               try {
+                this.assertRoundSafe(controller.signal);
                 const [fullScreening] = await this.bridge.screenJobs(
                   [detailResult.job],
                   undefined,
                   controller.signal,
                   'detail',
                 );
+                this.assertRoundSafe(controller.signal);
                 if (fullScreening === undefined) {
                   this.appendDetailError(
                     card.job.jobId,
@@ -1300,11 +1406,13 @@ export class ScanController {
 
       for (const result of evaluationTargets) {
         try {
+          this.assertRoundSafe(controller.signal);
           const response = await this.bridge.evaluateJob(
             result.savedJob.id,
             controller.signal,
             this.currentScanId!,
           );
+          this.assertRoundSafe(controller.signal);
           this.updateResult(result.card.job.jobId, {
             evaluation: response.evaluation,
           });
@@ -1388,7 +1496,21 @@ export class ScanController {
       });
       return this.currentState;
     } catch (error) {
-      if (controller.signal.aborted || isAbortError(error)) {
+      if (
+        this.fatalReason !== null ||
+        error instanceof BossFatalBlockError
+      ) {
+        const reason =
+          this.fatalReason ?? (error as BossFatalBlockError).reason;
+        this.fatalReason = reason;
+        this.stop(reason, `页面已停止扫描：${reason}`);
+        await this.diagnose({
+          level: 'warning',
+          event: 'scan_stopped',
+          outcome: reason,
+          message: `页面已停止扫描：${reason}`,
+        });
+      } else if (controller.signal.aborted || isAbortError(error)) {
         if (deadlineReached) {
           this.complete('round_time_limit');
           await this.diagnose({
@@ -1452,6 +1574,8 @@ export class ScanController {
     } finally {
       clearTimeout(deadlineTimer);
       await this.finalizeRun();
+      await this.content.endSession().catch(() => false);
+      removeFatalListener();
       if (this.abortController === controller) {
         this.abortController = null;
       }

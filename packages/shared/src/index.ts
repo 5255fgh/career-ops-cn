@@ -557,10 +557,18 @@ export const BossPageTypeSchema = z.enum([
 
 export type BossPageType = z.infer<typeof BossPageTypeSchema>;
 
-export const BossPageBlockReasonSchema = z.enum([
+export const BossAccountFatalReasonSchema = z.enum([
   "login_required",
   "challenge",
   "account_risk",
+]);
+
+export type BossAccountFatalReason = z.infer<
+  typeof BossAccountFatalReasonSchema
+>;
+
+export const BossPageBlockReasonSchema = z.enum([
+  ...BossAccountFatalReasonSchema.options,
   "unsupported_layout",
   "empty_page",
 ]);
@@ -583,8 +591,57 @@ export const VisibleJobCardSchema = z.strictObject({
 
 export type VisibleJobCard = z.infer<typeof VisibleJobCardSchema>;
 
+export const BeginBossSessionRequestSchema = z.strictObject({
+  type: z.literal("boss/begin-session/request"),
+  sessionId: NonEmptyTextSchema,
+});
+
+export const BeginBossSessionResponseSchema = z.strictObject({
+  type: z.literal("boss/begin-session/response"),
+  sessionId: NonEmptyTextSchema,
+  generation: NonEmptyTextSchema,
+  queryScope: SourceQuerySchema,
+});
+
+export type BeginBossSessionResponse = z.infer<
+  typeof BeginBossSessionResponseSchema
+>;
+
+export const EndBossSessionRequestSchema = z.strictObject({
+  type: z.literal("boss/end-session/request"),
+  sessionId: NonEmptyTextSchema,
+  generation: NonEmptyTextSchema,
+});
+
+export const EndBossSessionResponseSchema = z.strictObject({
+  type: z.literal("boss/end-session/response"),
+  ended: z.literal(true),
+});
+
+export const BossSessionErrorResponseSchema = z.strictObject({
+  type: z.literal("boss/session-error/response"),
+  sessionId: NonEmptyTextSchema,
+  generation: NonEmptyTextSchema,
+  reason: z.literal("context_changed"),
+});
+
+export type BossSessionErrorResponse = z.infer<
+  typeof BossSessionErrorResponseSchema
+>;
+
+export const BossFatalBlockEventSchema = z.strictObject({
+  type: z.literal("boss/fatal-block/event"),
+  sessionId: NonEmptyTextSchema,
+  generation: NonEmptyTextSchema,
+  reason: BossAccountFatalReasonSchema,
+});
+
+export type BossFatalBlockEvent = z.infer<typeof BossFatalBlockEventSchema>;
+
 export const DetectPageRequestSchema = z.strictObject({
   type: z.literal("boss/detect-page/request"),
+  sessionId: NonEmptyTextSchema,
+  generation: NonEmptyTextSchema,
 });
 
 export const DetectPageResponseSchema = z.strictObject({
@@ -598,6 +655,8 @@ export type DetectPageResponse = z.infer<typeof DetectPageResponseSchema>;
 
 export const ExtractCurrentDetailRequestSchema = z.strictObject({
   type: z.literal("boss/extract-current-detail/request"),
+  sessionId: NonEmptyTextSchema,
+  generation: NonEmptyTextSchema,
 });
 
 export const ExtractCurrentDetailResponseSchema = z.strictObject({
@@ -607,6 +666,8 @@ export const ExtractCurrentDetailResponseSchema = z.strictObject({
 
 export const ExtractVisibleCardsRequestSchema = z.strictObject({
   type: z.literal("boss/extract-visible-cards/request"),
+  sessionId: NonEmptyTextSchema,
+  generation: NonEmptyTextSchema,
 });
 
 export const ExtractVisibleCardsResponseSchema = z.strictObject({
@@ -739,6 +800,8 @@ export type StartDetailScanResponse = z.infer<
 
 export const CancelDetailScanRequestSchema = z.strictObject({
   type: z.literal("boss/cancel-detail-scan/request"),
+  sessionId: NonEmptyTextSchema,
+  generation: NonEmptyTextSchema,
 });
 
 export const CancelDetailScanResponseSchema = z.strictObject({
@@ -747,6 +810,12 @@ export const CancelDetailScanResponseSchema = z.strictObject({
 });
 
 export const ExtensionMessageSchema = z.union([
+  BeginBossSessionRequestSchema,
+  BeginBossSessionResponseSchema,
+  EndBossSessionRequestSchema,
+  EndBossSessionResponseSchema,
+  BossSessionErrorResponseSchema,
+  BossFatalBlockEventSchema,
   DetectPageRequestSchema,
   DetectPageResponseSchema,
   ExtractCurrentDetailRequestSchema,

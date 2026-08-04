@@ -5,14 +5,21 @@ import type { ZodType } from "zod";
 
 import {
   ApplicationStatusSchema,
+  BeginBossSessionRequestSchema,
+  BeginBossSessionResponseSchema,
+  BossFatalBlockEventSchema,
+  BossSessionErrorResponseSchema,
   BridgeErrorResponseSchema,
   BridgeSettingsSchema,
   CandidateRecordSchema,
   CandidateUpdateRequestSchema,
   CreateJobRequestSchema,
+  DetectPageRequestSchema,
   DetailReadDiagnosticSchema,
   EvaluationResponseSchema,
   EvaluationResultSchema,
+  EndBossSessionRequestSchema,
+  EndBossSessionResponseSchema,
   ExtractVisibleCardsResponseSchema,
   HealthBadRequestResponseSchema,
   HealthRequestSchema,
@@ -344,6 +351,73 @@ describe("其余边界对象", () => {
       detailUrl: "https://www.zhipin.com/job_detail/123456789.html",
       responseUrl: "https://www.zhipin.com/job_detail/123456789.html",
     });
+  });
+
+  it("begin/end session 与会话内请求使用严格 session 契约", () => {
+    const begin = BeginBossSessionRequestSchema.parse({
+      type: "boss/begin-session/request",
+      sessionId: "session-1",
+    });
+    expect(
+      BeginBossSessionResponseSchema.parse({
+        type: "boss/begin-session/response",
+        sessionId: begin.sessionId,
+        generation: "generation-1",
+        queryScope: "boss:/web/geek/job?query=TypeScript",
+      }),
+    ).toMatchObject({ sessionId: "session-1", generation: "generation-1" });
+    expect(
+      DetectPageRequestSchema.parse({
+        type: "boss/detect-page/request",
+        sessionId: "session-1",
+        generation: "generation-1",
+      }),
+    ).toMatchObject({ sessionId: "session-1" });
+    expect(
+      EndBossSessionRequestSchema.parse({
+        type: "boss/end-session/request",
+        sessionId: "session-1",
+        generation: "generation-1",
+      }),
+    ).toMatchObject({ sessionId: "session-1" });
+    expect(
+      EndBossSessionResponseSchema.parse({
+        type: "boss/end-session/response",
+        ended: true,
+      }),
+    ).toEqual({ type: "boss/end-session/response", ended: true });
+  });
+
+  it("context_changed 与 account fatal 使用不同的最小消息", () => {
+    expect(
+      BossSessionErrorResponseSchema.parse({
+        type: "boss/session-error/response",
+        sessionId: "session-1",
+        generation: "generation-1",
+        reason: "context_changed",
+      }),
+    ).toMatchObject({ reason: "context_changed" });
+    expect(
+      BossFatalBlockEventSchema.parse({
+        type: "boss/fatal-block/event",
+        sessionId: "session-1",
+        generation: "generation-1",
+        reason: "challenge",
+      }),
+    ).toEqual({
+      type: "boss/fatal-block/event",
+      sessionId: "session-1",
+      generation: "generation-1",
+      reason: "challenge",
+    });
+    expect(() =>
+      BossFatalBlockEventSchema.parse({
+        type: "boss/fatal-block/event",
+        sessionId: "session-1",
+        generation: "generation-1",
+        reason: "unsupported_layout",
+      }),
+    ).toThrow();
   });
 
   it("JobCard 只要求身份与详情入口字段", () => {

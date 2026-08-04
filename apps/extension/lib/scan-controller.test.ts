@@ -1,6 +1,8 @@
 import {
   JobDetailSchema,
   JobResponseSchema,
+  type BossAccountFatalReason,
+  type BossFatalBlockEvent,
   type JobCard,
   type JobDetail,
   type ScanRunSnapshot,
@@ -11,6 +13,7 @@ import { describe, expect, it, vi } from 'vitest';
 
 import type { BridgeClient } from './bridge-client';
 import {
+  ContentContextChangedError,
   createContentClient,
   type ContentClient,
   type TabsClient,
@@ -20,6 +23,18 @@ import {
   ScanController,
   scanStateFromSnapshot,
 } from './scan-controller';
+
+const contentFatalEmitters = new WeakMap<
+  ContentClient,
+  (reason: BossAccountFatalReason) => void
+>();
+
+function emitContentFatal(
+  content: ContentClient,
+  reason: BossAccountFatalReason,
+): void {
+  contentFatalEmitters.get(content)?.(reason);
+}
 
 function visibleCard(index: number, page = 0): VisibleJobCard {
   const suffix = page * 100 + index;
@@ -86,7 +101,19 @@ function scanRun(status: 'running' | 'cancelled' | 'interrupted' = 'running') {
 }
 
 function contentMock(pages: VisibleJobCard[][]): ContentClient {
-  return {
+  const fatalListeners = new Set<(event: BossFatalBlockEvent) => void>();
+  const content: ContentClient = {
+    beginSession: vi.fn(async () => ({
+      sessionId: 'session-1',
+      tabId: 42,
+      generation: 'generation-1',
+      queryScope: 'boss:/web/geek/job?query=TypeScript',
+    })),
+    endSession: vi.fn(async () => true),
+    onFatalBlock(listener) {
+      fatalListeners.add(listener);
+      return () => fatalListeners.delete(listener);
+    },
     detectPage: vi.fn(async () => ({
       type: 'boss/detect-page/response' as const,
       pageType: 'search-detail-panel' as const,
@@ -111,6 +138,18 @@ function contentMock(pages: VisibleJobCard[][]): ContentClient {
     })),
     cancelDetailScan: vi.fn(async () => true),
   };
+  contentFatalEmitters.set(content, (reason) => {
+    const event: BossFatalBlockEvent = {
+      type: 'boss/fatal-block/event',
+      sessionId: 'session-1',
+      generation: 'generation-1',
+      reason,
+    };
+    for (const listener of fatalListeners) {
+      listener(event);
+    }
+  });
+  return content;
 }
 
 function bridgeMock(): BridgeClient {
@@ -268,6 +307,24 @@ describe('ScanController', () => {
     expect(state.results).toHaveLength(25);
     expect(content.extractVisibleCards).toHaveBeenCalledOnce();
     expect(content.startDetailScan).not.toHaveBeenCalled();
+    expect(content.beginSession).toHaveBeenCalledOnce();
+    expect(content.endSession).toHaveBeenCalledOnce();
+  });
+
+  it('queryScope 或 content generation 改变时整轮进入 interrupted', async () => {
+    const content = contentMock([[visibleCard(0)]]);
+    vi.mocked(content.detectPage).mockRejectedValue(
+      new ContentContextChangedError(),
+    );
+    const bridge = bridgeMock();
+
+    const state = await controller(content, bridge).run();
+
+    expect(state.status).toBe('interrupted');
+    expect(state.stopReason).toBeNull();
+    expect(bridge.saveJob).not.toHaveBeenCalled();
+    expect(bridge.evaluateJob).not.toHaveBeenCalled();
+    expect(content.endSession).toHaveBeenCalledOnce();
   });
 
   it('maxPages 不为 1 时在创建 run 前明确拒绝', async () => {
@@ -656,6 +713,121 @@ describe('ScanController', () => {
     },
   );
 
+  it.each(['login_required', 'challenge', 'account_risk'] as const)(
+    '主动 %s event 在请求间隔等待中立即终止且不发起 retry',
+    async (reason) => {
+      const card = visibleCard(0);
+      const content = contentMock([[card]]);
+      vi.mocked(content.startDetailScan).mockResolvedValue({
+        type: 'boss/start-detail-scan/response',
+        outcome: 'failed',
+        message: '临时网络失败',
+        failureKind: 'network',
+        retryable: true,
+      });
+      const bridge = bridgeMock();
+      let markDelayStarted: (() => void) | undefined;
+      const delayStarted = new Promise<void>((resolve) => {
+        markDelayStarted = resolve;
+      });
+      const delay = vi.fn(
+        async (_milliseconds: number, signal: AbortSignal) =>
+          await new Promise<void>((resolve, reject) => {
+            markDelayStarted?.();
+            signal.addEventListener(
+              'abort',
+              () => reject(signal.reason),
+              { once: true },
+            );
+          }),
+      );
+      const scan = new ScanController({
+        content,
+        bridge,
+        config: { requestIntervalMs: 1_800, maxRoundMs: 30_000 },
+        delay,
+        random: () => 0.5,
+      });
+
+      const running = scan.run();
+      await delayStarted;
+      emitContentFatal(content, reason);
+      const state = await running;
+
+      expect(state.status).toBe('failed');
+      expect(state.stopReason).toBe(reason);
+      expect(content.startDetailScan).toHaveBeenCalledOnce();
+      expect(bridge.saveJob).not.toHaveBeenCalled();
+      expect(bridge.evaluateJob).not.toHaveBeenCalled();
+    },
+  );
+
+  it('主动 fatal 在列表筛选前置位后禁止筛选、保存和 AI', async () => {
+    const content = contentMock([[visibleCard(0)]]);
+    const bridge = bridgeMock();
+    vi.mocked(bridge.observeJobs).mockImplementation(async () => {
+      emitContentFatal(content, 'challenge');
+      return [
+        {
+          sourceJobId: 'boss-0',
+          action: 'read-detail',
+          reason: 'new',
+        },
+      ];
+    });
+
+    const state = await controller(content, bridge).run();
+
+    expect(state.stopReason).toBe('challenge');
+    expect(bridge.screenJobs).not.toHaveBeenCalled();
+    expect(bridge.saveJob).not.toHaveBeenCalled();
+    expect(bridge.evaluateJob).not.toHaveBeenCalled();
+  });
+
+  it('主动 fatal 在职位保存前置位后禁止保存和 AI', async () => {
+    const card = visibleCard(0);
+    const content = contentMock([[card]]);
+    vi.mocked(content.startDetailScan).mockImplementation(async () => {
+      emitContentFatal(content, 'account_risk');
+      return {
+        type: 'boss/start-detail-scan/response',
+        outcome: 'success',
+        job: detailFor(card),
+      };
+    });
+    const bridge = bridgeMock();
+
+    const state = await controller(content, bridge).run();
+
+    expect(state.stopReason).toBe('account_risk');
+    expect(bridge.saveJob).not.toHaveBeenCalled();
+    expect(bridge.evaluateJob).not.toHaveBeenCalled();
+  });
+
+  it('主动 fatal 在 AI 前置位后不再调用 AI', async () => {
+    const card = visibleCard(0);
+    const content = contentMock([[card]]);
+    const bridge = bridgeMock();
+    vi.mocked(bridge.screenJobs).mockImplementation(
+      async (jobs, _preferences, _signal, phase: ScreeningPhase = 'list') => {
+        if (phase === 'detail') {
+          emitContentFatal(content, 'login_required');
+        }
+        return jobs.map((job) => ({
+          jobId: job.jobId,
+          matched: true,
+          reasons: [],
+        }));
+      },
+    );
+
+    const state = await controller(content, bridge).run();
+
+    expect(state.stopReason).toBe('login_required');
+    expect(bridge.saveJob).toHaveBeenCalledOnce();
+    expect(bridge.evaluateJob).not.toHaveBeenCalled();
+  });
+
   it('旧职位 cache miss 时重建完整硬规则，阻断后不调用 AI', async () => {
     const card = visibleCard(0);
     const content = contentMock([[card]]);
@@ -700,6 +872,13 @@ describe('ScanController', () => {
     const sendMessage = vi.fn<TabsClient['sendMessage']>(
       async (_tabId, message) => {
         switch ((message as { type?: string }).type) {
+          case 'boss/begin-session/request':
+            return {
+              type: 'boss/begin-session/response',
+              sessionId: 'session-11',
+              generation: 'generation-11',
+              queryScope: 'boss:/web/geek/jobs',
+            };
           case 'boss/detect-page/request':
             return {
               type: 'boss/detect-page/response',
@@ -722,15 +901,24 @@ describe('ScanController', () => {
               type: 'boss/cancel-detail-scan/response',
               cancelled: true,
             };
+          case 'boss/end-session/request':
+            return {
+              type: 'boss/end-session/response',
+              ended: true,
+            };
           default:
             return undefined;
         }
       },
     );
-    const content = createContentClient({
-      query: async () => [{ id: 11 }],
-      sendMessage,
-    });
+    const content = createContentClient(
+      {
+        query: async () => [{ id: 11 }],
+        sendMessage,
+      },
+      { addMessageListener: () => () => undefined },
+      () => 'session-11',
+    );
     const bridge = bridgeMock();
 
     const state = await controller(content, bridge).run({ maxRoundMs: 20 });

@@ -1,7 +1,15 @@
 import { JobCardSchema, JobDetailSchema, type VisibleJobCard } from '@career-ops-cn/shared';
 import { describe, expect, it, vi } from 'vitest';
 
-import { ContentClientError, createContentClient, type TabsClient } from './content-client';
+import {
+  BossFatalBlockError,
+  ContentClientError,
+  ContentContextChangedError,
+  createContentClient,
+  type RuntimeClient,
+  type RuntimeMessageListener,
+  type TabsClient,
+} from './content-client';
 
 const job = JobCardSchema.parse({
   jobId: 'boss-1',
@@ -21,11 +29,42 @@ const detail = JobDetailSchema.parse({
   identityVerified: true,
 });
 
+function runtimeHarness(): {
+  runtime: RuntimeClient;
+  emit(message: unknown): void;
+} {
+  const listeners = new Set<RuntimeMessageListener>();
+  return {
+    runtime: {
+      addMessageListener(listener) {
+        listeners.add(listener);
+        return () => listeners.delete(listener);
+      },
+    },
+    emit(message) {
+      for (const listener of listeners) {
+        listener(message);
+      }
+    },
+  };
+}
+
+const noopRuntime: RuntimeClient = {
+  addMessageListener: () => () => undefined,
+};
+
 describe('Content client', () => {
   it('只通过 tabs 消息访问 Content Script，并校验全部响应', async () => {
     const sendMessage = vi.fn<TabsClient['sendMessage']>(async (_tabId, message) => {
       const type = (message as { type?: string }).type;
       switch (type) {
+        case 'boss/begin-session/request':
+          return {
+            type: 'boss/begin-session/response',
+            sessionId: 'session-1',
+            generation: 'generation-1',
+            queryScope: 'boss:/web/geek/job?query=TypeScript',
+          };
         case 'boss/detect-page/request':
           return {
             type: 'boss/detect-page/response',
@@ -64,6 +103,8 @@ describe('Content client', () => {
           };
         case 'boss/cancel-detail-scan/request':
           return { type: 'boss/cancel-detail-scan/response', cancelled: true };
+        case 'boss/end-session/request':
+          return { type: 'boss/end-session/response', ended: true };
         default:
           return undefined;
       }
@@ -72,8 +113,14 @@ describe('Content client', () => {
       query: vi.fn(async () => [{ id: 42 }]),
       sendMessage,
     };
-    const client = createContentClient(tabs);
+    const client = createContentClient(tabs, noopRuntime, () => 'session-1');
 
+    await expect(client.beginSession()).resolves.toEqual({
+      sessionId: 'session-1',
+      tabId: 42,
+      generation: 'generation-1',
+      queryScope: 'boss:/web/geek/job?query=TypeScript',
+    });
     await expect(client.detectPage()).resolves.toMatchObject({
       pageType: 'search-detail-panel',
     });
@@ -90,14 +137,23 @@ describe('Content client', () => {
       ],
     });
     await expect(client.cancelDetailScan()).resolves.toBe(true);
+    await expect(client.endSession()).resolves.toBe(true);
 
     expect(sendMessage.mock.calls.map(([, message]) => (message as { type: string }).type)).toEqual([
+      'boss/begin-session/request',
       'boss/detect-page/request',
       'boss/extract-current-detail/request',
       'boss/extract-visible-cards/request',
       'boss/start-detail-scan/request',
       'boss/cancel-detail-scan/request',
+      'boss/end-session/request',
     ]);
+    expect(tabs.query).toHaveBeenCalledOnce();
+    expect(sendMessage.mock.calls.every(([tabId]) => tabId === 42)).toBe(true);
+    expect(sendMessage.mock.calls.slice(1).every(([, message]) => {
+      const value = message as { sessionId?: string; generation?: string };
+      return value.sessionId === 'session-1' && value.generation === 'generation-1';
+    })).toBe(true);
     const startMessage = sendMessage.mock.calls.find(
       ([, message]) =>
         (message as { type?: string }).type === 'boss/start-detail-scan/request',
@@ -119,6 +175,14 @@ describe('Content client', () => {
   it('AbortSignal 会立即结束悬挂消息，并通知 Content Script 停止当前 MutationObserver', async () => {
     const sendMessage = vi.fn<TabsClient['sendMessage']>(async (_tabId, message) => {
       const type = (message as { type?: string }).type;
+      if (type === 'boss/begin-session/request') {
+        return {
+          type: 'boss/begin-session/response',
+          sessionId: 'session-7',
+          generation: 'generation-7',
+          queryScope: 'boss:/web/geek/jobs',
+        };
+      }
       if (type === 'boss/start-detail-scan/request') {
         return await new Promise<unknown>(() => undefined);
       }
@@ -137,14 +201,19 @@ describe('Content client', () => {
       }
       return undefined;
     });
-    const client = createContentClient({
-      query: async () => [{ id: 7 }],
-      sendMessage,
-    });
+    const client = createContentClient(
+      {
+        query: async () => [{ id: 7 }],
+        sendMessage,
+      },
+      noopRuntime,
+      () => 'session-7',
+    );
     const controller = new AbortController();
+    await client.beginSession();
     await client.extractVisibleCards();
     const scan = client.startDetailScan(visibleCard, 8_000, controller.signal);
-    await vi.waitFor(() => expect(sendMessage).toHaveBeenCalledTimes(2));
+    await vi.waitFor(() => expect(sendMessage).toHaveBeenCalledTimes(3));
     controller.abort();
 
     await expect(scan).rejects.toMatchObject({ name: 'AbortError' });
@@ -156,22 +225,38 @@ describe('Content client', () => {
 
   it('没有 locator session 时拒绝详情请求，不猜测 canonical URL', async () => {
     const sendMessage = vi.fn<TabsClient['sendMessage']>();
-    const client = createContentClient({
-      query: async () => [{ id: 9 }],
-      sendMessage,
-    });
+    const client = createContentClient(
+      {
+        query: async () => [{ id: 9 }],
+        sendMessage,
+      },
+      noopRuntime,
+    );
 
     await expect(client.startDetailScan(visibleCard, 8_000)).rejects.toThrow(
-      'locator session',
+      'session 尚未开始',
     );
     expect(sendMessage).not.toHaveBeenCalled();
   });
 
   it('页面检测消息悬挂时也会遵守外部轮次截止信号', async () => {
-    const client = createContentClient({
-      query: async () => [{ id: 8 }],
-      sendMessage: async () => await new Promise<unknown>(() => undefined),
-    });
+    const client = createContentClient(
+      {
+        query: async () => [{ id: 8 }],
+        sendMessage: async (_tabId, message) =>
+          (message as { type?: string }).type === 'boss/begin-session/request'
+            ? {
+                type: 'boss/begin-session/response',
+                sessionId: 'session-8',
+                generation: 'generation-8',
+                queryScope: 'boss:/web/geek/jobs',
+              }
+            : await new Promise<unknown>(() => undefined),
+      },
+      noopRuntime,
+      () => 'session-8',
+    );
+    await client.beginSession();
     const controller = new AbortController();
     const detection = client.detectPage(controller.signal);
     controller.abort(new DOMException('轮次超时。', 'TimeoutError'));
@@ -180,10 +265,123 @@ describe('Content client', () => {
   });
 
   it('没有活动标签页时返回明确错误', async () => {
-    const client = createContentClient({
-      query: async () => [],
-      sendMessage: async () => undefined,
+    const client = createContentClient(
+      {
+        query: async () => [],
+        sendMessage: async () => undefined,
+      },
+      noopRuntime,
+    );
+    await expect(client.beginSession()).rejects.toBeInstanceOf(ContentClientError);
+  });
+
+  it('固定 tab 后 active tab 改变也不会重定向后续请求', async () => {
+    const query = vi
+      .fn<TabsClient['query']>()
+      .mockResolvedValueOnce([{ id: 41 }])
+      .mockResolvedValueOnce([{ id: 99 }]);
+    const sendMessage = vi.fn<TabsClient['sendMessage']>(async (_tabId, message) => {
+      switch ((message as { type?: string }).type) {
+        case 'boss/begin-session/request':
+          return {
+            type: 'boss/begin-session/response',
+            sessionId: 'session-fixed',
+            generation: 'generation-fixed',
+            queryScope: 'boss:/web/geek/jobs',
+          };
+        case 'boss/detect-page/request':
+          return {
+            type: 'boss/detect-page/response',
+            pageType: 'search-list',
+            block: null,
+          };
+        default:
+          return undefined;
+      }
     });
-    await expect(client.detectPage()).rejects.toBeInstanceOf(ContentClientError);
+    const client = createContentClient(
+      { query, sendMessage },
+      noopRuntime,
+      () => 'session-fixed',
+    );
+
+    await client.beginSession();
+    await client.detectPage();
+    await client.detectPage();
+
+    expect(query).toHaveBeenCalledOnce();
+    expect(sendMessage.mock.calls.every(([tabId]) => tabId === 41)).toBe(true);
+  });
+
+  it('content 返回 context_changed 或固定 tab 断开时使用明确中断错误', async () => {
+    const sendMessage = vi.fn<TabsClient['sendMessage']>(async (_tabId, message) => {
+      if ((message as { type?: string }).type === 'boss/begin-session/request') {
+        return {
+          type: 'boss/begin-session/response',
+          sessionId: 'session-context',
+          generation: 'generation-context',
+          queryScope: 'boss:/web/geek/jobs',
+        };
+      }
+      return {
+        type: 'boss/session-error/response',
+        sessionId: 'session-context',
+        generation: 'generation-context',
+        reason: 'context_changed',
+      };
+    });
+    const client = createContentClient(
+      { query: async () => [{ id: 5 }], sendMessage },
+      noopRuntime,
+      () => 'session-context',
+    );
+    await client.beginSession();
+
+    await expect(client.detectPage()).rejects.toBeInstanceOf(
+      ContentContextChangedError,
+    );
+
+    sendMessage.mockRejectedValueOnce(new Error('Receiving end does not exist'));
+    await expect(client.detectPage()).rejects.toBeInstanceOf(
+      ContentContextChangedError,
+    );
+  });
+
+  it('匹配 session 的主动 fatal event 形成 client sticky latch', async () => {
+    const runtime = runtimeHarness();
+    const sendMessage = vi.fn<TabsClient['sendMessage']>(async (_tabId, message) => {
+      if ((message as { type?: string }).type === 'boss/begin-session/request') {
+        return {
+          type: 'boss/begin-session/response',
+          sessionId: 'session-fatal',
+          generation: 'generation-fatal',
+          queryScope: 'boss:/web/geek/jobs',
+        };
+      }
+      return undefined;
+    });
+    const client = createContentClient(
+      { query: async () => [{ id: 6 }], sendMessage },
+      runtime.runtime,
+      () => 'session-fatal',
+    );
+    const fatalListener = vi.fn();
+    client.onFatalBlock(fatalListener);
+    await client.beginSession();
+
+    runtime.emit({
+      type: 'boss/fatal-block/event',
+      sessionId: 'session-fatal',
+      generation: 'generation-fatal',
+      reason: 'challenge',
+    });
+
+    expect(fatalListener).toHaveBeenCalledOnce();
+    await expect(client.detectPage()).rejects.toMatchObject({
+      name: 'BossFatalBlockError',
+      reason: 'challenge',
+    });
+    expect(sendMessage).toHaveBeenCalledTimes(1);
+    expect(new BossFatalBlockError('challenge')).toBeInstanceOf(ContentClientError);
   });
 });
